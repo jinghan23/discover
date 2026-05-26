@@ -3,6 +3,7 @@ Implements RL on general MDPs
 """
 
 import asyncio
+import json
 import logging
 import os
 import time
@@ -37,6 +38,27 @@ from ttt_discover.tinker_utils.ml_log import WandbLogger
 
 
 logger = logging.getLogger(__name__)
+
+
+def append_agent_outputs(log_path: str, step: int, table_data: list[tuple[Any, ...]]) -> None:
+    """Persist raw agent rollouts locally before W&B-only table handling."""
+    os.makedirs(log_path, exist_ok=True)
+    output_path = os.path.join(log_path, "agent_outputs.jsonl")
+    columns = [
+        "prompt",
+        "response",
+        "reward",
+        "correctness",
+        "parsed_code",
+        "msg",
+        "initial_raw_score",
+        "advantage",
+    ]
+    with open(output_path, "a", encoding="utf-8") as f:
+        for row_idx, row in enumerate(table_data):
+            entry = {"step": step, "row": row_idx}
+            entry.update({key: value for key, value in zip(columns, row)})
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 
 @scope
@@ -573,6 +595,7 @@ async def do_sync_training(
             advantages_P = compute_advantages(trajectory_groups_P, cfg.adv_estimator, cfg.adv_estimator_beta)
             flat_advantages = [adv.item() for adv_G in advantages_P for adv in adv_G]
             table_data = [(*row, flat_advantages[i]) for i, row in enumerate(table_data)]
+            append_agent_outputs(cfg.log_path, i_batch, table_data)
             train_table = {
                 f"gen&score_train_{i_batch}":
                     wandb.Table(
