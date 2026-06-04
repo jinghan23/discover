@@ -1,3 +1,6 @@
+import json
+import re
+
 import numpy as np
 
 from ttt_discover import Environment, SandboxRewardEvaluator, State, DiscoverConfig, discover
@@ -19,17 +22,20 @@ def verify_c5_solution(h_values: np.ndarray, c5_achieved: float, n_points: int):
     if not np.all(np.isfinite(h_values)):
         raise ValueError("h_values contain NaN or inf values")
     
-    if np.any(h_values < 0) or np.any(h_values > 1):
+    bound_tol = 1e-9
+    if np.any(h_values < -bound_tol) or np.any(h_values > 1 + bound_tol):
         raise ValueError(f"h(x) is not in [0, 1]. Range: [{h_values.min()}, {h_values.max()}]")
+    h_values = np.clip(h_values, 0.0, 1.0)
     
     n = n_points
     target_sum = n / 2.0
     current_sum = np.sum(h_values)
     
-    if current_sum != target_sum:
+    if not np.isclose(current_sum, target_sum, rtol=0.0, atol=1e-8):
         h_values = h_values * (target_sum / current_sum)
-        if np.any(h_values < 0) or np.any(h_values > 1):
+        if np.any(h_values < -bound_tol) or np.any(h_values > 1 + bound_tol):
             raise ValueError(f"After normalization, h(x) is not in [0, 1]. Range: [{h_values.min()}, {h_values.max()}]")
+        h_values = np.clip(h_values, 0.0, 1.0)
     
     dx = 2.0 / n_points
     
@@ -111,6 +117,70 @@ class ErdosMinOverlapEnv(Environment):
     max_construction_len = 1000
 
     @classmethod
+    def prepare_initial_program(
+        cls,
+        program: str,
+        *,
+        source_path: str,
+        eval_timeout: int,
+    ) -> str:
+        if source_path.endswith(".json"):
+            data = json.loads(program)
+            if "h_values" not in data:
+                raise ValueError(
+                    f"Initial JSON construction {source_path} must contain h_values"
+                )
+            h_values = data["h_values"]
+            program = (
+                "import numpy as np\n\n"
+                f"h_values = np.array({h_values!r}, dtype=float)\n"
+            )
+        if "def run(" in program:
+            return program
+        if "h_values" not in program:
+            raise ValueError(
+                f"Initial program {source_path} must define run() or h_values"
+            )
+        budget_s = max(1, int(eval_timeout))
+        return program.rstrip() + f'''
+
+
+def run(seed=42, budget_s={budget_s}, **kwargs):
+    h = np.asarray(h_values, dtype=float).copy()
+    n_points = int(h.size)
+    dx = 2.0 / n_points
+    c5_bound = float(np.max(np.correlate(h, 1.0 - h, mode="full") * dx))
+    return h, c5_bound, n_points
+'''
+
+    @classmethod
+    def create_seed_state_from_initial_program(
+        cls,
+        program: str,
+        *,
+        source_path: str,
+        eval_timeout: int,
+    ) -> State | None:
+        del source_path, eval_timeout
+        match = re.search(r"```python\s+([\s\S]*?)\s*```", program)
+        code = match.group(1).strip() if match is not None else program
+        namespace: dict[str, object] = {"np": np}
+        exec(code, namespace)
+        if "h_values" not in namespace:
+            return None
+        h_values = np.asarray(namespace["h_values"], dtype=float)
+        n_points = int(h_values.size)
+        dx = 2.0 / n_points
+        c5_bound = float(np.max(np.correlate(h_values, 1.0 - h_values, mode="full") * dx))
+        c5_bound = verify_c5_solution(h_values, c5_bound, n_points)
+        return State(
+            timestep=-1,
+            code=program,
+            value=-c5_bound,
+            construction=list(h_values),
+        )
+
+    @classmethod
     def create_initial_state(cls, problem_type: str) -> State:
         rng = np.random.default_rng()
         n_points = rng.integers(40, 100)
@@ -129,6 +199,8 @@ class ErdosMinOverlapEnv(Environment):
     def get_question(self) -> str:
         state = self.initial_state
         state_ctx = state.to_prompt(0.3808, metric_name="C₅ bound", maximize=False)
+        budget_s = max(1, int(getattr(self, "eval_timeout", 1000)))
+        cpus = max(1, int(getattr(self, "num_cpus_per_task", 1)))
         
         # Construct construction section
         construction_section = ""
@@ -172,11 +244,11 @@ Smaller sequences with less than 1k samples are preferred - they are faster to o
 **Lower C₅ values are better** - they provide tighter upper bounds on the Erdős constant.
 
 ## Budget & Resources
-- **Time budget**: 1000s for your code to run
-- **CPUs**: 2 available
+- **Time budget**: {budget_s}s for your code to run
+- **CPUs**: {cpus} available
 
 ## Rules
-- Define `run(seed=42, budget_s=1000, **kwargs)` that returns `(h_values, c5_bound, n_points)`
+- Define `run(seed=42, budget_s={budget_s}, **kwargs)` that returns `(h_values, c5_bound, n_points)`
 - Use scipy, numpy, cvxpy[CBC,CVXOPT,GLOP,GLPK,GUROBI,MOSEK,PDLP,SCIP,XPRESS,ECOS], math
 - Make all helper functions top level, no closures or lambdas
 - No filesystem or network IO

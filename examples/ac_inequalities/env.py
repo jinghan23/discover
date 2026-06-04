@@ -222,6 +222,18 @@ class AutoCorrInequalityEnv(Environment):
             return State(timestep=-1, construction=construction, code=code, value=initial_value)
         raise ValueError(f"Unknown problem_type: {problem_type}")
 
+    @classmethod
+    def refresh_initial_state(cls, state: State, problem_type: str) -> None:
+        rng = np.random.default_rng()
+        construction = [rng.random()] * rng.integers(1000, 8000)
+        state.construction = construction
+        if problem_type == "ac1":
+            state.value = -evaluate_sequence_ac1(construction)
+        elif problem_type == "ac2":
+            state.value = evaluate_sequence_ac2(construction)
+        else:
+            raise ValueError(f"Unknown problem_type: {problem_type}")
+
     def is_maximize(self) -> bool:
         if self.problem_type == "ac1":
             return False # Minimize upper bound

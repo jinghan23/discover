@@ -1,13 +1,65 @@
 """Centralized sampler creation for all environments."""
 from __future__ import annotations
 from abc import ABC, abstractmethod
+from contextlib import contextmanager
+import json
 import os
 import threading
+import time
+from typing import Any
 
 import numpy as np
 
-from ttt_discover.tinker_utils.state import State, state_from_dict
-from ttt_discover.tinker_utils.best_sequence_utils import _file_lock, _atomic_write_json, _read_json_or_default
+from ttt_discover.codex_utils.runtime import State, state_from_dict, to_json_serializable
+
+
+@contextmanager
+def _file_lock(lock_path: str, *, poll_s: float = 0.05, stale_s: float = 600.0):
+    while True:
+        try:
+            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            try:
+                os.write(fd, f"{os.getpid()}\n{time.time()}\n".encode("utf-8"))
+            finally:
+                os.close(fd)
+            break
+        except FileExistsError:
+            try:
+                st = os.stat(lock_path)
+                if (time.time() - st.st_mtime) > stale_s:
+                    os.remove(lock_path)
+                    continue
+            except FileNotFoundError:
+                continue
+            time.sleep(poll_s)
+
+    try:
+        yield
+    finally:
+        try:
+            os.remove(lock_path)
+        except FileNotFoundError:
+            pass
+
+
+def _atomic_write_json(path: str, obj: Any) -> None:
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tmp_path = f"{path}.tmp.{os.getpid()}"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(to_json_serializable(obj), f, indent=2, sort_keys=True)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_path, path)
+
+
+def _read_json_or_default(path: str, default: Any) -> Any:
+    if not os.path.exists(path):
+        return default
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except json.JSONDecodeError:
+        return default
 
 
 class StateSampler(ABC):
@@ -142,6 +194,7 @@ class PUCTSampler(StateSampler):
 
     def _save(self, step: int):
         save_path = _sampler_file_for_step(self.file_path, step)
+        os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
         store = {
             "step": step,
             "states": [s.to_dict() for s in self._states],
@@ -154,18 +207,10 @@ class PUCTSampler(StateSampler):
             _atomic_write_json(save_path, store)
 
     def _refresh_random_construction(self, state: State) -> None:
-        """Regenerate construction for initial states when env expects random construction (e.g. AC)."""
-        # For ac
-        if not getattr(self.env_type, "construction_length_limits", None):
-            return
-        rng = np.random.default_rng()
-        state.construction = [rng.random()] * rng.integers(1000, 8000)
-        if self.problem_type == "ac1":
-            from ttt_discover.tinker_utils.ac_helpers import evaluate_sequence_ac1
-            state.value = -evaluate_sequence_ac1(state.construction)
-        else:
-            from ttt_discover.tinker_utils.ac_helpers import evaluate_sequence_ac2
-            state.value = evaluate_sequence_ac2(state.construction)
+        """Let task-specific envs refresh seed states without coupling sampler to a task."""
+        refresh = getattr(self.env_type, "refresh_initial_state", None)
+        if refresh is not None:
+            refresh(state, self.problem_type)
 
     def _get_construction_key(self, state: State) -> tuple | str | None:
         if hasattr(state, 'construction') and state.construction:
@@ -173,6 +218,14 @@ class PUCTSampler(StateSampler):
         if hasattr(state, 'code') and state.code:
             return state.code
         return None
+
+    def has_state(self, state: State) -> bool:
+        key = self._get_construction_key(state)
+        if key is None:
+            return False
+        existing = {self._get_construction_key(s) for s in self._states}
+        existing.discard(None)
+        return key in existing
 
     def _freeze_key(self, value):
         if isinstance(value, np.ndarray):
@@ -397,6 +450,50 @@ class PUCTSampler(StateSampler):
                     self._initial_states.append(state)
                     self._states.append(state)
 
+    def get_initial_states(self) -> list[State]:
+        return list(self._initial_states)
+
+    def add_initial_states(
+        self,
+        states: list[State],
+        *,
+        save: bool = True,
+        step: int | None = None,
+    ) -> int:
+        if not states:
+            return 0
+
+        existing = {self._get_construction_key(s) for s in self._states}
+        existing.discard(None)
+        existing_ids = {s.id for s in self._states}
+
+        new_states: list[State] = []
+        for state in states:
+            if state.value is None:
+                continue
+            state.timestep = -1
+            state.parent_values = []
+            state.parents = []
+            key = self._get_construction_key(state)
+            if key is not None and key in existing:
+                continue
+            if state.id in existing_ids:
+                continue
+            new_states.append(state)
+            existing_ids.add(state.id)
+            if key is not None:
+                existing.add(key)
+
+        if not new_states:
+            return 0
+
+        with self._lock:
+            self._states.extend(new_states)
+            self._initial_states.extend(new_states)
+            if save:
+                self._finalize_and_save(step)
+        return len(new_states)
+
     def get_sample_stats(self) -> dict:
         def _stats(values, prefix):
             arr = np.array([v for v in values if v is not None])
@@ -450,6 +547,7 @@ def create_sampler(
     problem_type: str = "",
     batch_size: int = 1,
     resume_step: int | None = None,
+    topk_children: int = 2,
 ) -> StateSampler:
     """Factory function to create samplers. Pass the env type (from config.env_type)."""
     if not log_path:
@@ -461,6 +559,7 @@ def create_sampler(
         problem_type=problem_type,
         batch_size=batch_size,
         resume_step=resume_step,
+        topk_children=topk_children,
     )
 
 
@@ -470,6 +569,7 @@ def get_or_create_sampler_with_default(
     problem_type: str = "",
     batch_size: int = 1,
     resume_step: int | None = None,
+    topk_children: int = 2,
 ) -> StateSampler:
     """Get sampler. Initial experience is created via env_type.create_initial_state."""
     return create_sampler(
@@ -478,4 +578,5 @@ def get_or_create_sampler_with_default(
         problem_type=problem_type,
         batch_size=batch_size,
         resume_step=resume_step,
+        topk_children=topk_children,
     )
