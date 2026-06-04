@@ -1,0 +1,34 @@
+import numpy as np
+import os
+import sys
+import json
+
+def evaluate(program_path: str = None):
+    """
+    Evaluate the pack_circles function from the given program file.
+    Returns the total radius sum if valid, otherwise raises an exception.
+    """
+    import importlib.util
+    import sys
+
+    if program_path is None:
+        program_path = os.path.join(os.path.dirname(__file__), "initial_program.py")
+    
+    # Load the module from the given path
+    spec = importlib.util.spec_from_file_location("program", program_path)
+    program = importlib.util.module_from_spec(spec)
+    sys.modules["program"] = program
+    spec.loader.exec_module(program)
+    try:
+        height_sequence_3 = program.find_better_c3_upper_bound()
+    except Exception:
+        return {"error": -10.0}
+    
+    convolution_3 = np.convolve(height_sequence_3, height_sequence_3)
+    C_upper_bound = abs(2 * len(height_sequence_3) * np.max(convolution_3) / (np.sum(height_sequence_3)**2))
+    
+    return {"score": 1.0 / C_upper_bound}
+
+if __name__ == "__main__":
+    target = sys.argv[1] if len(sys.argv) > 1 else None
+    print(json.dumps(evaluate(target), ensure_ascii=False))

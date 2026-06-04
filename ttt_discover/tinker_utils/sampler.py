@@ -169,10 +169,21 @@ class PUCTSampler(StateSampler):
 
     def _get_construction_key(self, state: State) -> tuple | str | None:
         if hasattr(state, 'construction') and state.construction:
-            return tuple(state.construction)
+            return self._freeze_key(state.construction)
         if hasattr(state, 'code') and state.code:
             return state.code
         return None
+
+    def _freeze_key(self, value):
+        if isinstance(value, np.ndarray):
+            return self._freeze_key(value.tolist())
+        if isinstance(value, list) or isinstance(value, tuple):
+            return tuple(self._freeze_key(item) for item in value)
+        if isinstance(value, dict):
+            return tuple(
+                sorted((key, self._freeze_key(item)) for key, item in value.items())
+            )
+        return value
 
     def _compute_scale(self, values: np.ndarray, mask: np.ndarray | None = None) -> float:
         if values.size == 0:

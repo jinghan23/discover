@@ -69,6 +69,24 @@ export WANDB_API_KEY="..."
 export WANDB_ENTITY="..."
 ```
 
+The Codex no-finetune runner defaults to the local `codex exec` CLI, so it uses
+the already logged-in Codex/ChatGPT account and does not require
+`OPENAI_API_KEY` or `TINKER_API_KEY`. It still uses the existing tokenizer,
+environment, PUCT sampler, evaluator, and logging code, but skips Tinker
+training. If you prefer the direct OpenAI Responses API backend, pass
+`--codex-backend responses` and set `OPENAI_API_KEY`.
+
+The Codex runner also loads `initial_pool_reference_plus_codex_20260603.json`
+by default. Rebuild that task-specific pool with:
+
+```bash
+python -m repro.erdos.build_initial_pool
+```
+
+The pool contains generic serialized `State` objects for the public loader;
+the Erdős-specific SOURCE_SUMMARY parsing and C5 filtering live in
+`build_initial_pool.py`.
+
 ## Launching The Paper Task
 
 The official entrypoint is:
@@ -96,6 +114,21 @@ For a cheaper smoke run after credentials are available:
 python -m repro.erdos.run_erdos_discovery \
   --experiment-name erdos-min-overlap-smoke \
   --model-name openai/gpt-oss-20b \
+  --num-epochs 1 \
+  --group-size 2 \
+  --groups-per-batch 1 \
+  --num-cpus-per-task 1 \
+  --eval-timeout 120 \
+  --codex-max-concurrent-requests 4
+```
+
+To run the Codex no-finetune variant:
+
+```bash
+python -m repro.erdos.run_erdos_discovery \
+  --runner codex_no_finetune \
+  --codex-backend cli \
+  --experiment-name erdos-min-overlap-codex-smoke \
   --num-epochs 1 \
   --group-size 2 \
   --groups-per-batch 1 \
