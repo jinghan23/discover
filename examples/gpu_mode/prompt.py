@@ -9,10 +9,10 @@ Your task:
 - Implement the "outgoing" version of the TriMul operator from the AlphaFold3 paper.
 - You will not have to compute or store gradients for this version. You will only need to implement the forward pass.
 
-Your function should be defined as 'custom_kernel' with the following signature:
+Your function should be defined as `custom_kernel(data)`.
 Input:
-- `data`: Tuple of (input: torch.Tensor, weights: Dict[str, torch.Tensor], config: Dict)
-    - input: Input tensor of shape [bs, seq_len, seq_len, dim]
+- `data`: Tuple of (input_tensor: torch.Tensor, mask: torch.Tensor, weights: Dict[str, torch.Tensor], config: Dict)
+    - input_tensor: Input tensor of shape [bs, seq_len, seq_len, dim]
     - mask: Mask tensor of shape [bs, seq_len, seq_len]
     - weights: Dictionary containing model weights
     - config: Dictionary containing model configuration parameters
