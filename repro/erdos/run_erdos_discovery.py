@@ -53,11 +53,6 @@ def parse_args() -> argparse.Namespace:
         default="cli",
         help="Use local Codex CLI account or direct OpenAI Responses API.",
     )
-    parser.add_argument(
-        "--codex-tokenizer-model-name",
-        default="openai/gpt-oss-20b",
-        help="Tokenizer used to preserve the existing token-based environment interface.",
-    )
     parser.add_argument("--codex-max-output-tokens", type=int, default=8192)
     parser.add_argument("--codex-temperature", type=float, default=None)
     parser.add_argument("--codex-cli-timeout", type=float, default=None)
@@ -112,7 +107,6 @@ def main() -> None:
         wandb_project=args.wandb_project,
         codex_model_name=args.codex_model_name,
         codex_backend=args.codex_backend,
-        codex_tokenizer_model_name=args.codex_tokenizer_model_name,
         codex_max_output_tokens=args.codex_max_output_tokens,
         codex_temperature=args.codex_temperature,
         codex_cli_timeout=args.codex_cli_timeout,

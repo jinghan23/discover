@@ -12,11 +12,6 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from examples.erdos_min_overlap.env import ErdosMinOverlapEnv
-from ttt_discover.codex_utils import adapt_environment
-from ttt_discover.codex_utils.dataset_builder import (
-    DatasetConfig,
-    get_single_problem_dataset_builder,
-)
 from ttt_discover.rl.codex_no_finetune import (
     CodexNoFinetuneConfig,
     main as codex_no_finetune_main,
@@ -54,14 +49,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--codex-cli-timeout", type=float, default=None)
     parser.add_argument("--codex-max-concurrent-requests", type=int, default=1)
-    parser.add_argument(
-        "--codex-tokenizer-model-name",
-        default="openai/gpt-oss-20b",
-        help="Tokenizer used only to instantiate the existing Codex env adapter.",
-    )
     parser.add_argument("--codex-max-output-tokens", type=int, default=8192)
     parser.add_argument("--codex-temperature", type=float, default=None)
-    parser.add_argument("--renderer-name", default="gpt_oss_high_reasoning")
     parser.add_argument("--num-cpus-per-task", type=int, default=1)
     parser.add_argument(
         "--eval-timeout",
@@ -109,30 +98,14 @@ def default_initial_pools(args: argparse.Namespace) -> list[str]:
 def main() -> None:
     args = parse_args()
     log_path = Path(args.log_root) / args.experiment_name
-    codex_env_type = adapt_environment(ErdosMinOverlapEnv)
-
-    dataset_config = DatasetConfig(
-        env_type=codex_env_type,
-        problem_type="",
-        batch_size=args.groups_per_batch,
-        group_size=args.group_size,
-        model_name_for_tokenizer=args.codex_tokenizer_model_name,
-        renderer_name=args.renderer_name,
-        num_cpus_per_task=args.num_cpus_per_task,
-        eval_timeout=args.eval_timeout,
-        log_path=str(log_path),
-        initial_program_paths=tuple(default_initial_programs(args)),
-        initial_pool_paths=tuple(default_initial_pools(args)),
-    )
-    dataset_builder = get_single_problem_dataset_builder(dataset_config)
 
     cfg = CodexNoFinetuneConfig(
-        env_type=codex_env_type,
+        env_type=ErdosMinOverlapEnv,
         problem_type="",
-        dataset_builder=dataset_builder,
         backend="cli",
         model_name=args.codex_model_name,
-        tokenizer_model_name=args.codex_tokenizer_model_name,
+        groups_per_batch=args.groups_per_batch,
+        group_size=args.group_size,
         num_cpus_per_task=args.num_cpus_per_task,
         eval_timeout=args.eval_timeout,
         num_epochs=args.num_epochs,
@@ -143,6 +116,8 @@ def main() -> None:
         cli_timeout=args.codex_cli_timeout,
         max_concurrent_requests=args.codex_max_concurrent_requests,
         autonomous=False,
+        initial_program_paths=tuple(default_initial_programs(args)),
+        initial_pool_paths=tuple(default_initial_pools(args)),
         wandb_project=args.wandb_project,
         wandb_name=args.experiment_name,
         log_path=str(log_path),
@@ -152,5 +127,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
     main()

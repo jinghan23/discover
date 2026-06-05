@@ -1,16 +1,20 @@
-"""Centralized sampler creation for all environments."""
+"""Search-state sampling and seeding helpers for Codex discovery."""
 from __future__ import annotations
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
 import json
+import logging
 import os
+from pathlib import Path
 import threading
 import time
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 
 from ttt_discover.codex_utils.runtime import State, state_from_dict, to_json_serializable
+
+logger = logging.getLogger(__name__)
 
 
 @contextmanager
@@ -67,7 +71,7 @@ class StateSampler(ABC):
 
     @abstractmethod
     def sample_states(self, num_states: int) -> list[State]:
-        """Sample states to start rollouts from."""
+        """Sample states to continue search from."""
         pass
 
     @abstractmethod
@@ -121,6 +125,210 @@ def create_initial_state(env_type: type, problem_type: str) -> State:
     name = getattr(env_type, "env_name", env_type.__name__)
     print(f"Creating initial state for {name}")
     return env_type.create_initial_state(problem_type)
+
+
+def _resolve_path(raw_path: str | os.PathLike) -> Path:
+    path = Path(os.path.expanduser(str(raw_path)))
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    return path
+
+
+def _pool_payload_to_states(payload: Any, *, path: Path, state_type: type) -> list[Any]:
+    if isinstance(payload, list):
+        raw_states = payload
+    elif isinstance(payload, dict):
+        if "state" in payload and isinstance(payload["state"], dict):
+            raw_states = [payload["state"]]
+        elif "states" in payload:
+            raw_states = payload["states"]
+        elif "initial_states" in payload:
+            raw_states = payload["initial_states"]
+        elif {"timestep", "construction", "code"}.issubset(payload):
+            raw_states = [payload]
+        else:
+            raise ValueError(f"Unsupported initial pool state file: {path}")
+    else:
+        raise ValueError(f"Unsupported initial pool format: {path}")
+
+    if not isinstance(raw_states, list):
+        raise ValueError(f"Initial pool states must be a list: {path}")
+    return [
+        state_from_dict(item, state_type=state_type)
+        for item in raw_states
+        if isinstance(item, dict)
+    ]
+
+
+def load_initial_pool_file(path: str | os.PathLike, *, state_type: type = State) -> list[Any]:
+    resolved = _resolve_path(path)
+    store = json.loads(resolved.read_text(encoding="utf-8"))
+    return _pool_payload_to_states(store, path=resolved, state_type=state_type)
+
+
+def load_initial_pool_paths(
+    initial_pool_paths: tuple[str, ...] | list[str],
+    *,
+    state_type: type = State,
+) -> list[Any]:
+    states: list[Any] = []
+    for raw_path in initial_pool_paths:
+        path = _resolve_path(raw_path)
+        loaded = load_initial_pool_file(path, state_type=state_type)
+        states.extend(loaded)
+        logger.info("Loaded %s initial-pool states from %s", len(loaded), path)
+    return [state for state in states if state is not None]
+
+
+def seed_initial_pool_paths(
+    sampler: "StateSampler",
+    initial_pool_paths: tuple[str, ...] | list[str],
+    *,
+    env_type: type,
+    save: bool = False,
+) -> int:
+    if not initial_pool_paths:
+        return 0
+
+    state_type = getattr(env_type, "state_type", State)
+    pool_states = load_initial_pool_paths(initial_pool_paths, state_type=state_type)
+    if not pool_states:
+        return 0
+
+    add_initial_states = getattr(sampler, "add_initial_states", None)
+    if add_initial_states is not None:
+        added = add_initial_states(pool_states, save=save)
+    else:
+        parent_states = sampler.sample_states(1)
+        if not parent_states:
+            logger.warning("No parent state available for initial pool seeding")
+            return 0
+        parents = [parent_states[0]] * len(pool_states)
+        before = len(getattr(sampler, "_states", []))
+        sampler.update_states(pool_states, parents, save=save)
+        added = len(getattr(sampler, "_states", [])) - before
+
+    if added and not save:
+        sampler.flush()
+    if added:
+        logger.info("Seeded %s states from initial pool", added)
+    return int(added)
+
+
+def _load_initial_programs(
+    initial_program_paths: tuple[str, ...] | list[str],
+    *,
+    env_type: type,
+    eval_timeout: int,
+) -> list[tuple[str, str]]:
+    programs: list[tuple[str, str]] = []
+    prepare = getattr(env_type, "prepare_initial_program", None)
+    for raw_path in initial_program_paths:
+        path = _resolve_path(raw_path)
+        program = path.read_text(encoding="utf-8")
+        if prepare is not None:
+            program = prepare(
+                program,
+                source_path=str(path),
+                eval_timeout=eval_timeout,
+            )
+        programs.append((str(path), program))
+    return programs
+
+
+def _with_code_fence(program: str, language: str) -> str:
+    if "```" in program:
+        return program
+    return f"```{language}\n{program.rstrip()}\n```"
+
+
+def seed_initial_program_paths(
+    sampler: "StateSampler",
+    initial_program_paths: tuple[str, ...] | list[str],
+    *,
+    env_type: type,
+    problem_type: str,
+    log_path: str,
+    eval_timeout: int,
+    make_env: Callable[[Any], Any],
+    save: bool = False,
+) -> int:
+    if not initial_program_paths:
+        return 0
+
+    if hasattr(sampler, "get_initial_states"):
+        parent_states = sampler.get_initial_states()
+    else:
+        parent_states = sampler.sample_states(1)
+    if not parent_states:
+        logger.warning("No parent state available for initial program seeding")
+        return 0
+
+    programs = _load_initial_programs(
+        initial_program_paths,
+        env_type=env_type,
+        eval_timeout=eval_timeout,
+    )
+    seed_states: list[Any] = []
+    seed_parents: list[Any] = []
+
+    for parent in parent_states:
+        env = make_env(parent)
+        get_languages = getattr(env, "_get_code_languages", None)
+        languages = get_languages() if get_languages is not None else ["python"]
+        language = languages[0] if languages else "python"
+
+        for source_path, raw_program in programs:
+            program = _with_code_fence(raw_program, language)
+            direct_seed = None
+            build_seed = getattr(env_type, "create_seed_state_from_initial_program", None)
+            if build_seed is not None:
+                direct_seed = build_seed(
+                    program,
+                    source_path=source_path,
+                    eval_timeout=eval_timeout,
+                )
+            if direct_seed is not None:
+                has_state = getattr(sampler, "has_state", None)
+                if has_state is not None and has_state(direct_seed):
+                    logger.info("Skipping already-seeded initial program %s", source_path)
+                    continue
+                seed_states.append(direct_seed)
+                seed_parents.append(parent)
+                logger.info(
+                    "Seeded initial program %s directly with value=%s",
+                    source_path,
+                    getattr(direct_seed, "value", None),
+                )
+                continue
+
+            if not hasattr(env, "_run_verification") or not hasattr(env, "_create_next_state"):
+                raise ValueError(
+                    f"{env_type.__name__} does not support verified initial-program seeding"
+                )
+            outs = env._run_verification(program, problem_type, log_path, parent)
+            if getattr(outs, "correctness", 0) <= 0:
+                logger.warning(
+                    "Initial program failed verification: %s: %s",
+                    source_path,
+                    getattr(outs, "msg", ""),
+                )
+                continue
+            seed_state = env._create_next_state(-1, program, outs)
+            seed_states.append(seed_state)
+            seed_parents.append(parent)
+            logger.info(
+                "Seeded initial program %s with raw_score=%s reward=%s",
+                source_path,
+                getattr(outs, "raw_score", None),
+                getattr(outs, "reward", None),
+            )
+
+    if seed_states:
+        sampler.update_states(seed_states, seed_parents, save=save)
+        if not save:
+            sampler.flush()
+    return len(seed_states)
 
 
 class PUCTSampler(StateSampler):
