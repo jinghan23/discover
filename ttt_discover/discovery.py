@@ -5,12 +5,7 @@ from typing import Literal
 
 import chz
 from ttt_discover.environments.utils.cpu_scheduler import CpuScheduler
-import ttt_discover.codex_utils.misc_utils as misc_utils
-from ttt_discover.codex_utils import adapt_environment
-from ttt_discover.codex_utils.dataset_builder import (
-    DatasetConfig as CodexDatasetConfig,
-    get_single_problem_dataset_builder as get_codex_single_problem_dataset_builder,
-)
+import ttt_discover.tinker_utils.misc_utils as misc_utils
 from ttt_discover.rl.codex_no_finetune import (
     CodexNoFinetuneConfig,
     main as codex_no_finetune_main,
@@ -50,11 +45,9 @@ class DiscoverConfig:
     num_cpus_per_task: int = 0
     eval_timeout: int = 1000
 
-    # Codex no-finetune config. The tokenizer model is only used to preserve
-    # the existing token-based environment/rendering interface.
+    # Codex no-finetune config.
     codex_backend: Literal["cli", "responses"] = "cli"
     codex_model_name: str | None = None
-    codex_tokenizer_model_name: str = "openai/gpt-oss-20b"
     codex_max_output_tokens: int = 8192
     codex_temperature: float | None = None
     codex_api_key_env: str = "OPENAI_API_KEY"
@@ -120,11 +113,7 @@ async def discover_impl(config: DiscoverConfig):
     logging.getLogger().addHandler(logging.NullHandler())
 
     renderer_name = config.renderer_name
-    model_name_for_tokenizer = (
-        config.model_name
-        if config.runner == "tinker_rl"
-        else config.codex_tokenizer_model_name
-    )
+    model_name_for_tokenizer = config.model_name
 
     # create log path if it doesn't exist
     log_path = f"./tinker_log/{config.experiment_name}"
@@ -136,28 +125,13 @@ async def discover_impl(config: DiscoverConfig):
     logger.info("Logging to %s", log_file)
 
     if config.runner == "codex_no_finetune":
-        codex_env_type = adapt_environment(config.env_type)
-        codex_dataset_config = CodexDatasetConfig(
-            env_type=codex_env_type,
-            problem_type=config.problem_type,
-            batch_size=config.groups_per_batch,
-            group_size=config.group_size,
-            model_name_for_tokenizer=model_name_for_tokenizer,
-            renderer_name=renderer_name,
-            num_cpus_per_task=config.num_cpus_per_task,
-            eval_timeout=config.eval_timeout,
-            log_path=log_path,
-            initial_program_paths=config.codex_initial_program_paths,
-            initial_pool_paths=config.codex_initial_pool_paths,
-        )
-        codex_dataset_builder = get_codex_single_problem_dataset_builder(codex_dataset_config)
         codex_config = CodexNoFinetuneConfig(
-            env_type=codex_dataset_config.env_type,
+            env_type=config.env_type,
             problem_type=config.problem_type,
-            dataset_builder=codex_dataset_builder,
             backend=config.codex_backend,
             model_name=config.codex_model_name,
-            tokenizer_model_name=config.codex_tokenizer_model_name,
+            groups_per_batch=config.groups_per_batch,
+            group_size=config.group_size,
             num_cpus_per_task=max(1, int(config.num_cpus_per_task)),
             eval_timeout=config.eval_timeout,
             num_epochs=config.num_epochs,
@@ -169,6 +143,8 @@ async def discover_impl(config: DiscoverConfig):
             cli_sandbox=config.codex_cli_sandbox,
             cli_timeout=config.codex_cli_timeout,
             max_concurrent_requests=config.codex_max_concurrent_requests,
+            initial_program_paths=config.codex_initial_program_paths,
+            initial_pool_paths=config.codex_initial_pool_paths,
             autonomous=config.codex_autonomous,
             wandb_project=config.wandb_project,
             wandb_name=config.experiment_name,
