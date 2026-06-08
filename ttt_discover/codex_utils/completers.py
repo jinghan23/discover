@@ -7,7 +7,9 @@ import json
 import os
 import signal
 import tempfile
-from dataclasses import dataclass
+import uuid
+from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Literal
 
 
@@ -106,6 +108,9 @@ class CodexCliCompleter(TextCompleter):
     ignore_user_config: bool = True
     ignore_rules: bool = True
     append_final_answer_instruction: bool = True
+    log_dir: str | None = None
+    call_name: str | None = None
+    _call_idx: int = field(default=0, init=False, repr=False)
 
     def _build_prompt(self, prompt: str) -> str:
         if not self.append_final_answer_instruction:
@@ -140,6 +145,22 @@ class CodexCliCompleter(TextCompleter):
         cmd.append("-")
         return cmd
 
+    def _next_call_dir(self) -> Path | None:
+        if not self.log_dir:
+            return None
+        self._call_idx += 1
+        name = self.call_name or "call"
+        safe_name = "".join(
+            char if char.isalnum() or char in "._-" else "_"
+            for char in name
+        )
+        call_dir = (
+            Path(self.log_dir)
+            / f"{safe_name}_call_{self._call_idx:04d}_{uuid.uuid4().hex[:8]}"
+        )
+        call_dir.mkdir(parents=True, exist_ok=True)
+        return call_dir
+
     async def __call__(self, prompt: str) -> str:
         if self.semaphore is not None:
             async with self.semaphore:
@@ -148,42 +169,102 @@ class CodexCliCompleter(TextCompleter):
 
     async def _call_unlocked(self, prompt: str) -> str:
         prompt = self._build_prompt(prompt)
-        output_file = tempfile.NamedTemporaryFile(prefix="ttt-discover-codex-", delete=False)
-        output_path = output_file.name
-        output_file.close()
+        call_dir = self._next_call_dir()
+        if call_dir is None:
+            output_file = tempfile.NamedTemporaryFile(prefix="ttt-discover-codex-", delete=False)
+            output_path = output_file.name
+            output_file.close()
+            stdout_target = asyncio.subprocess.PIPE
+            stderr_target = asyncio.subprocess.PIPE
+            stdout_log_path = None
+            stderr_log_path = None
+        else:
+            output_path = str(call_dir / "final_response.txt")
+            (call_dir / "prompt.txt").write_text(prompt, encoding="utf-8")
+            stdout_log_path = call_dir / "codex.stdout.log"
+            stderr_log_path = call_dir / "codex.stderr.log"
+            stdout_target = stdout_log_path.open("wb")
+            stderr_target = stderr_log_path.open("wb")
+
+        cmd = self._build_command(output_path)
+        if call_dir is not None:
+            (call_dir / "command.json").write_text(
+                json.dumps(cmd, indent=2),
+                encoding="utf-8",
+            )
 
         try:
-            process = await asyncio.create_subprocess_exec(
-                *self._build_command(output_path),
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                start_new_session=True,
-            )
-            communicate = process.communicate(prompt.encode("utf-8"))
             try:
-                if self.timeout is not None:
-                    stdout, stderr = await asyncio.wait_for(communicate, timeout=self.timeout)
-                else:
-                    stdout, stderr = await communicate
-            except asyncio.TimeoutError as exc:
-                await _kill_process_tree(process)
-                raise RuntimeError(f"codex exec timed out after {self.timeout}s") from exc
-            except asyncio.CancelledError:
-                await _kill_process_tree(process)
-                raise
-
-            if process.returncode != 0:
-                raise RuntimeError(
-                    "codex exec failed with exit code "
-                    f"{process.returncode}\nSTDOUT:\n{stdout.decode(errors='replace')}\n"
-                    f"STDERR:\n{stderr.decode(errors='replace')}"
+                process = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=stdout_target,
+                    stderr=stderr_target,
+                    start_new_session=True,
                 )
+                communicate = process.communicate(prompt.encode("utf-8"))
+                stdout: bytes | None = None
+                stderr: bytes | None = None
+                try:
+                    if self.timeout is not None:
+                        stdout, stderr = await asyncio.wait_for(communicate, timeout=self.timeout)
+                    else:
+                        stdout, stderr = await communicate
+                except asyncio.TimeoutError as exc:
+                    await _kill_process_tree(process)
+                    stdout_text = _read_log_or_bytes(stdout_log_path, stdout)
+                    stderr_text = _read_log_or_bytes(stderr_log_path, stderr)
+                    if call_dir is not None:
+                        (call_dir / "error.txt").write_text(
+                            f"codex exec timed out after {self.timeout}s\n",
+                            encoding="utf-8",
+                        )
+                    raise RuntimeError(
+                        f"codex exec timed out after {self.timeout}s; "
+                        f"log_dir={call_dir}\nSTDOUT:\n{stdout_text}\nSTDERR:\n{stderr_text}"
+                    ) from exc
+                except asyncio.CancelledError:
+                    await _kill_process_tree(process)
+                    if call_dir is not None:
+                        (call_dir / "error.txt").write_text(
+                            "codex exec was cancelled\n",
+                            encoding="utf-8",
+                        )
+                    raise
+
+                stdout_text = _read_log_or_bytes(stdout_log_path, stdout)
+                stderr_text = _read_log_or_bytes(stderr_log_path, stderr)
+                if process.returncode != 0:
+                    if call_dir is not None:
+                        (call_dir / "error.txt").write_text(
+                            f"codex exec failed with exit code {process.returncode}\n",
+                            encoding="utf-8",
+                        )
+                    raise RuntimeError(
+                        "codex exec failed with exit code "
+                        f"{process.returncode}; log_dir={call_dir}\n"
+                        f"STDOUT:\n{stdout_text}\nSTDERR:\n{stderr_text}"
+                    )
+            finally:
+                if stdout_log_path is not None:
+                    stdout_target.close()
+                if stderr_log_path is not None:
+                    stderr_target.close()
 
             with open(output_path, "r", encoding="utf-8") as f:
                 return f.read().strip()
         finally:
-            try:
-                os.remove(output_path)
-            except FileNotFoundError:
-                pass
+            if call_dir is None:
+                try:
+                    os.remove(output_path)
+                except FileNotFoundError:
+                    pass
+
+
+def _read_log_or_bytes(path: Path | None, data: bytes | None) -> str:
+    if path is not None:
+        try:
+            return path.read_bytes().decode(errors="replace")
+        except FileNotFoundError:
+            return ""
+    return (data or b"").decode(errors="replace")

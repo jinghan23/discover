@@ -1,8 +1,45 @@
-"""Sampling-only discovery loop backed by Codex.
+"""Sampling-only TTT Discover loop backed by Codex.
 
 This runner keeps the TTT-Discover task hooks, reward functions, PUCT sampler,
 and local metrics, but does not use RL dataset, trajectory, or trainer
 abstractions.
+
+Mode boundary:
+- TTT Discover means `autonomous=False`: many short non-auto Codex samples,
+  followed by the harness reward evaluator and sampler update. This is the
+  default path for longer multi-round discovery runs.
+- AutoEvolve means `autonomous=True`: Codex gets a writable workspace and may
+  inspect files, edit candidates, and run local commands inside one deep-dive
+  call. Use this only when the requested run is explicitly autonomous/deep-dive.
+
+Prefer invoking this directly instead of adding pass-through run scripts whose
+only job is argument plumbing. Example GPUMode TriMul GPU2 command:
+
+CUDA_VISIBLE_DEVICES=2 CUDA_DEVICE_ORDER=PCI_BUS_ID TORCH_CUDA_ARCH_LIST=8.0 \
+python - <<'PY'
+from examples.gpu_mode.env import GpuModeEnv
+from ttt_discover import DiscoverConfig, discover
+
+discover(DiscoverConfig(
+    runner="codex_no_finetune",
+    env_type=GpuModeEnv,
+    problem_type="trimul",
+    experiment_name="gpu-mode-trimul-codex-gpu2-50",
+    wandb_project=None,
+    num_epochs=50,
+    groups_per_batch=1,
+    group_size=1,
+    num_cpus_per_task=1,
+    eval_timeout=1200,
+    codex_backend="cli",
+    codex_model_name="gpt-5.5",
+    codex_cli_command="codex",
+    codex_cli_sandbox="read-only",
+    codex_cli_timeout=600,
+    codex_max_concurrent_requests=1,
+    codex_autonomous=False,
+))
+PY
 """
 
 from __future__ import annotations
@@ -22,7 +59,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 
 import chz
 import numpy as np
@@ -31,7 +68,6 @@ from ttt_discover.codex_utils.completers import (
     CodexCliCompleter,
     CodexResponseCompleter,
     TextCompleter,
-    _kill_process_tree,
 )
 from ttt_discover.codex_utils.runtime import to_json_serializable
 from ttt_discover.codex_utils.sampler import (
@@ -102,6 +138,8 @@ class CodexNoFinetuneConfig:
     initial_pool_paths: tuple[str, ...] = ()
     topk_children: int = 16
 
+    # False is TTT Discover: non-auto, many short samples. True is AutoEvolve:
+    # one Codex deep-dive workspace per sample with file edits and shell access.
     autonomous: bool = False
 
     wandb_project: str | None = None
@@ -423,6 +461,7 @@ class AutonomousCodexCliCompleter(CodexCliCompleter):
         step_idx: int,
         eval_timeout: int,
         num_cpus_per_task: int,
+        prompt_builder: Callable[..., str] | None = None,
         **kwargs: Any,
     ):
         super().__init__(append_final_answer_instruction=False, **kwargs)
@@ -431,6 +470,7 @@ class AutonomousCodexCliCompleter(CodexCliCompleter):
         self.step_idx = step_idx
         self.eval_timeout = eval_timeout
         self.num_cpus_per_task = num_cpus_per_task
+        self.prompt_builder = prompt_builder
         self._call_idx = 0
 
     def _next_workspace(self) -> Path:
@@ -448,6 +488,16 @@ class AutonomousCodexCliCompleter(CodexCliCompleter):
     def _build_prompt(self, prompt: str) -> str:
         workspace = self._next_workspace()
         self._workspace = workspace
+
+        if self.prompt_builder is not None:
+            full_prompt = self.prompt_builder(
+                prompt=prompt,
+                workspace=workspace,
+                eval_timeout=self.eval_timeout,
+                num_cpus_per_task=self.num_cpus_per_task,
+            )
+            (workspace / "prompt.txt").write_text(full_prompt, encoding="utf-8")
+            return full_prompt
 
         matches = re.findall(r"```python\s+([\s\S]*?)\s*```", prompt or "")
         parent_matches = [match for match in matches if "def priority(" in match]
@@ -487,52 +537,11 @@ Finish with exactly one Python code block defining that best `priority(el, n)`.
         (workspace / "prompt.txt").write_text(full_prompt, encoding="utf-8")
         return full_prompt
 
-    async def _call_unlocked(self, prompt: str) -> str:
-        prompt = self._build_prompt(prompt)
-        workspace = self._workspace
-        output_path = workspace / "final_response.txt"
-        cmd = self._build_command(str(output_path))
-
-        (workspace / "command.json").write_text(json.dumps(cmd, indent=2), encoding="utf-8")
-        stdout_log_path = workspace / "codex.stdout.log"
-        stderr_log_path = workspace / "codex.stderr.log"
-        with stdout_log_path.open("wb") as stdout_log, stderr_log_path.open("wb") as stderr_log:
-            process = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=stdout_log,
-                stderr=stderr_log,
-                start_new_session=True,
-            )
-            communicate = process.communicate(prompt.encode("utf-8"))
-            try:
-                if self.timeout is not None:
-                    await asyncio.wait_for(communicate, timeout=self.timeout)
-                else:
-                    await communicate
-            except asyncio.TimeoutError as exc:
-                await _kill_process_tree(process)
-                stdout_text = stdout_log_path.read_bytes().decode(errors="replace")
-                stderr_text = stderr_log_path.read_bytes().decode(errors="replace")
-                raise RuntimeError(
-                    "codex exec timed out after "
-                    f"{self.timeout}s; workspace={workspace}\n"
-                    f"STDOUT:\n{stdout_text}\nSTDERR:\n{stderr_text}"
-                ) from exc
-            except asyncio.CancelledError:
-                await _kill_process_tree(process)
-                raise
-
-        stdout_text = stdout_log_path.read_bytes().decode(errors="replace")
-        stderr_text = stderr_log_path.read_bytes().decode(errors="replace")
-        if process.returncode != 0:
-            raise RuntimeError(
-                "codex exec failed with exit code "
-                f"{process.returncode}; workspace={workspace}\n"
-                f"STDOUT:\n{stdout_text}\nSTDERR:\n{stderr_text}"
-            )
-
-        return output_path.read_text(encoding="utf-8").strip() if output_path.exists() else ""
+    def _next_call_dir(self) -> Path:
+        workspace = getattr(self, "_workspace", None)
+        if workspace is None:
+            raise RuntimeError("Autonomous Codex workspace was not initialized.")
+        return workspace
 
 
 def _make_completer(
@@ -540,6 +549,9 @@ def _make_completer(
     *,
     semaphore: asyncio.Semaphore | None,
     step_idx: int,
+    group_idx: int = 0,
+    sample_idx: int = 0,
+    env: Any | None = None,
 ) -> TextCompleter:
     if cfg.backend == "cli":
         if cfg.autonomous:
@@ -560,6 +572,11 @@ def _make_completer(
                 step_idx=step_idx,
                 eval_timeout=cfg.eval_timeout,
                 num_cpus_per_task=max(1, int(cfg.num_cpus_per_task)),
+                prompt_builder=(
+                    getattr(env, "build_autonomous_prompt", None)
+                    if env is not None
+                    else None
+                ),
             )
         return CodexCliCompleter(
             model_name=cfg.model_name,
@@ -568,6 +585,12 @@ def _make_completer(
             cwd=os.getcwd(),
             timeout=cfg.cli_timeout,
             semaphore=semaphore,
+            log_dir=os.path.join(
+                cfg.log_path,
+                "codex_cli_calls",
+                f"step_{step_idx:06d}",
+            ),
+            call_name=f"group_{group_idx:04d}_sample_{sample_idx:04d}",
         )
     if cfg.backend == "responses":
         if cfg.autonomous:
@@ -599,7 +622,14 @@ async def _run_candidate(
     try:
         env = _make_env(cfg, parent_state, sampler)
         prompt = env.get_question()
-        completer = _make_completer(cfg, semaphore=semaphore, step_idx=step_idx)
+        completer = _make_completer(
+            cfg,
+            semaphore=semaphore,
+            step_idx=step_idx,
+            group_idx=group_idx,
+            sample_idx=sample_idx,
+            env=env,
+        )
         response = await completer(prompt)
         get_languages = getattr(env, "_get_code_languages", None)
         languages = get_languages() if get_languages is not None else ["python"]
