@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import copy
 import dataclasses
 import datetime
@@ -5,17 +7,15 @@ import math
 import typing
 from typing import Optional, Union
 
-from better_profanity import profanity
-
 from libkernelbot.consts import RankCriterion
-from libkernelbot.db_types import RunItem, SubmissionItem
-from libkernelbot.leaderboard_db import LeaderboardDB, LeaderboardItem
 from libkernelbot.run_eval import FullResult
 from libkernelbot.task import LeaderboardTask
 from libkernelbot.utils import KernelBotError, format_time, setup_logging
 
 if typing.TYPE_CHECKING:
     from backend import KernelBackend
+    from libkernelbot.db_types import RunItem, SubmissionItem
+    from libkernelbot.leaderboard_db import LeaderboardDB, LeaderboardItem
 
 
 logger = setup_logging(__name__)
@@ -42,6 +42,8 @@ class ProcessedSubmissionRequest(SubmissionRequest):
 def prepare_submission(
     req: SubmissionRequest, backend: "KernelBackend"
 ) -> ProcessedSubmissionRequest:
+    from better_profanity import profanity
+
     if not backend.accepts_jobs:
         raise KernelBotError(
             "The bot is currently not accepting any new submissions, please try again later."

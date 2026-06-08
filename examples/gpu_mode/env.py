@@ -1,168 +1,314 @@
+from __future__ import annotations
+
+import contextlib
+import math
+import os
+import re
+import shlex
+import shutil
+import sys
+import tempfile
+import threading
+from functools import lru_cache
 from pathlib import Path
-import asyncio
+from typing import Any
 
-from ttt_discover import Environment, BaseRewardEvaluator, State, DiscoverConfig, discover
+from ttt_discover import BaseRewardEvaluator, DiscoverConfig, Environment, State, discover
 
-from examples.gpu_mode.lib.libkernelbot.consts import ModalGPU, SubmissionMode
-from examples.gpu_mode.lib.libkernelbot.launchers import ModalLauncher
-from examples.gpu_mode.lib.libkernelbot.report import RunProgressReporter
-from examples.gpu_mode.lib.libkernelbot.run_eval import FullResult
-from examples.gpu_mode.lib.libkernelbot.task import (
-    LeaderboardTask,
-    build_task_config,
-    make_task_definition,
-)
-from examples.gpu_mode.lib.libkernelbot.submission import compute_score
+GPU_MODE_ROOT = Path(__file__).resolve().parent
+REPO_ROOT = GPU_MODE_ROOT.parents[1]
+LIB_ROOT = GPU_MODE_ROOT / "lib"
+if str(LIB_ROOT) not in sys.path:
+    sys.path.insert(0, str(LIB_ROOT))
+
+from libkernelbot.consts import RankCriterion, SubmissionMode
+from libkernelbot.run_eval import FullResult, run_config
+from libkernelbot.task import LeaderboardTask, build_task_config, make_task_definition
+
 from examples.gpu_mode.prompt import (
-    TRIMUL_PROMPT,
     MLA_DECODE_PROMPT,
     MLA_DECODE_PROMPT_END,
+    TRIMUL_PROMPT,
 )
 
 
-class SimpleReporter(RunProgressReporter):
-    """Minimal reporter that prints to console."""
-
-    async def _update_message(self):
-        print(f"[{self.title}]")
-        for line in self.lines:
-            print(f"  {line}")
-
-    async def display_report(self, title: str, report):
-        print(f"\n=== {title} ===")
-        print(f"Report has {len(report.data)} items")
+_RUN_CONFIG_LOCK = threading.Lock()
+_CODE_BLOCK_RE = re.compile(r"```(?:python|py|cuda)?\s*([\s\S]*?)\s*```")
 
 
-def load_task(task_name: str = "trimul") -> LeaderboardTask:
-    """Load a LeaderboardTask from its YAML definition."""
-    PROJECT_ROOT = Path(__file__).resolve().parent
+def _task_yaml(problem_type: str) -> Path:
     task_map = {
-        "trimul": PROJECT_ROOT / "lib" / "bioml" / "trimul" / "task.yml",
-        "mla_decode_nvidia": PROJECT_ROOT / "lib" / "mla-decode" / "task.yml",
+        "trimul": GPU_MODE_ROOT / "lib" / "bioml" / "trimul" / "task.yml",
+        "mla_decode_nvidia": GPU_MODE_ROOT / "lib" / "mla-decode" / "task.yml",
     }
-    task_yaml = task_map[task_name]
-    definition = make_task_definition(task_yaml)
-    return definition.task
-
-
-async def run_on_modal(
-    submission_code: str,
-    gpu_type: str = "H100",
-    mode: str = "leaderboard",
-    task_name: str = "trimul",
-    app_name: str = "discord-bot-runner",
-) -> tuple[FullResult, LeaderboardTask]:
-    """
-    Run a submission on Modal using the official task definition.
-
-    Args:
-        submission_code: Contents of the user's `submission.py`
-        gpu_type: One of ModalGPU names (A100, H100, B200)
-        mode: One of: test, benchmark, leaderboard, profile, private
-        task_name: One of "trimul" or "mla_decode_nvidia"
-    """
-    task = load_task(task_name)
     try:
-        mode_enum = SubmissionMode(mode)
-    except ValueError as e:
-        valid = ", ".join(m.value for m in SubmissionMode)
-        raise ValueError(f"Invalid mode '{mode}'. Valid modes: {valid}") from e
-
-    config = build_task_config(
-        task=task,
-        submission_content=submission_code,
-        arch=None,
-        mode=mode_enum,
-    )
-
-    launcher = ModalLauncher(add_include_dirs=[], app_name=app_name)
-    gpu_enum = ModalGPU[gpu_type.upper()]
-
-    task_display_name = task_name.capitalize()
-    reporter = SimpleReporter(f"{task_display_name} on {gpu_enum.name} (Modal)")
-    print(
-        f"Submitting {task_display_name} task to Modal on {gpu_enum.name} with mode='{mode_enum.value}'..."
-    )
-
-    result = await launcher.run_submission(config, gpu_enum, reporter)
-    return result, task
+        return task_map[problem_type]
+    except KeyError as exc:
+        raise ValueError(
+            f"Unknown problem_type: {problem_type}. "
+            "Must be 'trimul' or 'mla_decode_nvidia'"
+        ) from exc
 
 
-def get_gpu_mode_error(msg: str) -> dict:
+def _task_dir(problem_type: str) -> Path:
+    return _task_yaml(problem_type).parent
+
+
+@lru_cache(maxsize=None)
+def load_task(problem_type: str = "trimul") -> LeaderboardTask:
+    """Load a LeaderboardTask from its YAML definition."""
+    return make_task_definition(_task_yaml(problem_type)).task
+
+
+def _extract_submission_code(text: str) -> str:
+    matches = list(_CODE_BLOCK_RE.finditer(text or ""))
+    if matches:
+        return matches[-1].group(1).strip() + "\n"
+    return (text or "").strip() + "\n"
+
+
+def _score_scale(problem_type: str) -> float:
+    if problem_type == "trimul":
+        return 1500.0
+    if problem_type == "mla_decode_nvidia":
+        return 5000.0
+    raise ValueError(f"Unknown problem_type: {problem_type}")
+
+
+def _target_us(problem_type: str) -> float:
+    return 1000.0 if problem_type == "trimul" else 1700.0
+
+
+def _compute_score_us(result: FullResult, task: LeaderboardTask) -> float:
+    leaderboard = result.runs["leaderboard"].run
+    if leaderboard is None:
+        raise ValueError("Missing leaderboard run result")
+
+    num_benchmarks = int(leaderboard.result["benchmark-count"])
+    means_ns = [
+        float(leaderboard.result[f"benchmark.{idx}.mean"])
+        for idx in range(num_benchmarks)
+    ]
+    if not means_ns:
+        raise ValueError("No benchmark means in leaderboard result")
+
+    if task.ranking_by == RankCriterion.LAST:
+        score_ns = means_ns[-1]
+    elif task.ranking_by == RankCriterion.MEAN:
+        score_ns = sum(means_ns) / len(means_ns)
+    elif task.ranking_by == RankCriterion.GEOM:
+        if any(value <= 0 for value in means_ns):
+            raise ValueError(f"Cannot compute geometric mean for {means_ns}")
+        score_ns = math.exp(sum(math.log(value) for value in means_ns) / len(means_ns))
+    else:
+        raise ValueError(f"Unsupported ranking criterion: {task.ranking_by}")
+
+    return score_ns / 1000.0
+
+
+def _format_run_outputs(result: FullResult) -> str:
+    chunks: list[str] = []
+    for name, eval_result in result.runs.items():
+        run = eval_result.run
+        if run is None:
+            continue
+        chunks.append(
+            f"--- {name} ---\n"
+            f"passed={run.passed} success={run.success} exit_code={run.exit_code}\n"
+            f"stdout:\n{run.stdout}\n"
+            f"stderr:\n{run.stderr}\n"
+        )
+    return "\n".join(chunks)
+
+
+@contextlib.contextmanager
+def _pushd(path: str | os.PathLike[str]):
+    old_cwd = os.getcwd()
+    os.chdir(path)
+    try:
+        yield
+    finally:
+        os.chdir(old_cwd)
+
+
+def get_gpu_mode_error(msg: str, stdout: str = "") -> dict:
     return {
         "reward": 0.0,
         "msg": msg,
         "correctness": 0.0,
-        "raw_score": -1_000_000,
+        "raw_score": -1_000_000.0,
         "result_construction": [],
-        "stdout": "",
+        "stdout": stdout,
     }
 
 
 class GpuModeRewardEvaluator(BaseRewardEvaluator):
-
     def __init__(self, *args, **kwargs):
         self.problem_type = kwargs.get("problem_type")
-        self.log_dir = kwargs.get("log_dir")
-        if self.problem_type == "trimul":
-            self.score_scale = 1500
-            self.gpu_type = "H100"
-            self.task_name = "trimul"
-            self.app_name = "discord-bot-runner"
-        elif self.problem_type == "mla_decode_nvidia":
-            self.score_scale = 5000
-            self.gpu_type = "H200"
-            self.task_name = "mla_decode_nvidia"
-            self.app_name = "discord-bot-runner-mla-decode-nvidia"
-        else:
-            raise ValueError(f"Unknown problem_type: {self.problem_type}")
+        self.log_dir = kwargs.get("log_dir") or ""
+        self.eval_timeout = int(kwargs.get("eval_timeout", 1200))
+        self.num_cpus_per_task = max(1, int(kwargs.get("num_cpus_per_task", 1)))
+        self.score_scale = _score_scale(self.problem_type)
+        self.task = load_task(self.problem_type)
+
+    def _tmp_root(self) -> Path:
+        base = Path(self.log_dir) if self.log_dir else Path(tempfile.gettempdir())
+        root = base / "gpu_mode_local_eval"
+        root.mkdir(parents=True, exist_ok=True)
+        return root
 
     def get_reward(self, code: str, state: State) -> dict:
-        # Prevent no triton kernel code
-        if "@triton.jit" not in code:
+        del state
+        submission_code = _extract_submission_code(code)
+        if not submission_code.strip():
+            return get_gpu_mode_error("Empty submission.")
+        if "def custom_kernel" not in submission_code:
+            return get_gpu_mode_error("Code must define custom_kernel.")
+        if "@triton.jit" not in submission_code:
             return get_gpu_mode_error("Code must contain @triton.jit.")
-        # Prevent identity kernel for trimul
-        if self.problem_type == "trimul" and "identity" in code:
+        if self.problem_type == "trimul" and "identity" in submission_code.lower():
             return get_gpu_mode_error("Identity kernel is not allowed.")
-        
-        result, task = asyncio.run(
-            run_on_modal(
-                submission_code=code,
-                gpu_type=self.gpu_type,
-                mode="leaderboard",
-                task_name=self.task_name,
-                app_name=self.app_name,
-            )
+
+        config = build_task_config(
+            task=self.task,
+            submission_content=submission_code,
+            arch=None,
+            mode=SubmissionMode.LEADERBOARD,
         )
-        if not result.success:
-            return get_gpu_mode_error(f"Error: Failed to run test: {result.error}.")
-        if "test" not in result.runs:
-            return get_gpu_mode_error("Unexpected result: Failed to find test results.")
-        test_results = result.runs["test"]
-        if not test_results.run.success:
-            return get_gpu_mode_error(f"Failed to run tests: {test_results.run.stderr}")
-        if not test_results.run.passed:
-            return get_gpu_mode_error("Failed to pass test cases.")
-        if task is None or "leaderboard" not in result.runs:
-            return get_gpu_mode_error("No leaderboard run in result.")
+
         try:
-            score_seconds = compute_score(result, task, submission_id=-1)
-            score_us = score_seconds * 1_000_000
-            msg = (
-                f"\nOverall leaderboard score (microseconds, {task.ranking_by.value}): "
-                f"{score_us} us"
+            with tempfile.TemporaryDirectory(
+                prefix=f"{self.problem_type}_",
+                dir=self._tmp_root(),
+            ) as tmp_dir:
+                # run_config writes task files into cwd, so guard cwd globally.
+                with _RUN_CONFIG_LOCK:
+                    with _pushd(tmp_dir):
+                        result = run_config(config)
+        except Exception as exc:
+            return get_gpu_mode_error(f"Error: Failed to run local eval: {exc}")
+
+        stdout = _format_run_outputs(result)
+        if not result.success:
+            return get_gpu_mode_error(f"Error: Failed to run test: {result.error}.", stdout)
+
+        test_result = result.runs.get("test")
+        if test_result is None or test_result.run is None:
+            return get_gpu_mode_error("Unexpected result: Failed to find test results.", stdout)
+        if not test_result.run.success:
+            return get_gpu_mode_error(f"Failed to run tests: {test_result.run.stderr}", stdout)
+        if not test_result.run.passed:
+            return get_gpu_mode_error("Failed to pass test cases.", stdout)
+
+        leaderboard_result = result.runs.get("leaderboard")
+        if leaderboard_result is None or leaderboard_result.run is None:
+            return get_gpu_mode_error("No leaderboard run in result.", stdout)
+        if not leaderboard_result.run.success:
+            return get_gpu_mode_error(
+                f"Failed to run leaderboard: {leaderboard_result.run.stderr}",
+                stdout,
             )
-            reward = self.score_scale / score_us
-            return {
-                "reward": float(reward),
-                "msg": msg,
-                "correctness": 1.0,
-                "raw_score": float(score_us),
-                "result_construction": [],
-                "stdout": "",
-            }
-        except Exception as e:
-            return get_gpu_mode_error(f"Could not compute leaderboard score: {e}")
+        if not leaderboard_result.run.passed:
+            return get_gpu_mode_error("Failed leaderboard correctness checks.", stdout)
+
+        try:
+            score_us = _compute_score_us(result, self.task)
+        except Exception as exc:
+            return get_gpu_mode_error(f"Could not compute leaderboard score: {exc}", stdout)
+
+        reward = self.score_scale / max(score_us, 1e-9)
+        return {
+            "reward": float(reward),
+            "msg": (
+                f"Overall leaderboard score (microseconds, "
+                f"{self.task.ranking_by.value}): {score_us:.6f} us"
+            ),
+            "correctness": 1.0,
+            "raw_score": float(score_us),
+            "result_construction": [],
+            "stdout": stdout,
+            "metrics": {
+                "gpu_mode/score_us": float(score_us),
+                "gpu_mode/reward": float(reward),
+                "gpu_mode/task": self.problem_type,
+                "gpu_mode/system_gpu": result.system.gpu,
+                "gpu_mode/device_count": result.system.device_count,
+            },
+        }
+
+
+def _autonomous_eval_script(problem_type: str) -> str:
+    task_yaml = _task_yaml(problem_type)
+    return f"""from pathlib import Path
+import math
+import os
+import sys
+import tempfile
+
+ROOT = Path({str(REPO_ROOT)!r})
+sys.path.insert(0, str(ROOT / "examples/gpu_mode/lib"))
+
+from libkernelbot.consts import RankCriterion, SubmissionMode
+from libkernelbot.run_eval import run_config
+from libkernelbot.task import build_task_config, make_task_definition
+
+
+def compute_score_us(result, task):
+    run = result.runs["leaderboard"].run
+    n = int(run.result["benchmark-count"])
+    means_ns = [float(run.result[f"benchmark.{{i}}.mean"]) for i in range(n)]
+    if task.ranking_by == RankCriterion.LAST:
+        score_ns = means_ns[-1]
+    elif task.ranking_by == RankCriterion.MEAN:
+        score_ns = sum(means_ns) / len(means_ns)
+    elif task.ranking_by == RankCriterion.GEOM:
+        score_ns = math.exp(sum(math.log(x) for x in means_ns) / len(means_ns))
+    else:
+        raise ValueError(f"Unsupported ranking_by: {{task.ranking_by}}")
+    return score_ns / 1000.0
+
+
+def main():
+    task = make_task_definition(Path({str(task_yaml)!r})).task
+    code = Path("submission.py").read_text()
+    config = build_task_config(
+        task=task,
+        submission_content=code,
+        arch=None,
+        mode=SubmissionMode.LEADERBOARD,
+    )
+    workspace = Path.cwd()
+    eval_root = workspace / "eval_tmp"
+    eval_root.mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="run_", dir=eval_root) as tmp_dir:
+        old_cwd = os.getcwd()
+        os.chdir(tmp_dir)
+        try:
+            result = run_config(config)
+        finally:
+            os.chdir(old_cwd)
+    test = result.runs.get("test")
+    if test is None or test.run is None or not test.run.passed:
+        print("TEST FAILED")
+        if test is not None and test.run is not None:
+            print(test.run.stdout)
+            print(test.run.stderr)
+            print(test.run.result)
+        raise SystemExit(1)
+    leaderboard = result.runs.get("leaderboard")
+    if leaderboard is None or leaderboard.run is None or not leaderboard.run.passed:
+        print("LEADERBOARD FAILED")
+        if leaderboard is not None and leaderboard.run is not None:
+            print(leaderboard.run.stdout)
+            print(leaderboard.run.stderr)
+            print(leaderboard.run.result)
+        raise SystemExit(1)
+    print(f"score_us {{compute_score_us(result, task):.6f}}")
+
+
+if __name__ == "__main__":
+    main()
+"""
 
 
 class GpuModeEnv(Environment):
@@ -172,24 +318,101 @@ class GpuModeEnv(Environment):
     @classmethod
     def create_initial_state(cls, problem_type: str) -> State:
         if problem_type == "mla_decode_nvidia":
-            from examples.gpu_mode.prompt import MLA_DECODE_INITIAL_STATE, MLA_DECODE_INITIAL_VALUE
-            return State(timestep=-1, code=MLA_DECODE_INITIAL_STATE, value=MLA_DECODE_INITIAL_VALUE, construction=None)
+            from examples.gpu_mode.prompt import (
+                MLA_DECODE_INITIAL_STATE,
+                MLA_DECODE_INITIAL_VALUE,
+            )
+
+            return State(
+                timestep=-1,
+                code=MLA_DECODE_INITIAL_STATE,
+                value=MLA_DECODE_INITIAL_VALUE,
+                construction=None,
+            )
         if problem_type == "trimul":
-            return State(timestep=-1, code="", value=-1_000_000, construction=None)
+            return State(
+                timestep=-1,
+                code="",
+                value=-1_000_000.0,
+                construction=None,
+            )
         raise ValueError(f"Unknown problem_type: {problem_type}")
 
     def _should_keep_code_separators(self) -> bool:
         return False
-    
+
+    def _get_code_languages(self) -> list[str]:
+        return ["python"]
+
     def is_maximize(self) -> bool:
         return False
+
+    def check_format(self, parsed_code: str) -> bool:
+        return bool(parsed_code and "def custom_kernel" in parsed_code)
+
+    def _initial_submission_code(self) -> str:
+        if self.initial_state and self.initial_state.code:
+            code = _extract_submission_code(self.initial_state.code)
+            if code.strip():
+                return code
+        return (_task_dir(self.problem_type) / "submission.py").read_text()
+
+    def build_autonomous_prompt(
+        self,
+        *,
+        prompt: str,
+        workspace: Path,
+        eval_timeout: int,
+        num_cpus_per_task: int,
+    ) -> str:
+        del eval_timeout, num_cpus_per_task
+        task_dir = _task_dir(self.problem_type)
+        for name in ("task.py", "utils.py", "reference.py", "eval.py", "task.yml"):
+            shutil.copy2(task_dir / name, workspace / name)
+        readme = task_dir / "README.md"
+        if readme.exists():
+            shutil.copy2(readme, workspace / "README.md")
+        (workspace / "submission.py").write_text(
+            self._initial_submission_code(),
+            encoding="utf-8",
+        )
+        (workspace / "eval_candidate.py").write_text(
+            _autonomous_eval_script(self.problem_type),
+            encoding="utf-8",
+        )
+
+        evaluator_cmd = f"cd {shlex.quote(str(workspace))} && python eval_candidate.py"
+        return f"""{prompt}
+
+--- Autonomous GPUMode Search Mode ---
+You may inspect files and run shell commands, but keep all edits inside this workspace:
+{workspace}
+
+Editable candidate:
+{workspace / "submission.py"}
+
+The copied task files (`task.py`, `utils.py`, `reference.py`, `eval.py`, `task.yml`)
+are for inspection and local testing. The evaluator below reloads trusted task files
+from the repository and runs in `eval_tmp/`, so editing copied task files will not
+change the official score or delete your candidate.
+
+Run this evaluator after each revision:
+{evaluator_cmd}
+
+When done, put the best implementation in:
+{workspace / "submission.py"}
+"""
 
     def get_question(self) -> str:
         """Build prompt from template, injecting previous code from state."""
         state = self.initial_state
-        target = 1000 if self.problem_type == "trimul" else 1700
-
-        state_ctx = state.to_prompt(target, metric_name="runtime (microseconds)", maximize=False, language="python")
+        target = _target_us(self.problem_type)
+        state_ctx = state.to_prompt(
+            target,
+            metric_name="runtime (microseconds)",
+            maximize=False,
+            language="python",
+        )
 
         if self.problem_type == "trimul":
             return f"""{TRIMUL_PROMPT}
@@ -197,17 +420,16 @@ class GpuModeEnv(Environment):
 {state_ctx}
 
 Rules:
-- The tensors arguments passed in will be already on your cuda device.
+- The tensor arguments passed in will already be on your CUDA device.
 - Define all of your code in one final ```python ``` block.
-- We will test the correctness of your kernel on multiple input shapes, make sure to support different potential test cases.
-- You are allowed to use mixed precision computations, but make sure your final output is in float32.
-- You must use trition 3.3.1 and these kernels will be run on an H100.
-- You do not have to implement everything in triton, you may choose to have some of the operations done in pytorch. However, you must implement at least part of the operations in a kernel.
+- We will test correctness on multiple input shapes; support all potential test cases.
+- You are allowed to use mixed precision computations, but make sure your final output is float32.
+- You must use Triton 3.3.1 and these kernels will be run on an H100-class NVIDIA GPU.
+- You do not have to implement everything in Triton; PyTorch helper operations are allowed. However, implement at least part of the computation in a kernel.
 - Include a short docstring at the top summarizing your algorithm.
 """
 
         if self.problem_type == "mla_decode_nvidia":
-            
             return f"""{MLA_DECODE_PROMPT}
 
 {state_ctx}
