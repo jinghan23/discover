@@ -401,6 +401,9 @@ Run this evaluator after each revision:
 
 When done, put the best implementation in:
 {workspace / "submission.py"}
+
+The outer discovery runner will score the final contents of that `submission.py`
+before considering any code block in your final response.
 """
 
     def get_question(self) -> str:
@@ -415,6 +418,8 @@ When done, put the best implementation in:
         )
 
         if self.problem_type == "trimul":
+            # Original hardware prompt kept for reference:
+            # - You must use Triton 3.3.1 and these kernels will be run on an H100-class NVIDIA GPU.
             return f"""{TRIMUL_PROMPT}
 
 {state_ctx}
@@ -424,7 +429,7 @@ Rules:
 - Define all of your code in one final ```python ``` block.
 - We will test correctness on multiple input shapes; support all potential test cases.
 - You are allowed to use mixed precision computations, but make sure your final output is float32.
-- You must use Triton 3.3.1 and these kernels will be run on an H100-class NVIDIA GPU.
+- You must use Triton 3.3.1. These kernels will be run on an A800/A100-class NVIDIA GPU (Ampere SM80, CUDA arch 8.0; A800-SXM4-80GB target). Do not use Hopper/SM90-only features such as TMA, WGMMA, or FP8-only paths.
 - You do not have to implement everything in Triton; PyTorch helper operations are allowed. However, implement at least part of the computation in a kernel.
 - Include a short docstring at the top summarizing your algorithm.
 """

@@ -126,7 +126,7 @@ class CodexNoFinetuneConfig:
     eval_timeout: int = 45
     timeout: float = 8000.0
     num_epochs: int = 1
-    max_output_tokens: int = 8192
+    max_output_tokens: int | None = None
     temperature: float | None = None
     api_key_env: str = "OPENAI_API_KEY"
     base_url: str | None = None
@@ -305,6 +305,27 @@ def last_codeblock_postprocess(
         return code_content
 
     return "" if last_response_strict else input_text
+
+
+def _autonomous_submission_from_workspace(
+    completer: TextCompleter,
+) -> tuple[str | None, str | None]:
+    workspace = getattr(completer, "_workspace", None)
+    if workspace is None:
+        return None, None
+
+    submission_path = Path(workspace) / "submission.py"
+    try:
+        code = submission_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        logger.warning("Could not read autonomous submission file %s: %s", submission_path, exc)
+        return None, str(submission_path)
+
+    if not code.strip():
+        logger.warning("Autonomous submission file is empty: %s", submission_path)
+        return None, str(submission_path)
+
+    return code, str(submission_path)
 
 
 def _latest_sampler_step(log_path: str) -> int:
@@ -637,14 +658,26 @@ async def _run_candidate(
         keep_separators = (
             keep_separators_fn() if keep_separators_fn is not None else True
         )
+        parsed_code_source = "final_response_codeblock"
+        autonomous_submission_path = None
         parsed_code = last_codeblock_postprocess(
             response,
             codeblock_seps=languages,
             keep_separators=keep_separators,
         )
+        if cfg.autonomous:
+            autonomous_submission, autonomous_submission_path = (
+                _autonomous_submission_from_workspace(completer)
+            )
+            if autonomous_submission is not None:
+                parsed_code = autonomous_submission
+                parsed_code_source = "workspace_submission.py"
         correct_format = _check_candidate_format(env, parsed_code)
         outs = await _safe_grade(cfg, env, parsed_code, correct_format)
         metrics = _build_metrics(env, outs, response, parsed_code, correct_format)
+        metrics["codex/parsed_code_source"] = parsed_code_source
+        if autonomous_submission_path is not None:
+            metrics["codex/autonomous_submission_path"] = autonomous_submission_path
         next_state = _maybe_create_next_state(env, step_idx, parsed_code, outs)
         return CandidateResult(
             parent_state=parent_state,

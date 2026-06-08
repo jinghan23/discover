@@ -102,7 +102,7 @@ class TriMul(nn.Module):
 
 Here is some example skeleton code of the entrypoint function you will create:
 ```python
-def custom_kernel(data)
+def custom_kernel(data):
     input_tensor, mask, weights, config = data
     dim, hidden_dim = config["dim"], config["hidden_dim"]
 
