@@ -238,15 +238,14 @@ class GpuModeRewardEvaluator(BaseRewardEvaluator):
 
 
 def _autonomous_eval_script(problem_type: str) -> str:
-    task_yaml = _task_yaml(problem_type)
-    return f"""from pathlib import Path
+    del problem_type
+    return """from pathlib import Path
 import math
 import os
 import sys
 import tempfile
 
-ROOT = Path({str(REPO_ROOT)!r})
-sys.path.insert(0, str(ROOT / "examples/gpu_mode/lib"))
+sys.path.insert(0, str(Path.cwd()))
 
 from libkernelbot.consts import RankCriterion, SubmissionMode
 from libkernelbot.run_eval import run_config
@@ -256,7 +255,7 @@ from libkernelbot.task import build_task_config, make_task_definition
 def compute_score_us(result, task):
     run = result.runs["leaderboard"].run
     n = int(run.result["benchmark-count"])
-    means_ns = [float(run.result[f"benchmark.{{i}}.mean"]) for i in range(n)]
+    means_ns = [float(run.result[f"benchmark.{i}.mean"]) for i in range(n)]
     if task.ranking_by == RankCriterion.LAST:
         score_ns = means_ns[-1]
     elif task.ranking_by == RankCriterion.MEAN:
@@ -264,12 +263,20 @@ def compute_score_us(result, task):
     elif task.ranking_by == RankCriterion.GEOM:
         score_ns = math.exp(sum(math.log(x) for x in means_ns) / len(means_ns))
     else:
-        raise ValueError(f"Unsupported ranking_by: {{task.ranking_by}}")
+        raise ValueError(f"Unsupported ranking_by: {task.ranking_by}")
     return score_ns / 1000.0
 
 
 def main():
-    task = make_task_definition(Path({str(task_yaml)!r})).task
+    print(f"CUDA_VISIBLE_DEVICES {os.environ.get('CUDA_VISIBLE_DEVICES')}")
+    print(f"TORCH_CUDA_ARCH_LIST {os.environ.get('TORCH_CUDA_ARCH_LIST')}")
+    task_path = Path("task.yml")
+    if not task_path.exists():
+        raise SystemExit("task.yml is missing")
+    if not Path("submission.py").exists():
+        raise SystemExit("submission.py is missing")
+
+    task = make_task_definition(task_path).task
     code = Path("submission.py").read_text()
     config = build_task_config(
         task=task,
@@ -277,8 +284,7 @@ def main():
         arch=None,
         mode=SubmissionMode.LEADERBOARD,
     )
-    workspace = Path.cwd()
-    eval_root = workspace / "eval_tmp"
+    eval_root = Path.cwd() / "eval_tmp"
     eval_root.mkdir(exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="run_", dir=eval_root) as tmp_dir:
         old_cwd = os.getcwd()
@@ -287,6 +293,7 @@ def main():
             result = run_config(config)
         finally:
             os.chdir(old_cwd)
+
     test = result.runs.get("test")
     if test is None or test.run is None or not test.run.passed:
         print("TEST FAILED")
@@ -303,7 +310,7 @@ def main():
             print(leaderboard.run.stderr)
             print(leaderboard.run.result)
         raise SystemExit(1)
-    print(f"score_us {{compute_score_us(result, task):.6f}}")
+    print(f"score_us {compute_score_us(result, task):.6f}")
 
 
 if __name__ == "__main__":
@@ -369,6 +376,12 @@ class GpuModeEnv(Environment):
         task_dir = _task_dir(self.problem_type)
         for name in ("task.py", "utils.py", "reference.py", "eval.py", "task.yml"):
             shutil.copy2(task_dir / name, workspace / name)
+        shutil.copytree(
+            LIB_ROOT / "libkernelbot",
+            workspace / "libkernelbot",
+            dirs_exist_ok=True,
+            ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+        )
         readme = task_dir / "README.md"
         if readme.exists():
             shutil.copy2(readme, workspace / "README.md")
@@ -381,7 +394,15 @@ class GpuModeEnv(Environment):
             encoding="utf-8",
         )
 
-        evaluator_cmd = f"cd {shlex.quote(str(workspace))} && python eval_candidate.py"
+        env_parts = []
+        for key in ("CUDA_VISIBLE_DEVICES", "CUDA_DEVICE_ORDER", "TORCH_CUDA_ARCH_LIST"):
+            value = os.environ.get(key)
+            if value:
+                env_parts.append(f"{key}={shlex.quote(value)}")
+        env_prefix = (" ".join(env_parts) + " ") if env_parts else ""
+        evaluator_cmd = (
+            f"cd {shlex.quote(str(workspace))} && {env_prefix}python eval_candidate.py"
+        )
         return f"""{prompt}
 
 --- Autonomous GPUMode Search Mode ---
@@ -392,18 +413,23 @@ Editable candidate:
 {workspace / "submission.py"}
 
 The copied task files (`task.py`, `utils.py`, `reference.py`, `eval.py`, `task.yml`)
-are for inspection and local testing. The evaluator below reloads trusted task files
-from the repository and runs in `eval_tmp/`, so editing copied task files will not
-change the official score or delete your candidate.
+and `libkernelbot/` are for inspection and local testing. The evaluator below uses
+the copied `task.yml` and runs leaderboard mode, so it checks both tests and
+leaderboard benchmarks for this task.
 
 Run this evaluator after each revision:
 {evaluator_cmd}
+
+Do not edit `eval_candidate.py`, `task.yml`, `libkernelbot/`, or the copied task/eval
+files to improve a score. Only `submission.py` is a valid candidate artifact, and
+the outer runner will re-score it with trusted repository files.
 
 When done, put the best implementation in:
 {workspace / "submission.py"}
 
 The outer discovery runner will score the final contents of that `submission.py`
-before considering any code block in your final response.
+with trusted repository files outside the Codex workspace before considering any
+code block in your final response.
 """
 
     def get_question(self) -> str:

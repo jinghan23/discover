@@ -31,6 +31,27 @@ class TextCompleter:
         raise NotImplementedError
 
 
+class CodexCliTimeoutError(RuntimeError):
+    """Raised when `codex exec` times out after writing logs/workspace files."""
+
+    def __init__(
+        self,
+        *,
+        timeout: float | None,
+        call_dir: Path | None,
+        stdout: str,
+        stderr: str,
+    ):
+        self.timeout = timeout
+        self.call_dir = call_dir
+        self.stdout = stdout
+        self.stderr = stderr
+        super().__init__(
+            f"codex exec timed out after {timeout}s; "
+            f"log_dir={call_dir}\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+        )
+
+
 @dataclass
 class CodexResponseCompleter(TextCompleter):
     """Text completer backed by OpenAI's Responses API."""
@@ -110,6 +131,9 @@ class CodexCliCompleter(TextCompleter):
     append_final_answer_instruction: bool = True
     log_dir: str | None = None
     call_name: str | None = None
+    config_overrides: tuple[str, ...] = ()
+    env: dict[str, str] | None = None
+    skip_git_repo_check: bool = False
     _call_idx: int = field(default=0, init=False, repr=False)
 
     def _build_prompt(self, prompt: str) -> str:
@@ -132,6 +156,8 @@ class CodexCliCompleter(TextCompleter):
         ]
         if self.cwd:
             cmd.extend(["-C", self.cwd])
+        if self.skip_git_repo_check:
+            cmd.append("--skip-git-repo-check")
         if self.ignore_user_config:
             cmd.append("--ignore-user-config")
         if self.ignore_rules:
@@ -142,8 +168,39 @@ class CodexCliCompleter(TextCompleter):
                 "-c",
                 f"model_reasoning_effort={json.dumps(self.reasoning_effort)}",
             ])
+        for override in self.config_overrides:
+            cmd.extend(["-c", override])
         cmd.append("-")
         return cmd
+
+    def _build_process_env(self) -> dict[str, str] | None:
+        if self.env is None:
+            return None
+        process_env = os.environ.copy()
+        process_env.update(self.env)
+        return process_env
+
+    def _log_env(self, call_dir: Path) -> None:
+        keys = (
+            "CUDA_VISIBLE_DEVICES",
+            "CUDA_DEVICE_ORDER",
+            "TORCH_CUDA_ARCH_LIST",
+            "PYTHONUNBUFFERED",
+            "PYTHONPATH",
+            "CUDA_HOME",
+            "LD_LIBRARY_PATH",
+            "TRITON_CACHE_DIR",
+            "TORCH_EXTENSIONS_DIR",
+        )
+        effective = os.environ.copy()
+        if self.env is not None:
+            effective.update(self.env)
+        logged = {key: effective[key] for key in keys if key in effective}
+        if logged:
+            (call_dir / "codex_env.json").write_text(
+                json.dumps(logged, indent=2, sort_keys=True),
+                encoding="utf-8",
+            )
 
     def _next_call_dir(self) -> Path | None:
         if not self.log_dir:
@@ -192,6 +249,7 @@ class CodexCliCompleter(TextCompleter):
                 json.dumps(cmd, indent=2),
                 encoding="utf-8",
             )
+            self._log_env(call_dir)
 
         try:
             try:
@@ -200,6 +258,7 @@ class CodexCliCompleter(TextCompleter):
                     stdin=asyncio.subprocess.PIPE,
                     stdout=stdout_target,
                     stderr=stderr_target,
+                    env=self._build_process_env(),
                     start_new_session=True,
                 )
                 communicate = process.communicate(prompt.encode("utf-8"))
@@ -219,9 +278,11 @@ class CodexCliCompleter(TextCompleter):
                             f"codex exec timed out after {self.timeout}s\n",
                             encoding="utf-8",
                         )
-                    raise RuntimeError(
-                        f"codex exec timed out after {self.timeout}s; "
-                        f"log_dir={call_dir}\nSTDOUT:\n{stdout_text}\nSTDERR:\n{stderr_text}"
+                    raise CodexCliTimeoutError(
+                        timeout=self.timeout,
+                        call_dir=call_dir,
+                        stdout=stdout_text,
+                        stderr=stderr_text,
                     ) from exc
                 except asyncio.CancelledError:
                     await _kill_process_tree(process)
