@@ -144,6 +144,10 @@ class CodexNoFinetuneConfig:
     # False is TTT Discover: non-auto, many short samples. True is AutoEvolve:
     # one Codex deep-dive workspace per sample with file edits and shell access.
     autonomous: bool = False
+    autonomous_blackbox: bool = False
+    blackbox_eval_socket: str | None = None
+    blackbox_eval_host: str = "127.0.0.1"
+    blackbox_eval_port: int | None = None
 
     wandb_project: str | None = None
     wandb_name: str | None = None
@@ -352,6 +356,10 @@ def _make_env(cfg: CodexNoFinetuneConfig, state: Any, sampler: StateSampler) -> 
     env.sampler = sampler
     env.state = state
     env.problem_type = cfg.problem_type
+    env.autonomous_blackbox = cfg.autonomous_blackbox
+    env.blackbox_eval_socket = cfg.blackbox_eval_socket
+    env.blackbox_eval_host = cfg.blackbox_eval_host
+    env.blackbox_eval_port = cfg.blackbox_eval_port
     return env
 
 
@@ -719,6 +727,50 @@ cd {isolated_workspace_shell}
         return ["unshare", "-Ur", "-m", "bash", "-lc", script]
 
 
+class BlackboxAutonomousCodexCliCompleter(AutonomousCodexCliCompleter):
+    """Autonomous Codex mode that delegates local evals to a blackbox service."""
+
+    def __init__(
+        self,
+        *,
+        blackbox_eval_socket: str | None,
+        blackbox_eval_host: str,
+        blackbox_eval_port: int | None,
+        **kwargs: Any,
+    ):
+        super().__init__(**kwargs)
+        self.blackbox_eval_socket = blackbox_eval_socket
+        self.blackbox_eval_host = blackbox_eval_host
+        self.blackbox_eval_port = blackbox_eval_port
+
+    def _build_prompt(self, prompt: str) -> str:
+        if self.prompt_builder is None:
+            raise ValueError(
+                "Blackbox autonomous mode requires an environment "
+                "build_blackbox_autonomous_prompt(...) hook."
+            )
+
+        workspace = self._next_workspace()
+        self._workspace = workspace
+
+        full_prompt = self.prompt_builder(
+            prompt=prompt,
+            workspace=workspace,
+            eval_timeout=self.eval_timeout,
+            num_cpus_per_task=self.num_cpus_per_task,
+            socket_path=self.blackbox_eval_socket,
+            host=self.blackbox_eval_host,
+            port=self.blackbox_eval_port,
+        )
+        if self.isolate_danger_full_access:
+            full_prompt = full_prompt.replace(
+                str(workspace),
+                str(self._isolated_workspace()),
+            )
+        (workspace / "prompt.txt").write_text(full_prompt, encoding="utf-8")
+        return full_prompt
+
+
 def _make_completer(
     cfg: CodexNoFinetuneConfig,
     *,
@@ -735,6 +787,33 @@ def _make_completer(
                     "Codex autonomous mode requires --codex-cli-sandbox workspace-write "
                     "or danger-full-access so Codex can write candidates."
             )
+            if cfg.autonomous_blackbox:
+                prompt_builder = (
+                    getattr(env, "build_blackbox_autonomous_prompt", None)
+                    if env is not None
+                    else None
+                )
+                return BlackboxAutonomousCodexCliCompleter(
+                    model_name=cfg.model_name,
+                    codex_command=cfg.cli_command,
+                    sandbox=cfg.cli_sandbox,
+                    cwd=None,
+                    repo_cwd=os.getcwd(),
+                    timeout=cfg.cli_timeout,
+                    semaphore=semaphore,
+                    log_path=cfg.log_path,
+                    problem_type=cfg.problem_type,
+                    step_idx=step_idx,
+                    eval_timeout=cfg.eval_timeout,
+                    num_cpus_per_task=max(1, int(cfg.num_cpus_per_task)),
+                    config_overrides=("shell_environment_policy.inherit=all",),
+                    isolate_danger_full_access=cfg.cli_sandbox == "danger-full-access",
+                    skip_git_repo_check=True,
+                    prompt_builder=prompt_builder,
+                    blackbox_eval_socket=cfg.blackbox_eval_socket,
+                    blackbox_eval_host=cfg.blackbox_eval_host,
+                    blackbox_eval_port=cfg.blackbox_eval_port,
+                )
             return AutonomousCodexCliCompleter(
                 model_name=cfg.model_name,
                 codex_command=cfg.cli_command,
@@ -1162,6 +1241,18 @@ async def main(cfg: CodexNoFinetuneConfig) -> None:
         raise ValueError("num_epochs must be >= 1")
     if not cfg.log_path:
         raise ValueError("log_path is required")
+    if cfg.autonomous_blackbox and not cfg.autonomous:
+        raise ValueError("autonomous_blackbox requires autonomous=True")
+    if (
+        cfg.autonomous_blackbox
+        and not cfg.blackbox_eval_socket
+        and cfg.blackbox_eval_port is None
+        and not os.environ.get("TTT_BLACKBOX_EVAL_SOCKET")
+        and not os.environ.get("TTT_BLACKBOX_EVAL_PORT")
+    ):
+        raise ValueError(
+            "autonomous_blackbox requires a blackbox eval socket or TCP port"
+        )
 
     object.__setattr__(cfg, "log_path", os.path.expanduser(cfg.log_path))
     os.makedirs(cfg.log_path, exist_ok=True)

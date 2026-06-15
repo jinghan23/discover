@@ -289,6 +289,18 @@ def parse_args() -> argparse.Namespace:
         help="AutoEvolve mode: give Codex a writable workspace for deep dives.",
     )
     parser.add_argument(
+        "--codex-autonomous-blackbox",
+        action="store_true",
+        help="In AutoEvolve mode, use a blackbox verifier service for local evals.",
+    )
+    parser.add_argument(
+        "--blackbox-eval-socket",
+        default=None,
+        help="Unix socket path for the blackbox verifier service.",
+    )
+    parser.add_argument("--blackbox-eval-host", default="127.0.0.1")
+    parser.add_argument("--blackbox-eval-port", type=int, default=None)
+    parser.add_argument(
         "--gpu",
         default=None,
         help="Set CUDA_VISIBLE_DEVICES for GPU tasks.",
@@ -320,6 +332,9 @@ def _configure_gpu_env(args: argparse.Namespace, spec: TaskSpec) -> None:
 
 def main() -> None:
     args = parse_args()
+    if args.codex_autonomous_blackbox and not args.codex_autonomous:
+        raise ValueError("--codex-autonomous-blackbox requires --codex-autonomous")
+
     spec = _task_spec(args)
     _configure_gpu_env(args, spec)
 
@@ -370,6 +385,10 @@ def main() -> None:
         print(f"eval_timeout={eval_timeout}")
         print(f"wandb_project={wandb_project!r}")
         print(f"codex_autonomous={args.codex_autonomous}")
+        print(f"codex_autonomous_blackbox={args.codex_autonomous_blackbox}")
+        print(f"blackbox_eval_socket={args.blackbox_eval_socket!r}")
+        print(f"blackbox_eval_host={args.blackbox_eval_host!r}")
+        print(f"blackbox_eval_port={args.blackbox_eval_port!r}")
         print(f"codex_cli_sandbox={codex_cli_sandbox!r}")
         print(f"codex_initial_pool_paths={initial_pools!r}")
         if spec.uses_gpu:
@@ -405,6 +424,10 @@ def main() -> None:
             initial_program_paths=tuple(args.codex_initial_program or ()),
             initial_pool_paths=initial_pools,
             autonomous=args.codex_autonomous,
+            autonomous_blackbox=args.codex_autonomous_blackbox,
+            blackbox_eval_socket=args.blackbox_eval_socket,
+            blackbox_eval_host=args.blackbox_eval_host,
+            blackbox_eval_port=args.blackbox_eval_port,
             wandb_project=wandb_project,
             wandb_name=experiment_name,
             log_path=str(Path(args.log_root) / experiment_name),
@@ -446,6 +469,10 @@ def main() -> None:
         codex_initial_program_paths=tuple(args.codex_initial_program or ()),
         codex_initial_pool_paths=initial_pools,
         codex_autonomous=args.codex_autonomous,
+        codex_autonomous_blackbox=args.codex_autonomous_blackbox,
+        blackbox_eval_socket=args.blackbox_eval_socket,
+        blackbox_eval_host=args.blackbox_eval_host,
+        blackbox_eval_port=args.blackbox_eval_port,
         remove_constant_reward_groups=remove_constant_reward_groups,
     )
     discover(config)

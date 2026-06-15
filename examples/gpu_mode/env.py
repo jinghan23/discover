@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from ttt_discover import BaseRewardEvaluator, DiscoverConfig, Environment, State, discover
+from ttt_discover.blackbox_eval import build_eval_client_source
 
 GPU_MODE_ROOT = Path(__file__).resolve().parent
 REPO_ROOT = GPU_MODE_ROOT.parents[1]
@@ -430,6 +431,68 @@ When done, put the best implementation in:
 The outer discovery runner will score the final contents of that `submission.py`
 with trusted repository files outside the Codex workspace before considering any
 code block in your final response.
+"""
+
+    def build_blackbox_autonomous_prompt(
+        self,
+        *,
+        prompt: str,
+        workspace: Path,
+        eval_timeout: int,
+        num_cpus_per_task: int,
+        socket_path: str | None = None,
+        host: str = "127.0.0.1",
+        port: int | None = None,
+    ) -> str:
+        del num_cpus_per_task
+        socket_path = socket_path or os.environ.get("TTT_BLACKBOX_EVAL_SOCKET")
+        host = os.environ.get("TTT_BLACKBOX_EVAL_HOST") or host
+        env_port = os.environ.get("TTT_BLACKBOX_EVAL_PORT")
+        if port is None and env_port:
+            port = int(env_port)
+        if socket_path is None and port is None:
+            raise ValueError(
+                "Blackbox autonomous GPUMode requires a socket path or TCP port."
+            )
+
+        (workspace / "submission.py").write_text(
+            self._initial_submission_code(),
+            encoding="utf-8",
+        )
+        (workspace / "eval_client.py").write_text(
+            build_eval_client_source(
+                problem_type=self.problem_type,
+                socket_path=socket_path,
+                host=host,
+                port=port,
+                timeout_s=max(1.0, float(eval_timeout)),
+            ),
+            encoding="utf-8",
+        )
+
+        evaluator_cmd = f"cd {shlex.quote(str(workspace))} && python eval_client.py"
+        return f"""{prompt}
+
+--- Autonomous GPUMode Blackbox Search Mode ---
+You may inspect files and run shell commands, but keep all edits inside this workspace:
+{workspace}
+
+Editable candidate:
+{workspace / "submission.py"}
+
+The local evaluator is a blackbox service. This workspace intentionally contains
+only `submission.py` and `eval_client.py`; hidden task files, reference code,
+test cases, and evaluator internals are not available here.
+
+Run this evaluator after each revision:
+{evaluator_cmd}
+
+Do not edit `eval_client.py` to improve a score. Only `submission.py` is a valid
+candidate artifact. The evaluator returns only compact pass/fail/score feedback,
+and the outer runner will re-score the final `submission.py` with trusted files.
+
+When done, put the best implementation in:
+{workspace / "submission.py"}
 """
 
     def get_question(self) -> str:

@@ -1,10 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+PYTHON_BIN="${PYTHON:-python}"
+DRY_RUN_ARGS=()
+if [[ "${RUN_0608_DRY_RUN:-0}" == "1" ]]; then
+    DRY_RUN_ARGS+=(--dry-run)
+fi
+
 # TTT Discover: non-auto, many short Codex samples driven by the sampler/evaluator.
 # groups-per-batch = parent states sampled per outer round.
 # group-size = Codex samples per parent; product is samples/evals per round.
-python repro/run_discovery.py \
+if [[ "${RUN_0608_ONLY_AUTONOMOUS:-0}" != "1" ]]; then
+"$PYTHON_BIN" repro/run_discovery.py \
     --task trimul \
     --runner codex_no_finetune \
     --experiment-name trimul_0608_ttt_discover_gpu2 \
@@ -23,15 +30,30 @@ python repro/run_discovery.py \
     --codex-cli-command codex \
     --codex-cli-sandbox read-only \
     --codex-cli-timeout 1200 \
-    --codex-max-concurrent-requests 4
+    --codex-max-concurrent-requests 4 \
+    "${DRY_RUN_ARGS[@]}"
+fi
 
 # Codex AutoEvolve: autonomous deep dive, one writable workspace per sample.
 # For GPUMode, danger-full-access is wrapped by the completer in an external
 # unshare mount namespace: Codex only sees the sample workspace, while CUDA
 # remains visible.
+# Optional blackbox verifier:
+#   RUN_0608_ONLY_AUTONOMOUS=1 TTT_BLACKBOX_EVAL_SOCKET=/tmp/ttt_blackbox_eval_trimul.sock bash repro/gpu_mode/run_0608.sh
+# Add RUN_0608_DRY_RUN=1 to validate command plumbing without launching Codex.
 # groups-per-batch = parent states sampled per outer round.
 # group-size = Codex samples per parent; product is samples/evals per round.
-python repro/run_discovery.py \
+BLACKBOX_ARGS=()
+if [[ -n "${TTT_BLACKBOX_EVAL_SOCKET:-}" ]]; then
+    BLACKBOX_ARGS+=(--codex-autonomous-blackbox --blackbox-eval-socket "$TTT_BLACKBOX_EVAL_SOCKET")
+elif [[ -n "${TTT_BLACKBOX_EVAL_PORT:-}" ]]; then
+    BLACKBOX_ARGS+=(--codex-autonomous-blackbox --blackbox-eval-port "$TTT_BLACKBOX_EVAL_PORT")
+    if [[ -n "${TTT_BLACKBOX_EVAL_HOST:-}" ]]; then
+        BLACKBOX_ARGS+=(--blackbox-eval-host "$TTT_BLACKBOX_EVAL_HOST")
+    fi
+fi
+
+"$PYTHON_BIN" repro/run_discovery.py \
     --task trimul \
     --runner codex_no_finetune \
     --experiment-name trimul_0608_codex_autoevolve_gpu2 \
@@ -51,4 +73,6 @@ python repro/run_discovery.py \
     --codex-cli-sandbox danger-full-access \
     --codex-cli-timeout 7200 \
     --codex-max-concurrent-requests 2 \
-    --codex-autonomous
+    --codex-autonomous \
+    "${BLACKBOX_ARGS[@]}" \
+    "${DRY_RUN_ARGS[@]}"

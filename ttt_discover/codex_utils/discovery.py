@@ -50,6 +50,10 @@ class DiscoverConfig:
     codex_initial_program_paths: tuple[str, ...] = ()
     codex_initial_pool_paths: tuple[str, ...] = ()
     codex_autonomous: bool = False
+    codex_autonomous_blackbox: bool = False
+    blackbox_eval_socket: str | None = None
+    blackbox_eval_host: str = "127.0.0.1"
+    blackbox_eval_port: int | None = None
 
 
 def _run_codex_no_finetune(config: DiscoverConfig) -> None:
@@ -85,6 +89,10 @@ def _run_codex_no_finetune(config: DiscoverConfig) -> None:
         initial_program_paths=config.codex_initial_program_paths,
         initial_pool_paths=config.codex_initial_pool_paths,
         autonomous=config.codex_autonomous,
+        autonomous_blackbox=config.codex_autonomous_blackbox,
+        blackbox_eval_socket=config.blackbox_eval_socket,
+        blackbox_eval_host=config.blackbox_eval_host,
+        blackbox_eval_port=config.blackbox_eval_port,
         wandb_project=config.wandb_project,
         wandb_name=experiment_name,
         log_path=log_path,
