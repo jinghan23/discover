@@ -267,6 +267,11 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=None,
     )
+    parser.add_argument(
+        "--reward-shaping",
+        action="store_true",
+        help="Enable fixed TTT-Discover score shaping before PUCT sampler updates.",
+    )
 
     parser.add_argument("--codex-backend", choices=("cli", "responses"), default="cli")
     parser.add_argument("--codex-model-name", default=None)
@@ -391,6 +396,7 @@ def main() -> None:
         print(f"blackbox_eval_port={args.blackbox_eval_port!r}")
         print(f"codex_cli_sandbox={codex_cli_sandbox!r}")
         print(f"codex_initial_pool_paths={initial_pools!r}")
+        print(f"reward_shaping={args.reward_shaping}")
         if spec.uses_gpu:
             print(f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')!r}")
             print(f"CUDA_DEVICE_ORDER={os.environ.get('CUDA_DEVICE_ORDER')!r}")
@@ -432,6 +438,7 @@ def main() -> None:
             wandb_name=experiment_name,
             log_path=str(Path(args.log_root) / experiment_name),
             remove_constant_reward_groups=remove_constant_reward_groups,
+            reward_shaping=args.reward_shaping,
         )
         asyncio.run(codex_no_finetune_main(cfg))
         return
@@ -474,6 +481,7 @@ def main() -> None:
         blackbox_eval_host=args.blackbox_eval_host,
         blackbox_eval_port=args.blackbox_eval_port,
         remove_constant_reward_groups=remove_constant_reward_groups,
+        reward_shaping=args.reward_shaping,
     )
     discover(config)
 
