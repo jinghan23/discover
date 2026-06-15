@@ -38,21 +38,9 @@ fi
 # For GPUMode, danger-full-access is wrapped by the completer in an external
 # unshare mount namespace: Codex only sees the sample workspace, while CUDA
 # remains visible.
-# Optional blackbox verifier:
-#   RUN_0608_ONLY_AUTONOMOUS=1 TTT_BLACKBOX_EVAL_SOCKET=/tmp/ttt_blackbox_eval_trimul.sock bash repro/gpu_mode/run_0608.sh
 # Add RUN_0608_DRY_RUN=1 to validate command plumbing without launching Codex.
 # groups-per-batch = parent states sampled per outer round.
 # group-size = Codex samples per parent; product is samples/evals per round.
-BLACKBOX_ARGS=()
-if [[ -n "${TTT_BLACKBOX_EVAL_SOCKET:-}" ]]; then
-    BLACKBOX_ARGS+=(--codex-autonomous-blackbox --blackbox-eval-socket "$TTT_BLACKBOX_EVAL_SOCKET")
-elif [[ -n "${TTT_BLACKBOX_EVAL_PORT:-}" ]]; then
-    BLACKBOX_ARGS+=(--codex-autonomous-blackbox --blackbox-eval-port "$TTT_BLACKBOX_EVAL_PORT")
-    if [[ -n "${TTT_BLACKBOX_EVAL_HOST:-}" ]]; then
-        BLACKBOX_ARGS+=(--blackbox-eval-host "$TTT_BLACKBOX_EVAL_HOST")
-    fi
-fi
-
 "$PYTHON_BIN" repro/run_discovery.py \
     --task trimul \
     --runner codex_no_finetune \
@@ -74,5 +62,4 @@ fi
     --codex-cli-timeout 7200 \
     --codex-max-concurrent-requests 2 \
     --codex-autonomous \
-    "${BLACKBOX_ARGS[@]}" \
     "${DRY_RUN_ARGS[@]}"
