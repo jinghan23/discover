@@ -1,0 +1,297 @@
+```python
+"""
+Outgoing TriMul forward pass.
+
+Algorithm:
+1. Fuse input LayerNorm into a compact FP16 activation matrix.
+2. Use one large GEMM for all five input projections.
+3. Triton-split the projection into gated left/right tensors laid out as
+   [B*H, N, N], enabling tensor-core batched GEMM for the triangle product.
+4. Fuse output LayerNorm and output gating; for D=H=128 also fuse the final
+   output projection into the same Triton kernel. Other output widths use one
+   final GEMM.
+"""
+
+import torch
+import triton
+import triton.language as tl
+
+
+_WEIGHT_CACHE = {}
+_MM_OUT_DTYPE_OK = None
+
+
+def _np2(x: int) -> int:
+    return 1 << (x - 1).bit_length()
+
+
+def _cdiv(a: int, b: int) -> int:
+    return triton.cdiv(a, b)
+
+
+@triton.jit
+def _ln_kernel(x, w, b, y, M: tl.constexpr, D: tl.constexpr, EPS: tl.constexpr,
+               BLOCK_M: tl.constexpr, BLOCK_D: tl.constexpr):
+    pid = tl.program_id(0)
+    rows = pid * BLOCK_M + tl.arange(0, BLOCK_M)
+    cols = tl.arange(0, BLOCK_D)
+    rm = rows < M
+    cm = cols < D
+    mask = rm[:, None] & cm[None, :]
+
+    vals = tl.load(x + rows[:, None] * D + cols[None, :], mask=mask, other=0.0).to(tl.float32)
+    vals_z = tl.where(cm[None, :], vals, 0.0)
+    mean = tl.sum(vals_z, axis=1) / D
+    diff = tl.where(cm[None, :], vals - mean[:, None], 0.0)
+    var = tl.sum(diff * diff, axis=1) / D
+    inv = tl.rsqrt(var + EPS)
+
+    ww = tl.load(w + cols, mask=cm, other=1.0).to(tl.float32)
+    bb = tl.load(b + cols, mask=cm, other=0.0).to(tl.float32)
+    out = (vals - mean[:, None]) * inv[:, None] * ww[None, :] + bb[None, :]
+    tl.store(y + rows[:, None] * D + cols[None, :], out, mask=mask)
+
+
+@triton.jit
+def _split_gate_nomask_kernel(p, l, r, og, M: tl.constexpr, N2: tl.constexpr,
+                              H: tl.constexpr, BLOCK_M: tl.constexpr,
+                              BLOCK_H: tl.constexpr):
+    pm = tl.program_id(0)
+    ph = tl.program_id(1)
+
+    rows = pm * BLOCK_M + tl.arange(0, BLOCK_M)
+    hs = ph * BLOCK_H + tl.arange(0, BLOCK_H)
+    rm = rows < M
+    hm = hs < H
+    mask = rm[:, None] & hm[None, :]
+
+    bidx = rows // N2
+    ij = rows - bidx * N2
+    out_off = bidx[:, None] * (H * N2) + hs[None, :] * N2 + ij[:, None]
+    base = p + rows[:, None] * (5 * H) + hs[None, :]
+
+    lp = tl.load(base, mask=mask, other=0.0).to(tl.float32)
+    rp = tl.load(base + H, mask=mask, other=0.0).to(tl.float32)
+    lg = tl.load(base + 2 * H, mask=mask, other=0.0).to(tl.float32)
+    rg = tl.load(base + 3 * H, mask=mask, other=0.0).to(tl.float32)
+    oo = tl.load(base + 4 * H, mask=mask, other=0.0).to(tl.float32)
+
+    tl.store(l + out_off, lp * tl.sigmoid(lg), mask=mask)
+    tl.store(r + out_off, rp * tl.sigmoid(rg), mask=mask)
+    tl.store(og + rows[:, None] * H + hs[None, :], tl.sigmoid(oo), mask=mask)
+
+
+@triton.jit
+def _split_gate_mask_kernel(p, m, l, r, og, M: tl.constexpr, N2: tl.constexpr,
+                            H: tl.constexpr, BLOCK_M: tl.constexpr,
+                            BLOCK_H: tl.constexpr):
+    pm = tl.program_id(0)
+    ph = tl.program_id(1)
+
+    rows = pm * BLOCK_M + tl.arange(0, BLOCK_M)
+    hs = ph * BLOCK_H + tl.arange(0, BLOCK_H)
+    rm = rows < M
+    hm = hs < H
+    mask = rm[:, None] & hm[None, :]
+
+    mv = tl.load(m + rows, mask=rm, other=0.0).to(tl.float32)
+    bidx = rows // N2
+    ij = rows - bidx * N2
+    out_off = bidx[:, None] * (H * N2) + hs[None, :] * N2 + ij[:, None]
+    base = p + rows[:, None] * (5 * H) + hs[None, :]
+
+    lp = tl.load(base, mask=mask, other=0.0).to(tl.float32)
+    rp = tl.load(base + H, mask=mask, other=0.0).to(tl.float32)
+    lg = tl.load(base + 2 * H, mask=mask, other=0.0).to(tl.float32)
+    rg = tl.load(base + 3 * H, mask=mask, other=0.0).to(tl.float32)
+    oo = tl.load(base + 4 * H, mask=mask, other=0.0).to(tl.float32)
+
+    tl.store(l + out_off, lp * tl.sigmoid(lg) * mv[:, None], mask=mask)
+    tl.store(r + out_off, rp * tl.sigmoid(rg) * mv[:, None], mask=mask)
+    tl.store(og + rows[:, None] * H + hs[None, :], tl.sigmoid(oo), mask=mask)
+
+
+@triton.jit
+def _final_ln_gate_out_128_kernel(tri, gate, w, b, wout, y,
+                                  M: tl.constexpr, N2: tl.constexpr,
+                                  EPS: tl.constexpr, BLOCK_M: tl.constexpr):
+    pid = tl.program_id(0)
+    rows = pid * BLOCK_M + tl.arange(0, BLOCK_M)
+    hs = tl.arange(0, 128)
+    ds = tl.arange(0, 128)
+    rm = rows < M
+
+    bidx = rows // N2
+    ij = rows - bidx * N2
+    off = bidx[:, None] * (128 * N2) + hs[None, :] * N2 + ij[:, None]
+
+    vals = tl.load(tri + off, mask=rm[:, None], other=0.0).to(tl.float32)
+    mean = tl.sum(vals, axis=1) * 0.0078125
+    diff = vals - mean[:, None]
+    var = tl.sum(diff * diff, axis=1) * 0.0078125
+    inv = tl.rsqrt(var + EPS)
+
+    ww = tl.load(w + hs).to(tl.float32)
+    bb = tl.load(b + hs).to(tl.float32)
+    gg = tl.load(gate + rows[:, None] * 128 + hs[None, :], mask=rm[:, None], other=0.0).to(tl.float32)
+    hidden = ((diff * inv[:, None] * ww[None, :] + bb[None, :]) * gg).to(tl.float16)
+
+    wo = tl.load(wout + hs[:, None] * 128 + ds[None, :])
+    acc = tl.dot(hidden, wo, out_dtype=tl.float32)
+    tl.store(y + rows[:, None] * 128 + ds[None, :], acc, mask=rm[:, None])
+
+
+@triton.jit
+def _final_ln_gate_kernel(tri, gate, w, b, y,
+                          M: tl.constexpr, N2: tl.constexpr,
+                          EPS: tl.constexpr, BLOCK_M: tl.constexpr):
+    pid = tl.program_id(0)
+    rows = pid * BLOCK_M + tl.arange(0, BLOCK_M)
+    hs = tl.arange(0, 128)
+    rm = rows < M
+
+    bidx = rows // N2
+    ij = rows - bidx * N2
+    off = bidx[:, None] * (128 * N2) + hs[None, :] * N2 + ij[:, None]
+
+    vals = tl.load(tri + off, mask=rm[:, None], other=0.0).to(tl.float32)
+    mean = tl.sum(vals, axis=1) * 0.0078125
+    diff = vals - mean[:, None]
+    var = tl.sum(diff * diff, axis=1) * 0.0078125
+    inv = tl.rsqrt(var + EPS)
+
+    ww = tl.load(w + hs).to(tl.float32)
+    bb = tl.load(b + hs).to(tl.float32)
+    gg = tl.load(gate + rows[:, None] * 128 + hs[None, :], mask=rm[:, None], other=0.0).to(tl.float32)
+    out = ((diff * inv[:, None] * ww[None, :] + bb[None, :]) * gg).to(tl.float16)
+    tl.store(y + rows[:, None] * 128 + hs[None, :], out, mask=rm[:, None])
+
+
+def _weights(weights):
+    key = (
+        weights["left_proj.weight"].data_ptr(),
+        weights["right_proj.weight"].data_ptr(),
+        weights["left_gate.weight"].data_ptr(),
+        weights["right_gate.weight"].data_ptr(),
+        weights["out_gate.weight"].data_ptr(),
+        weights["to_out.weight"].data_ptr(),
+        tuple(weights["left_proj.weight"].shape),
+        tuple(weights["to_out.weight"].shape),
+        weights["left_proj.weight"].device.index,
+    )
+    cached = _WEIGHT_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    if len(_WEIGHT_CACHE) > 8:
+        _WEIGHT_CACHE.clear()
+
+    wcat = torch.cat(
+        (
+            weights["left_proj.weight"],
+            weights["right_proj.weight"],
+            weights["left_gate.weight"],
+            weights["right_gate.weight"],
+            weights["out_gate.weight"],
+        ),
+        dim=0,
+    ).to(torch.float16).t().contiguous()
+
+    wout = weights["to_out.weight"].to(torch.float16).t().contiguous()
+    _WEIGHT_CACHE[key] = (wcat, wout)
+    return wcat, wout
+
+
+def _mm32(a, b):
+    global _MM_OUT_DTYPE_OK
+    if _MM_OUT_DTYPE_OK is True:
+        return torch.mm(a, b, out_dtype=torch.float32)
+    if _MM_OUT_DTYPE_OK is None:
+        try:
+            y = torch.mm(a, b, out_dtype=torch.float32)
+            _MM_OUT_DTYPE_OK = True
+            return y
+        except TypeError:
+            _MM_OUT_DTYPE_OK = False
+    return torch.mm(a, b).to(torch.float32)
+
+
+def custom_kernel(data):
+    x, mask, weights, config = data
+    B, N, _, D = x.shape
+    H = int(config["hidden_dim"])
+    M = B * N * N
+    N2 = N * N
+    eps = float(config.get("eps", 1.0e-5))
+
+    if not x.is_contiguous():
+        x = x.contiguous()
+
+    has_mask = (mask is not None) and (not bool(config.get("nomask", False)))
+    if has_mask and not mask.is_contiguous():
+        mask = mask.contiguous()
+
+    wcat, wout = _weights(weights)
+
+    xh = torch.empty((M, D), device=x.device, dtype=torch.float16)
+    bd = _np2(D)
+    bm_ln = 16 if D <= 128 else 8
+    _ln_kernel[(_cdiv(M, bm_ln),)](
+        x, weights["norm.weight"], weights["norm.bias"], xh,
+        M, D, eps,
+        BLOCK_M=bm_ln, BLOCK_D=bd,
+        num_warps=4 if D <= 128 else 8,
+    )
+
+    proj = torch.mm(xh, wcat)
+    del xh
+
+    left = torch.empty((B * H, N, N), device=x.device, dtype=torch.float16)
+    right = torch.empty((B * H, N, N), device=x.device, dtype=torch.float16)
+    out_gate = torch.empty((M, H), device=x.device, dtype=torch.float16)
+
+    if has_mask:
+        _split_gate_mask_kernel[(_cdiv(M, 32), _cdiv(H, 64))](
+            proj, mask, left, right, out_gate,
+            M, N2, H,
+            BLOCK_M=32, BLOCK_H=64,
+            num_warps=4,
+        )
+    else:
+        _split_gate_nomask_kernel[(_cdiv(M, 32), _cdiv(H, 64))](
+            proj, left, right, out_gate,
+            M, N2, H,
+            BLOCK_M=32, BLOCK_H=64,
+            num_warps=4,
+        )
+    del proj
+
+    tri = torch.bmm(left, right.transpose(1, 2))
+    del left, right
+
+    if D == 128 and H == 128:
+        out = torch.empty((M, 128), device=x.device, dtype=torch.float32)
+        _final_ln_gate_out_128_kernel[(_cdiv(M, 16),)](
+            tri, out_gate,
+            weights["to_out_norm.weight"], weights["to_out_norm.bias"],
+            wout, out,
+            M, N2, eps,
+            BLOCK_M=16,
+            num_warps=4,
+        )
+        return out.view(B, N, N, 128)
+
+    hidden = torch.empty((M, H), device=x.device, dtype=torch.float16)
+    _final_ln_gate_kernel[(_cdiv(M, 16),)](
+        tri, out_gate,
+        weights["to_out_norm.weight"], weights["to_out_norm.bias"],
+        hidden,
+        M, N2, eps,
+        BLOCK_M=16,
+        num_warps=4,
+    )
+    del tri, out_gate
+
+    out = _mm32(hidden, wout)
+    return out.view(B, N, N, D)
+```

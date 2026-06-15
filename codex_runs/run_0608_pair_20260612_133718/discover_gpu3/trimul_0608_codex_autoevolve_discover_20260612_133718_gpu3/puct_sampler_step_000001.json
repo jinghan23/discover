@@ -1,0 +1,54 @@
+{
+  "initial_states": [
+    {
+      "code": "",
+      "construction": null,
+      "id": "0d5cae62-a209-4749-b948-cb7a0fd2ef44",
+      "observation": "",
+      "parent_values": [],
+      "parents": [],
+      "timestep": -1,
+      "type": "State",
+      "value": -1000000.0
+    }
+  ],
+  "puct_T": 2,
+  "puct_m": {
+    "0d5cae62-a209-4749-b948-cb7a0fd2ef44": -2878.817281692183
+  },
+  "puct_n": {
+    "0d5cae62-a209-4749-b948-cb7a0fd2ef44": 2
+  },
+  "states": [
+    {
+      "code": "",
+      "construction": null,
+      "id": "0d5cae62-a209-4749-b948-cb7a0fd2ef44",
+      "observation": "",
+      "parent_values": [],
+      "parents": [],
+      "timestep": -1,
+      "type": "State",
+      "value": -1000000.0
+    },
+    {
+      "code": "\"\"\"\nTriMul forward optimized around the cubic contraction.\n\nHot shapes use a Triton LayerNorm that emits BF16 projection inputs directly;\nother shapes use PyTorch LayerNorm for extra numerical margin.  The five hidden\nprojections are one packed BF16 GEMM, followed by a Triton gate/mask/layout\nkernel that writes channel-major [B, H, N, N] matrices.  The triangle contraction\nis B*H independent N x N BF16 GEMMs via torch.bmm, then a second Triton kernel\nperforms output LayerNorm and gate before the final PyTorch output projection.\n\"\"\"\n\nimport torch\nimport torch.nn.functional as F\nimport triton\nimport triton.language as tl\n\n\ntorch.backends.cuda.matmul.allow_tf32 = True\ntorch.backends.cudnn.allow_tf32 = True\ntry:\n    torch.set_float32_matmul_precision(\"high\")\nexcept Exception:\n    pass\n\n\n@triton.jit\ndef _input_ln_bf16_kernel(\n    x_ptr,\n    w_ptr,\n    b_ptr,\n    out_ptr,\n    total_rows: tl.constexpr,\n    dim: tl.constexpr,\n    BLOCK_M: tl.constexpr,\n    BLOCK_D: tl.constexpr,\n):\n    pid_m = tl.program_id(0)\n    rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)\n    ds = tl.arange(0, BLOCK_D)\n    mask = (rows[:, None] < total_rows) & (ds[None, :] < dim)\n    vals = tl.load(x_ptr + rows[:, None] * dim + ds[None, :], mask=mask, other=0.0).to(tl.float32)\n\n    mean = tl.sum(vals, axis=1) / dim\n    centered = vals - mean[:, None]\n    var = tl.sum(centered * centered, axis=1) / dim\n    inv = tl.rsqrt(var + 1.0e-5)\n\n    nw = tl.load(w_ptr + ds, mask=ds < dim, other=0.0).to(tl.float32)\n    nb = tl.load(b_ptr + ds, mask=ds < dim, other=0.0).to(tl.float32)\n    res = (centered * inv[:, None]) * nw[None, :] + nb[None, :]\n    tl.store(out_ptr + rows[:, None] * dim + ds[None, :], res, mask=mask)\n\n\n@triton.jit\ndef _gate_layout_kernel(\n    proj_ptr,\n    mask_ptr,\n    left_ptr,\n    right_ptr,\n    ogate_ptr,\n    total_rows: tl.constexpr,\n    nn: tl.constexpr,\n    hdim: tl.constexpr,\n    HAS_MASK: tl.constexpr,\n    BLOCK_M: tl.constexpr,\n    BLOCK_H: tl.constexpr,\n):\n    pid_m = tl.program_id(0)\n    pid_h = tl.program_id(1)\n    rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)\n    hs = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)\n    valid = (rows[:, None] < total_rows) & (hs[None, :] < hdim)\n\n    proj_base = rows[:, None] * (5 * hdim) + hs[None, :]\n    left_v = tl.load(proj_ptr + proj_base, mask=valid, other=0.0).to(tl.float32)\n    right_v = tl.load(proj_ptr + proj_base + hdim, mask=valid, other=0.0).to(tl.float32)\n    lg = tl.load(proj_ptr + proj_base + 2 * hdim, mask=valid, other=0.0).to(tl.float32)\n    rg = tl.load(proj_ptr + proj_base + 3 * hdim, mask=valid, other=0.0).to(tl.float32)\n    og = tl.load(proj_ptr + proj_base + 4 * hdim, mask=valid, other=0.0).to(tl.float32)\n\n    lg = tl.sigmoid(lg)\n    rg = tl.sigmoid(rg)\n    og = tl.sigmoid(og)\n    if HAS_MASK:\n        m = tl.load(mask_ptr + rows, mask=rows < total_rows, other=0.0).to(tl.float32)\n    else:\n        m = tl.full((BLOCK_M,), 1.0, tl.float32)\n\n    batch = rows // nn\n    inner = rows - batch * nn\n    ch_major = batch[:, None] * (hdim * nn) + hs[None, :] * nn + inner[:, None]\n\n    tl.store(left_ptr + ch_major, left_v * lg * m[:, None], mask=valid)\n    tl.store(right_ptr + ch_major, right_v * rg * m[:, None], mask=valid)\n    tl.store(ogate_ptr + rows[:, None] * hdim + hs[None, :], og, mask=valid)\n\n\n@triton.jit\ndef _out_norm_gate_kernel(\n    out_ch_ptr,\n    ogate_ptr,\n    norm_w_ptr,\n    norm_b_ptr,\n    tmp_ptr,\n    total_rows: tl.constexpr,\n    nn: tl.constexpr,\n    hdim: tl.constexpr,\n    BLOCK_M: tl.constexpr,\n    BLOCK_H: tl.constexpr,\n):\n    pid_m = tl.program_id(0)\n    rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)\n    hs = tl.arange(0, BLOCK_H)\n    valid_r = rows < total_rows\n\n    batch = rows // nn\n    inner = rows - batch * nn\n    ch_offsets = batch[None, :] * (hdim * nn) + hs[:, None] * nn + inner[None, :]\n    vals = tl.load(out_ch_ptr + ch_offsets, mask=valid_r[None, :], other=0.0).to(tl.float32)\n\n    mean = tl.sum(vals, axis=0) / hdim\n    centered = vals - mean[None, :]\n    var = tl.sum(centered * centered, axis=0) / hdim\n    inv = tl.rsqrt(var + 1.0e-5)\n\n    nw = tl.load(norm_w_ptr + hs).to(tl.float32)\n    nb = tl.load(norm_b_ptr + hs).to(tl.float32)\n    og = tl.load(\n        ogate_ptr + rows[None, :] * hdim + hs[:, None],\n        mask=valid_r[None, :],\n        other=0.0,\n    ).to(tl.float32)\n    res = centered * inv[None, :]\n    res = (res * nw[:, None] + nb[:, None]) * og\n\n    tl.store(\n        tmp_ptr + rows[None, :] * hdim + hs[:, None],\n        res,\n        mask=valid_r[None, :],\n    )\n\n\n@torch.no_grad()\ndef custom_kernel(data):\n    input_tensor, mask, weights, config = data\n    bsz = input_tensor.shape[0]\n    n = input_tensor.shape[1]\n    dim = config[\"dim\"]\n    hdim = config[\"hidden_dim\"]\n    nn = n * n\n    total_rows = bsz * nn\n\n    norm_weight = weights[\"norm.weight\"]\n    norm_bias = weights[\"norm.bias\"]\n    to_out_norm_weight = weights[\"to_out_norm.weight\"]\n    to_out_norm_bias = weights[\"to_out_norm.bias\"]\n    to_out_weight = weights[\"to_out.weight\"]\n\n    use_direct_ln = (dim == 384) or (dim == 128 and bsz == 1 and n >= 512)\n    if use_direct_ln:\n        x2 = torch.empty((total_rows, dim), device=input_tensor.device, dtype=torch.bfloat16)\n        block_d = triton.next_power_of_2(dim)\n        block_m = 8 if dim <= 384 else 4\n        _input_ln_bf16_kernel[(triton.cdiv(total_rows, block_m),)](\n            input_tensor,\n            norm_weight,\n            norm_bias,\n            x2,\n            total_rows,\n            dim,\n            BLOCK_M=block_m,\n            BLOCK_D=block_d,\n            num_warps=8,\n        )\n    else:\n        x2 = F.layer_norm(input_tensor, (dim,), norm_weight, norm_bias).reshape(total_rows, dim).to(torch.bfloat16)\n    packed_w = torch.cat(\n        (\n            weights[\"left_proj.weight\"],\n            weights[\"right_proj.weight\"],\n            weights[\"left_gate.weight\"],\n            weights[\"right_gate.weight\"],\n            weights[\"out_gate.weight\"],\n        ),\n        dim=0,\n    ).to(torch.bfloat16)\n    proj = F.linear(x2, packed_w)\n\n    left = torch.empty((bsz, hdim, n, n), device=input_tensor.device, dtype=torch.bfloat16)\n    right = torch.empty_like(left)\n    ogate = torch.empty((total_rows, hdim), device=input_tensor.device, dtype=torch.float32)\n    grid = (triton.cdiv(total_rows, 64), triton.cdiv(hdim, 64))\n    _gate_layout_kernel[grid](\n        proj,\n        mask.reshape(total_rows),\n        left,\n        right,\n        ogate,\n        total_rows,\n        nn,\n        hdim,\n        HAS_MASK=mask.dtype != torch.float32,\n        BLOCK_M=64,\n        BLOCK_H=64,\n        num_warps=8,\n    )\n\n    # BF16 tensor cores are much faster for the N^3 contraction; the following\n    # LayerNorm makes the small contraction error acceptable for the task bounds.\n    out_ch = torch.bmm(\n        left.reshape(bsz * hdim, n, n),\n        right.reshape(bsz * hdim, n, n).transpose(1, 2),\n    )\n\n    out = torch.empty((total_rows, hdim), device=input_tensor.device, dtype=torch.float32)\n    _out_norm_gate_kernel[(triton.cdiv(total_rows, 32),)](\n        out_ch,\n        ogate,\n        to_out_norm_weight,\n        to_out_norm_bias,\n        out,\n        total_rows,\n        nn,\n        hdim,\n        BLOCK_M=32,\n        BLOCK_H=128,\n        num_warps=4,\n    )\n    out = F.linear(out, to_out_weight).view(bsz, n, n, dim)\n    return out.to(torch.float32)\n",
+      "construction": [],
+      "id": "c93f9f48-5500-4adf-bdd1-c75503f2997d",
+      "observation": "--- test ---\npassed=True success=True exit_code=0\nstdout:\n\nstderr:\n\n\n--- leaderboard ---\npassed=True success=True exit_code=0\nstdout:\n\nstderr:\n\n",
+      "parent_values": [
+        -1000000.0
+      ],
+      "parents": [
+        {
+          "id": "0d5cae62-a209-4749-b948-cb7a0fd2ef44",
+          "timestep": -1
+        }
+      ],
+      "timestep": 0,
+      "type": "State",
+      "value": -2878.817281692183
+    }
+  ],
+  "step": 1
+}

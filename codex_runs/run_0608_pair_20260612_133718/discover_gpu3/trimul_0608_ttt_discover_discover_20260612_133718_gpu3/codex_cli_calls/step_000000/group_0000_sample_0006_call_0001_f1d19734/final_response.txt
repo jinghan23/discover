@@ -1,0 +1,204 @@
+```python
+"""
+TriMul outgoing forward pass.
+
+The implementation keeps the numerically sensitive LayerNorms in PyTorch, fuses the
+post-normalization projections, sigmoid gates, and optional mask application in one
+Triton kernel, then computes the N^3 outgoing triangle multiplication as a strided
+batched GEMM over hidden channels:
+    out[b, d] = left[b, :, :, d] @ right[b, :, :, d].T
+The final output LayerNorm, output gate, and projection are then applied to produce
+float32 output.
+"""
+
+import torch
+import torch.nn.functional as F
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def _project_gate_kernel(
+    x_ptr,
+    mask_ptr,
+    left_w,
+    right_w,
+    left_gate_w,
+    right_gate_w,
+    out_gate_w,
+    left_ptr,
+    right_ptr,
+    out_gate_ptr,
+    total_tokens: tl.constexpr,
+    dim: tl.constexpr,
+    hidden: tl.constexpr,
+    has_mask: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    BLOCK_C: tl.constexpr,
+):
+    pid_t = tl.program_id(0)
+    pid_d = tl.program_id(1)
+
+    offs_t = pid_t * BLOCK_T + tl.arange(0, BLOCK_T)
+    offs_d = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
+    offs_c = tl.arange(0, BLOCK_C)
+
+    valid_t = offs_t < total_tokens
+    valid_d = offs_d < hidden
+
+    acc_l = tl.zeros((BLOCK_T, BLOCK_D), tl.float32)
+    acc_r = tl.zeros((BLOCK_T, BLOCK_D), tl.float32)
+    acc_lg = tl.zeros((BLOCK_T, BLOCK_D), tl.float32)
+    acc_rg = tl.zeros((BLOCK_T, BLOCK_D), tl.float32)
+    acc_og = tl.zeros((BLOCK_T, BLOCK_D), tl.float32)
+
+    for c0 in range(0, dim, BLOCK_C):
+        c = c0 + offs_c
+        valid_c = c < dim
+
+        x = tl.load(
+            x_ptr + offs_t[:, None] * dim + c[None, :],
+            mask=valid_t[:, None] & valid_c[None, :],
+            other=0.0,
+        )
+
+        wl = tl.load(
+            left_w + offs_d[None, :] * dim + c[:, None],
+            mask=valid_c[:, None] & valid_d[None, :],
+            other=0.0,
+        )
+        wr = tl.load(
+            right_w + offs_d[None, :] * dim + c[:, None],
+            mask=valid_c[:, None] & valid_d[None, :],
+            other=0.0,
+        )
+        wlg = tl.load(
+            left_gate_w + offs_d[None, :] * dim + c[:, None],
+            mask=valid_c[:, None] & valid_d[None, :],
+            other=0.0,
+        )
+        wrg = tl.load(
+            right_gate_w + offs_d[None, :] * dim + c[:, None],
+            mask=valid_c[:, None] & valid_d[None, :],
+            other=0.0,
+        )
+        wog = tl.load(
+            out_gate_w + offs_d[None, :] * dim + c[:, None],
+            mask=valid_c[:, None] & valid_d[None, :],
+            other=0.0,
+        )
+
+        acc_l += tl.dot(x, wl, out_dtype=tl.float32)
+        acc_r += tl.dot(x, wr, out_dtype=tl.float32)
+        acc_lg += tl.dot(x, wlg, out_dtype=tl.float32)
+        acc_rg += tl.dot(x, wrg, out_dtype=tl.float32)
+        acc_og += tl.dot(x, wog, out_dtype=tl.float32)
+
+    lg = tl.sigmoid(acc_lg)
+    rg = tl.sigmoid(acc_rg)
+    og = tl.sigmoid(acc_og)
+
+    if has_mask:
+        m = tl.load(mask_ptr + offs_t, mask=valid_t, other=0.0).to(tl.float32)
+        acc_l = acc_l * m[:, None]
+        acc_r = acc_r * m[:, None]
+
+    tl.store(
+        left_ptr + offs_t[:, None] * hidden + offs_d[None, :],
+        acc_l * lg,
+        mask=valid_t[:, None] & valid_d[None, :],
+    )
+    tl.store(
+        right_ptr + offs_t[:, None] * hidden + offs_d[None, :],
+        acc_r * rg,
+        mask=valid_t[:, None] & valid_d[None, :],
+    )
+    tl.store(
+        out_gate_ptr + offs_t[:, None] * hidden + offs_d[None, :],
+        og,
+        mask=valid_t[:, None] & valid_d[None, :],
+    )
+
+
+def _fused_project_gate(x, mask, weights, bs, n, dim, hidden_dim, has_mask):
+    total = bs * n * n
+    left = torch.empty((total, hidden_dim), device=x.device, dtype=torch.float32)
+    right = torch.empty_like(left)
+    out_gate = torch.empty_like(left)
+
+    block_t = 16
+    block_d = 32
+    block_c = 64
+
+    grid = (triton.cdiv(total, block_t), triton.cdiv(hidden_dim, block_d))
+    _project_gate_kernel[grid](
+        x,
+        mask,
+        weights["left_proj.weight"],
+        weights["right_proj.weight"],
+        weights["left_gate.weight"],
+        weights["right_gate.weight"],
+        weights["out_gate.weight"],
+        left,
+        right,
+        out_gate,
+        total,
+        dim,
+        hidden_dim,
+        has_mask,
+        BLOCK_T=block_t,
+        BLOCK_D=block_d,
+        BLOCK_C=block_c,
+        num_warps=4,
+        num_stages=3,
+    )
+    return left, right, out_gate
+
+
+def custom_kernel(data):
+    input_tensor, mask, weights, config = data
+    dim = int(config["dim"])
+    hidden_dim = int(config["hidden_dim"])
+
+    bs, n, _, _ = input_tensor.shape
+    has_mask = mask is not None and not bool(config.get("nomask", False))
+
+    x = F.layer_norm(
+        input_tensor,
+        (dim,),
+        weights["norm.weight"],
+        weights["norm.bias"],
+        eps=1e-5,
+    ).contiguous()
+
+    flat_mask = mask.contiguous().view(-1) if has_mask else input_tensor.new_empty((1,))
+    left, right, out_gate = _fused_project_gate(
+        x.view(-1, dim),
+        flat_mask,
+        weights,
+        bs,
+        n,
+        dim,
+        hidden_dim,
+        has_mask,
+    )
+
+    left = left.view(bs, n, n, hidden_dim).permute(0, 3, 1, 2).reshape(bs * hidden_dim, n, n)
+    right = right.view(bs, n, n, hidden_dim).permute(0, 3, 1, 2).reshape(bs * hidden_dim, n, n)
+
+    out = torch.bmm(left, right.transpose(1, 2))
+    out = out.view(bs, hidden_dim, n, n).permute(0, 2, 3, 1).contiguous()
+
+    out = F.layer_norm(
+        out,
+        (hidden_dim,),
+        weights["to_out_norm.weight"],
+        weights["to_out_norm.bias"],
+        eps=1e-5,
+    )
+
+    out = out * out_gate.view(bs, n, n, hidden_dim)
+    out = F.linear(out, weights["to_out.weight"])
+    return out.to(torch.float32)
+```

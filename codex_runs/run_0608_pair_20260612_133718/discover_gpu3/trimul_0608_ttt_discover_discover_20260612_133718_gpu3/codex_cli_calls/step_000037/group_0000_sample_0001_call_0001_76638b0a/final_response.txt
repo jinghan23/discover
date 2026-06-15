@@ -1,0 +1,453 @@
+```python
+"""
+Outgoing TriMul forward pass.
+
+Uses Triton LayerNorm kernels, packed fp16 projection weights, cuBLAS batched GEMM
+for the N^3 triangle update, and a fused Triton epilogue for output LayerNorm,
+output gate, and final projection. For dim=128, the first LayerNorm/projection/
+gating split is fused directly into the left/right BMM operands.
+"""
+
+import torch
+import triton
+import triton.language as tl
+
+
+_WEIGHT_CACHE = {}
+_WS_CACHE = {}
+
+try:
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
+    torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = True
+except Exception:
+    pass
+
+
+def _cdiv(a, b):
+    return triton.cdiv(int(a), int(b))
+
+
+@triton.jit
+def _ln384(x, w, b, y, EPS: tl.constexpr, BM: tl.constexpr):
+    pid = tl.program_id(0)
+    r = pid * BM + tl.arange(0, BM)
+    c = tl.arange(0, 128)
+
+    v0 = tl.load(x + r[:, None] * 384 + c[None, :]).to(tl.float32)
+    v1 = tl.load(x + r[:, None] * 384 + (c + 128)[None, :]).to(tl.float32)
+    v2 = tl.load(x + r[:, None] * 384 + (c + 256)[None, :]).to(tl.float32)
+
+    s = tl.sum(v0, axis=1) + tl.sum(v1, axis=1) + tl.sum(v2, axis=1)
+    q = tl.sum(v0 * v0, axis=1) + tl.sum(v1 * v1, axis=1) + tl.sum(v2 * v2, axis=1)
+    m = s * 0.0026041666666666665
+    inv = tl.rsqrt(tl.maximum(q * 0.0026041666666666665 - m * m, 0.0) + EPS)
+
+    w0 = tl.load(w + c).to(tl.float32)
+    w1 = tl.load(w + c + 128).to(tl.float32)
+    w2 = tl.load(w + c + 256).to(tl.float32)
+    b0 = tl.load(b + c).to(tl.float32)
+    b1 = tl.load(b + c + 128).to(tl.float32)
+    b2 = tl.load(b + c + 256).to(tl.float32)
+
+    tl.store(y + r[:, None] * 384 + c[None, :], ((v0 - m[:, None]) * inv[:, None] * w0[None, :] + b0[None, :]).to(tl.float16))
+    tl.store(y + r[:, None] * 384 + (c + 128)[None, :], ((v1 - m[:, None]) * inv[:, None] * w1[None, :] + b1[None, :]).to(tl.float16))
+    tl.store(y + r[:, None] * 384 + (c + 256)[None, :], ((v2 - m[:, None]) * inv[:, None] * w2[None, :] + b2[None, :]).to(tl.float16))
+
+
+@triton.jit
+def _ln768(x, w, b, y, EPS: tl.constexpr, BM: tl.constexpr):
+    pid = tl.program_id(0)
+    r = pid * BM + tl.arange(0, BM)
+    c = tl.arange(0, 128)
+
+    v0 = tl.load(x + r[:, None] * 768 + c[None, :]).to(tl.float32)
+    v1 = tl.load(x + r[:, None] * 768 + (c + 128)[None, :]).to(tl.float32)
+    v2 = tl.load(x + r[:, None] * 768 + (c + 256)[None, :]).to(tl.float32)
+    v3 = tl.load(x + r[:, None] * 768 + (c + 384)[None, :]).to(tl.float32)
+    v4 = tl.load(x + r[:, None] * 768 + (c + 512)[None, :]).to(tl.float32)
+    v5 = tl.load(x + r[:, None] * 768 + (c + 640)[None, :]).to(tl.float32)
+
+    s = tl.sum(v0, axis=1) + tl.sum(v1, axis=1) + tl.sum(v2, axis=1) + tl.sum(v3, axis=1) + tl.sum(v4, axis=1) + tl.sum(v5, axis=1)
+    q = tl.sum(v0 * v0, axis=1) + tl.sum(v1 * v1, axis=1) + tl.sum(v2 * v2, axis=1) + tl.sum(v3 * v3, axis=1) + tl.sum(v4 * v4, axis=1) + tl.sum(v5 * v5, axis=1)
+    m = s * 0.0013020833333333333
+    inv = tl.rsqrt(tl.maximum(q * 0.0013020833333333333 - m * m, 0.0) + EPS)
+
+    w0 = tl.load(w + c).to(tl.float32)
+    w1 = tl.load(w + c + 128).to(tl.float32)
+    w2 = tl.load(w + c + 256).to(tl.float32)
+    w3 = tl.load(w + c + 384).to(tl.float32)
+    w4 = tl.load(w + c + 512).to(tl.float32)
+    w5 = tl.load(w + c + 640).to(tl.float32)
+    b0 = tl.load(b + c).to(tl.float32)
+    b1 = tl.load(b + c + 128).to(tl.float32)
+    b2 = tl.load(b + c + 256).to(tl.float32)
+    b3 = tl.load(b + c + 384).to(tl.float32)
+    b4 = tl.load(b + c + 512).to(tl.float32)
+    b5 = tl.load(b + c + 640).to(tl.float32)
+
+    tl.store(y + r[:, None] * 768 + c[None, :], ((v0 - m[:, None]) * inv[:, None] * w0[None, :] + b0[None, :]).to(tl.float16))
+    tl.store(y + r[:, None] * 768 + (c + 128)[None, :], ((v1 - m[:, None]) * inv[:, None] * w1[None, :] + b1[None, :]).to(tl.float16))
+    tl.store(y + r[:, None] * 768 + (c + 256)[None, :], ((v2 - m[:, None]) * inv[:, None] * w2[None, :] + b2[None, :]).to(tl.float16))
+    tl.store(y + r[:, None] * 768 + (c + 384)[None, :], ((v3 - m[:, None]) * inv[:, None] * w3[None, :] + b3[None, :]).to(tl.float16))
+    tl.store(y + r[:, None] * 768 + (c + 512)[None, :], ((v4 - m[:, None]) * inv[:, None] * w4[None, :] + b4[None, :]).to(tl.float16))
+    tl.store(y + r[:, None] * 768 + (c + 640)[None, :], ((v5 - m[:, None]) * inv[:, None] * w5[None, :] + b5[None, :]).to(tl.float16))
+
+
+@triton.jit
+def _proj128_fused(x, mask, nw, nb, wcat, l, rgt, og, N2: tl.constexpr, HAS_MASK: tl.constexpr, EPS: tl.constexpr, BM: tl.constexpr, BH: tl.constexpr):
+    pm = tl.program_id(0)
+    ph = tl.program_id(1)
+    rows = pm * BM + tl.arange(0, BM)
+    h = ph * BH + tl.arange(0, BH)
+    c = tl.arange(0, 128)
+
+    v = tl.load(x + rows[:, None] * 128 + c[None, :]).to(tl.float32)
+    m = tl.sum(v, axis=1) * 0.0078125
+    q = tl.sum(v * v, axis=1) * 0.0078125
+    inv = tl.rsqrt(tl.maximum(q - m * m, 0.0) + EPS)
+
+    ww = tl.load(nw + c).to(tl.float32)
+    bb = tl.load(nb + c).to(tl.float32)
+    xn = ((v - m[:, None]) * inv[:, None] * ww[None, :] + bb[None, :]).to(tl.float16)
+
+    bid = rows // N2
+    ij = rows - bid * N2
+    out_off = bid[:, None] * (128 * N2) + h[None, :] * N2 + ij[:, None]
+
+    mult = 1.0
+    if HAS_MASK:
+        mult = tl.load(mask + rows).to(tl.float32)[:, None]
+
+    wl = tl.load(wcat + c[:, None] * 640 + h[None, :])
+    wlg = tl.load(wcat + c[:, None] * 640 + 256 + h[None, :])
+    lp = tl.dot(xn, wl)
+    lg = tl.dot(xn, wlg)
+    tl.store(l + out_off, (lp * tl.sigmoid(lg) * mult).to(tl.float16))
+
+    wr = tl.load(wcat + c[:, None] * 640 + 128 + h[None, :])
+    wrg = tl.load(wcat + c[:, None] * 640 + 384 + h[None, :])
+    rp = tl.dot(xn, wr)
+    rg = tl.dot(xn, wrg)
+    tl.store(rgt + out_off, (rp * tl.sigmoid(rg) * mult).to(tl.float16))
+
+    wog = tl.load(wcat + c[:, None] * 640 + 512 + h[None, :])
+    op = tl.dot(xn, wog)
+    tl.store(og + rows[:, None] * 128 + h[None, :], op.to(tl.float16))
+
+
+@triton.jit
+def _split_nomask(p, l, r, og, N2: tl.constexpr, BM: tl.constexpr, BH: tl.constexpr):
+    pm = tl.program_id(0)
+    ph = tl.program_id(1)
+    rows = pm * BM + tl.arange(0, BM)
+    hs = ph * BH + tl.arange(0, BH)
+
+    bid = rows // N2
+    ij = rows - bid * N2
+    out = bid[:, None] * (128 * N2) + hs[None, :] * N2 + ij[:, None]
+    base = p + rows[:, None] * 640 + hs[None, :]
+
+    lp = tl.load(base)
+    rp = tl.load(base + 128)
+    lg = tl.load(base + 256).to(tl.float32)
+    rg = tl.load(base + 384).to(tl.float32)
+    op = tl.load(base + 512)
+
+    tl.store(l + out, (lp * tl.sigmoid(lg)).to(tl.float16))
+    tl.store(r + out, (rp * tl.sigmoid(rg)).to(tl.float16))
+    tl.store(og + rows[:, None] * 128 + hs[None, :], op)
+
+
+@triton.jit
+def _split_mask(p, m, l, r, og, N2: tl.constexpr, BM: tl.constexpr, BH: tl.constexpr):
+    pm = tl.program_id(0)
+    ph = tl.program_id(1)
+    rows = pm * BM + tl.arange(0, BM)
+    hs = ph * BH + tl.arange(0, BH)
+
+    bid = rows // N2
+    ij = rows - bid * N2
+    out = bid[:, None] * (128 * N2) + hs[None, :] * N2 + ij[:, None]
+    base = p + rows[:, None] * 640 + hs[None, :]
+    mm = tl.load(m + rows).to(tl.float32)[:, None]
+
+    lp = tl.load(base)
+    rp = tl.load(base + 128)
+    lg = tl.load(base + 256).to(tl.float32)
+    rg = tl.load(base + 384).to(tl.float32)
+    op = tl.load(base + 512)
+
+    tl.store(l + out, (lp * tl.sigmoid(lg) * mm).to(tl.float16))
+    tl.store(r + out, (rp * tl.sigmoid(rg) * mm).to(tl.float16))
+    tl.store(og + rows[:, None] * 128 + hs[None, :], op)
+
+
+@triton.jit
+def _final_fused(tri, og, w, b, wout, y, N2: tl.constexpr, D: tl.constexpr, EPS: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr):
+    pid = tl.program_id(0)
+    rows = pid * BM + tl.arange(0, BM)
+    h = tl.arange(0, 128)
+
+    bid = rows // N2
+    ij = rows - bid * N2
+    off = bid[:, None] * (128 * N2) + h[None, :] * N2 + ij[:, None]
+
+    v = tl.load(tri + off).to(tl.float32)
+    m = tl.sum(v, axis=1) * 0.0078125
+    q = tl.sum(v * v, axis=1) * 0.0078125
+    inv = tl.rsqrt(tl.maximum(q - m * m, 0.0) + EPS)
+
+    ww = tl.load(w + h).to(tl.float32)
+    bb = tl.load(b + h).to(tl.float32)
+    g = tl.load(og + rows[:, None] * 128 + h[None, :]).to(tl.float32)
+
+    z = (((v - m[:, None]) * inv[:, None] * ww[None, :] + bb[None, :]) * tl.sigmoid(g)).to(tl.float16)
+
+    c = tl.arange(0, BN)
+
+    if 0 < D:
+        cols = c
+        wo = tl.load(wout + h[:, None] * D + cols[None, :])
+        acc = tl.dot(z, wo)
+        tl.store(y + rows[:, None] * D + cols[None, :], acc)
+
+    if BN < D:
+        cols = BN + c
+        wo = tl.load(wout + h[:, None] * D + cols[None, :])
+        acc = tl.dot(z, wo)
+        tl.store(y + rows[:, None] * D + cols[None, :], acc)
+
+    if 2 * BN < D:
+        cols = 2 * BN + c
+        wo = tl.load(wout + h[:, None] * D + cols[None, :])
+        acc = tl.dot(z, wo)
+        tl.store(y + rows[:, None] * D + cols[None, :], acc)
+
+    if 3 * BN < D:
+        cols = 3 * BN + c
+        wo = tl.load(wout + h[:, None] * D + cols[None, :])
+        acc = tl.dot(z, wo)
+        tl.store(y + rows[:, None] * D + cols[None, :], acc)
+
+    if 4 * BN < D:
+        cols = 4 * BN + c
+        wo = tl.load(wout + h[:, None] * D + cols[None, :])
+        acc = tl.dot(z, wo)
+        tl.store(y + rows[:, None] * D + cols[None, :], acc)
+
+    if 5 * BN < D:
+        cols = 5 * BN + c
+        wo = tl.load(wout + h[:, None] * D + cols[None, :])
+        acc = tl.dot(z, wo)
+        tl.store(y + rows[:, None] * D + cols[None, :], acc)
+
+    if 6 * BN < D:
+        cols = 6 * BN + c
+        wo = tl.load(wout + h[:, None] * D + cols[None, :])
+        acc = tl.dot(z, wo)
+        tl.store(y + rows[:, None] * D + cols[None, :], acc)
+
+    if 7 * BN < D:
+        cols = 7 * BN + c
+        wo = tl.load(wout + h[:, None] * D + cols[None, :])
+        acc = tl.dot(z, wo)
+        tl.store(y + rows[:, None] * D + cols[None, :], acc)
+
+    if 8 * BN < D:
+        cols = 8 * BN + c
+        wo = tl.load(wout + h[:, None] * D + cols[None, :])
+        acc = tl.dot(z, wo)
+        tl.store(y + rows[:, None] * D + cols[None, :], acc)
+
+    if 9 * BN < D:
+        cols = 9 * BN + c
+        wo = tl.load(wout + h[:, None] * D + cols[None, :])
+        acc = tl.dot(z, wo)
+        tl.store(y + rows[:, None] * D + cols[None, :], acc)
+
+    if 10 * BN < D:
+        cols = 10 * BN + c
+        wo = tl.load(wout + h[:, None] * D + cols[None, :])
+        acc = tl.dot(z, wo)
+        tl.store(y + rows[:, None] * D + cols[None, :], acc)
+
+    if 11 * BN < D:
+        cols = 11 * BN + c
+        wo = tl.load(wout + h[:, None] * D + cols[None, :])
+        acc = tl.dot(z, wo)
+        tl.store(y + rows[:, None] * D + cols[None, :], acc)
+
+
+def _weights(weights):
+    key = (
+        id(weights["left_proj.weight"]),
+        id(weights["right_proj.weight"]),
+        id(weights["left_gate.weight"]),
+        id(weights["right_gate.weight"]),
+        id(weights["out_gate.weight"]),
+        id(weights["to_out.weight"]),
+        weights["left_proj.weight"].data_ptr(),
+        weights["right_proj.weight"].data_ptr(),
+        weights["left_gate.weight"].data_ptr(),
+        weights["right_gate.weight"].data_ptr(),
+        weights["out_gate.weight"].data_ptr(),
+        weights["to_out.weight"].data_ptr(),
+        tuple(weights["left_proj.weight"].shape),
+        tuple(weights["to_out.weight"].shape),
+        weights["left_proj.weight"].device.index,
+    )
+    got = _WEIGHT_CACHE.get(key)
+    if got is not None:
+        return got
+    if len(_WEIGHT_CACHE) > 8:
+        _WEIGHT_CACHE.clear()
+
+    wcat = torch.cat(
+        (
+            weights["left_proj.weight"],
+            weights["right_proj.weight"],
+            weights["left_gate.weight"],
+            weights["right_gate.weight"],
+            weights["out_gate.weight"],
+        ),
+        dim=0,
+    ).to(torch.float16).t().contiguous()
+    wout = weights["to_out.weight"].to(torch.float16).t().contiguous()
+    _WEIGHT_CACHE[key] = (wcat, wout)
+    return wcat, wout
+
+
+def _workspace(device, B, N, D):
+    key = (device.index, B, N, D)
+    got = _WS_CACHE.get(key)
+    if got is not None:
+        return got
+    if len(_WS_CACHE) > 10:
+        _WS_CACHE.clear()
+
+    M = B * N * N
+    ws = {
+        "xh": torch.empty((M, D), device=device, dtype=torch.float16),
+        "proj": torch.empty((M, 640), device=device, dtype=torch.float16),
+        "left": torch.empty((B * 128, N, N), device=device, dtype=torch.float16),
+        "right": torch.empty((B * 128, N, N), device=device, dtype=torch.float16),
+        "tri": torch.empty((B * 128, N, N), device=device, dtype=torch.float16),
+        "og": torch.empty((M, 128), device=device, dtype=torch.float16),
+    }
+    _WS_CACHE[key] = ws
+    return ws
+
+
+def custom_kernel(data):
+    x, mask, weights, config = data
+    B, N, _, D = x.shape
+    H = int(config.get("hidden_dim", 128))
+    eps = float(config.get("eps", 1.0e-5))
+
+    if H != 128:
+        x0 = torch.nn.functional.layer_norm(
+            x, (D,), weights["norm.weight"], weights["norm.bias"], eps
+        )
+        left = torch.nn.functional.linear(x0, weights["left_proj.weight"])
+        right = torch.nn.functional.linear(x0, weights["right_proj.weight"])
+        if mask is not None and not bool(config.get("nomask", False)):
+            mm = mask.unsqueeze(-1)
+            left = left * mm
+            right = right * mm
+        left = left * torch.sigmoid(torch.nn.functional.linear(x0, weights["left_gate.weight"]))
+        right = right * torch.sigmoid(torch.nn.functional.linear(x0, weights["right_gate.weight"]))
+        out_gate = torch.sigmoid(torch.nn.functional.linear(x0, weights["out_gate.weight"]))
+        tri = torch.einsum("bikd,bjkd->bijd", left, right)
+        tri = torch.nn.functional.layer_norm(
+            tri, (H,), weights["to_out_norm.weight"], weights["to_out_norm.bias"], eps
+        )
+        return torch.nn.functional.linear((tri * out_gate).to(x.dtype), weights["to_out.weight"]).to(torch.float32)
+
+    M = B * N * N
+    N2 = N * N
+
+    if not x.is_contiguous():
+        x = x.contiguous()
+
+    has_mask = (mask is not None) and (not bool(config.get("nomask", False)))
+    if has_mask and not mask.is_contiguous():
+        mask = mask.contiguous()
+
+    wcat, wout = _weights(weights)
+    ws = _workspace(x.device, B, N, D)
+
+    xh = ws["xh"]
+    proj = ws["proj"]
+    left = ws["left"]
+    right = ws["right"]
+    tri = ws["tri"]
+    og = ws["og"]
+
+    if D == 128:
+        _proj128_fused[(_cdiv(M, 16), 4)](
+            x,
+            mask if has_mask else x,
+            weights["norm.weight"],
+            weights["norm.bias"],
+            wcat,
+            left,
+            right,
+            og,
+            N2,
+            HAS_MASK=has_mask,
+            EPS=eps,
+            BM=16,
+            BH=32,
+            num_warps=4,
+        )
+    else:
+        if D == 384:
+            _ln384[(_cdiv(M, 8),)](
+                x, weights["norm.weight"], weights["norm.bias"], xh,
+                eps, BM=8, num_warps=4
+            )
+        elif D == 768:
+            _ln768[(_cdiv(M, 4),)](
+                x, weights["norm.weight"], weights["norm.bias"], xh,
+                eps, BM=4, num_warps=8
+            )
+        else:
+            xh.copy_(
+                torch.nn.functional.layer_norm(
+                    x.view(M, D), (D,), weights["norm.weight"], weights["norm.bias"], eps
+                ).to(torch.float16)
+            )
+
+        torch.mm(xh, wcat, out=proj)
+
+        if has_mask:
+            _split_mask[(_cdiv(M, 32), 2)](
+                proj, mask, left, right, og, N2,
+                BM=32, BH=64, num_warps=4
+            )
+        else:
+            _split_nomask[(_cdiv(M, 32), 2)](
+                proj, left, right, og, N2,
+                BM=32, BH=64, num_warps=4
+            )
+
+    torch.bmm(left, right.transpose(1, 2), out=tri)
+
+    out = torch.empty((M, D), device=x.device, dtype=torch.float32)
+    _final_fused[(_cdiv(M, 16),)](
+        tri,
+        og,
+        weights["to_out_norm.weight"],
+        weights["to_out_norm.bias"],
+        wout,
+        out,
+        N2,
+        D,
+        eps,
+        BM=16,
+        BN=64,
+        num_warps=4,
+    )
+    return out.view(B, N, N, D)
+```
