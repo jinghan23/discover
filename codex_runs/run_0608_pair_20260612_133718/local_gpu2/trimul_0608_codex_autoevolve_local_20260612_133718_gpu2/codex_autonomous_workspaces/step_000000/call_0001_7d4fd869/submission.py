@@ -1,0 +1,235 @@
+"""Hybrid Triton/cuBLAS outgoing Triangle Multiplicative Update forward.
+
+LayerNorm and dense projections are evaluated in float32, with Ampere TF32
+enabled for the large projection GEMMs.  A Triton kernel then fuses sigmoid
+gates, mask application, and a write into [B * H, N, N] layout so the cubic
+per-channel contraction is a fast BF16 batched matmul.  A second Triton kernel
+normalizes that H-major contraction result and applies the output gate before
+the final cuBLAS projection back to the input channel dimension.
+"""
+
+from task import input_t, output_t
+
+import torch
+import torch.nn.functional as F
+import triton
+import triton.language as tl
+
+
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.set_float32_matmul_precision("high")
+
+
+@triton.jit
+def _prep_hmajor_mask_kernel(
+    lp,
+    rp,
+    lg,
+    rg,
+    mask,
+    left,
+    right,
+    n_pairs: tl.constexpr,
+    N: tl.constexpr,
+    H: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_h = tl.program_id(1)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_h = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
+    valid_m = offs_m < (tl.num_programs(0) * BLOCK_M)
+    valid_h = offs_h < H
+    pair = offs_m
+    b = pair // n_pairs
+    rem = pair - b * n_pairs
+
+    in_offs = pair[:, None] * H + offs_h[None, :]
+    valid = valid_h[None, :]
+    m = tl.load(mask + pair, mask=valid_m, other=0.0).to(tl.float32)
+
+    lp_v = tl.load(lp + in_offs, mask=valid, other=0.0).to(tl.float32)
+    rp_v = tl.load(rp + in_offs, mask=valid, other=0.0).to(tl.float32)
+    lg_v = tl.load(lg + in_offs, mask=valid, other=0.0).to(tl.float32)
+    rg_v = tl.load(rg + in_offs, mask=valid, other=0.0).to(tl.float32)
+    left_v = lp_v * m[:, None] / (1.0 + tl.exp(-lg_v))
+    right_v = rp_v * m[:, None] / (1.0 + tl.exp(-rg_v))
+
+    hmajor = (b[:, None] * H + offs_h[None, :]) * n_pairs + rem[:, None]
+    tl.store(left + hmajor, left_v, mask=valid)
+    tl.store(right + hmajor, right_v, mask=valid)
+
+
+@triton.jit
+def _prep_hmajor_nomask_kernel(
+    lp,
+    rp,
+    lg,
+    rg,
+    left,
+    right,
+    n_pairs: tl.constexpr,
+    N: tl.constexpr,
+    H: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_h = tl.program_id(1)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_h = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
+    valid_h = offs_h < H
+    pair = offs_m
+    b = pair // n_pairs
+    rem = pair - b * n_pairs
+
+    in_offs = pair[:, None] * H + offs_h[None, :]
+    valid = valid_h[None, :]
+    lp_v = tl.load(lp + in_offs, mask=valid, other=0.0).to(tl.float32)
+    rp_v = tl.load(rp + in_offs, mask=valid, other=0.0).to(tl.float32)
+    lg_v = tl.load(lg + in_offs, mask=valid, other=0.0).to(tl.float32)
+    rg_v = tl.load(rg + in_offs, mask=valid, other=0.0).to(tl.float32)
+    left_v = lp_v / (1.0 + tl.exp(-lg_v))
+    right_v = rp_v / (1.0 + tl.exp(-rg_v))
+
+    hmajor = (b[:, None] * H + offs_h[None, :]) * n_pairs + rem[:, None]
+    tl.store(left + hmajor, left_v, mask=valid)
+    tl.store(right + hmajor, right_v, mask=valid)
+
+
+@triton.jit
+def _norm_gate_tile_kernel(
+    out_h,
+    out_gate_logits,
+    norm_w,
+    norm_b,
+    z,
+    n_pairs: tl.constexpr,
+    N: tl.constexpr,
+    H: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offs_m = pid * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_h = tl.arange(0, BLOCK_H)
+
+    b = offs_m // n_pairs
+    rem = offs_m - b * n_pairs
+    hm = (b[None, :] * H + offs_h[:, None]) * n_pairs + rem[None, :]
+    vals = tl.load(out_h + hm).to(tl.float32)
+
+    mean = tl.sum(vals, axis=0) / H
+    centered = vals - mean[None, :]
+    var = tl.sum(centered * centered, axis=0) / H
+    inv = tl.rsqrt(var + 1.0e-5)
+
+    nw = tl.load(norm_w + offs_h).to(tl.float32)
+    nb = tl.load(norm_b + offs_h).to(tl.float32)
+    cl = offs_m[None, :] * H + offs_h[:, None]
+    gate_logits = tl.load(out_gate_logits + cl).to(tl.float32)
+    gate = 1.0 / (1.0 + tl.exp(-gate_logits))
+    out = (centered * inv[None, :] * nw[:, None] + nb[:, None]) * gate
+    tl.store(z + cl, out)
+
+
+def _sigmoid_mask_layout(lp, rp, lg, rg, mask, B: int, N: int, H: int):
+    left = torch.empty((B * H, N, N), device=lp.device, dtype=torch.bfloat16)
+    right = torch.empty((B * H, N, N), device=lp.device, dtype=torch.bfloat16)
+    grid = (triton.cdiv(B * N * N, 16), triton.cdiv(H, 64))
+    if mask.dtype is torch.float32:
+        _prep_hmajor_nomask_kernel[grid](
+            lp,
+            rp,
+            lg,
+            rg,
+            left,
+            right,
+            N * N,
+            N,
+            H,
+            BLOCK_M=16,
+            BLOCK_H=64,
+            num_warps=8,
+        )
+    else:
+        _prep_hmajor_mask_kernel[grid](
+            lp,
+            rp,
+            lg,
+            rg,
+            mask,
+            left,
+            right,
+            N * N,
+            N,
+            H,
+            BLOCK_M=16,
+            BLOCK_H=64,
+            num_warps=8,
+        )
+    return left, right
+
+
+def _norm_gate(out_h, out_gate_logits, norm_w, norm_b, B: int, N: int, H: int):
+    z = torch.empty((B, N, N, H), device=out_h.device, dtype=torch.float32)
+    _norm_gate_tile_kernel[(triton.cdiv(B * N * N, 32),)](
+        out_h,
+        out_gate_logits,
+        norm_w,
+        norm_b,
+        z,
+        N * N,
+        N,
+        H,
+        BLOCK_M=32,
+        BLOCK_H=128,
+        num_warps=4,
+    )
+    return z
+
+
+def custom_kernel(data: input_t) -> output_t:
+    input_tensor, mask, weights, config = data
+    B = input_tensor.shape[0]
+    N = input_tensor.shape[1]
+    C = config["dim"]
+    H = config["hidden_dim"]
+
+    x = F.layer_norm(
+        input_tensor,
+        (C,),
+        weights["norm.weight"],
+        weights["norm.bias"],
+        eps=1.0e-5,
+    )
+
+    left_proj = F.linear(x, weights["left_proj.weight"])
+    right_proj = F.linear(x, weights["right_proj.weight"])
+    left_gate = F.linear(x, weights["left_gate.weight"])
+    right_gate = F.linear(x, weights["right_gate.weight"])
+    out_gate_logits = F.linear(x, weights["out_gate.weight"])
+
+    left, right = _sigmoid_mask_layout(
+        left_proj,
+        right_proj,
+        left_gate,
+        right_gate,
+        mask,
+        B,
+        N,
+        H,
+    )
+
+    out_h = torch.bmm(left, right.transpose(1, 2))
+    z = _norm_gate(
+        out_h,
+        out_gate_logits,
+        weights["to_out_norm.weight"],
+        weights["to_out_norm.bias"],
+        B,
+        N,
+        H,
+    )
+    return F.linear(z, weights["to_out.weight"]).to(torch.float32)

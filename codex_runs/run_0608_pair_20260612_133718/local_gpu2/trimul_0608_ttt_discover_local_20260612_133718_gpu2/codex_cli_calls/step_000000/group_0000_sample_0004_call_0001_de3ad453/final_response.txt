@@ -1,0 +1,115 @@
+```python
+"""
+TriMul outgoing forward: use PyTorch/cuBLAS for the large dense projections and
+batched channel-wise N x N contractions, with Triton fusing the cheap output gate
+multiply plus final projection for hidden_dim=128. This keeps the N^3 work on
+highly optimized GEMMs while avoiding one intermediate PyTorch pointwise/proj step.
+"""
+
+import torch
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def _gate_to_out_kernel(
+    y_ptr, gate_ptr, w_ptr, out_ptr,
+    total_rows: tl.constexpr, dim: tl.constexpr,
+    BLOCK_M: tl.constexpr, BLOCK_D: tl.constexpr, BLOCK_H: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_d = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_d = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
+    offs_h = tl.arange(0, BLOCK_H)
+
+    mask_m = offs_m < total_rows
+    mask_d = offs_d < dim
+
+    y = tl.load(y_ptr + offs_m[:, None] * BLOCK_H + offs_h[None, :],
+                mask=mask_m[:, None], other=0.0).to(tl.float32)
+    g = tl.load(gate_ptr + offs_m[:, None] * BLOCK_H + offs_h[None, :],
+                mask=mask_m[:, None], other=0.0).to(tl.float32)
+    yg = y * g
+
+    w = tl.load(w_ptr + offs_d[:, None] * BLOCK_H + offs_h[None, :],
+                mask=mask_d[:, None], other=0.0).to(tl.float32)
+
+    acc = tl.dot(yg, tl.trans(w), input_precision="tf32")
+    tl.store(out_ptr + offs_m[:, None] * dim + offs_d[None, :],
+             acc, mask=mask_m[:, None] & mask_d[None, :])
+
+
+def _linear_no_bias(x, w):
+    return torch.matmul(x, w.t())
+
+
+def custom_kernel(data):
+    input_tensor, mask, weights, config = data
+
+    x = input_tensor
+    B, N, _, dim = x.shape
+    hidden_dim = config["hidden_dim"]
+
+    norm_weight = weights["norm.weight"]
+    norm_bias = weights["norm.bias"]
+    left_proj_weight = weights["left_proj.weight"]
+    right_proj_weight = weights["right_proj.weight"]
+    left_gate_weight = weights["left_gate.weight"]
+    right_gate_weight = weights["right_gate.weight"]
+    out_gate_weight = weights["out_gate.weight"]
+    to_out_norm_weight = weights["to_out_norm.weight"]
+    to_out_norm_bias = weights["to_out_norm.bias"]
+    to_out_weight = weights["to_out.weight"]
+
+    # First LayerNorm and all input projections.
+    x_norm = torch.nn.functional.layer_norm(x, (dim,), norm_weight, norm_bias, 1e-5)
+    x_flat = x_norm.reshape(-1, dim)
+
+    left = _linear_no_bias(x_flat, left_proj_weight)
+    right = _linear_no_bias(x_flat, right_proj_weight)
+    left_gate = torch.sigmoid(_linear_no_bias(x_flat, left_gate_weight))
+    right_gate = torch.sigmoid(_linear_no_bias(x_flat, right_gate_weight))
+    out_gate = torch.sigmoid(_linear_no_bias(x_flat, out_gate_weight))
+
+    left = left * left_gate
+    right = right * right_gate
+
+    if mask is not None and not bool(config.get("nomask", False)):
+        m = mask.reshape(-1, 1).to(left.dtype)
+        left = left * m
+        right = right * m
+
+    left = left.reshape(B, N, N, hidden_dim)
+    right = right.reshape(B, N, N, hidden_dim)
+
+    # For each hidden channel d: out[:, :, :, d] = left[:, :, :, d] @ right[:, :, :, d]^T.
+    left_bdh = left.permute(0, 3, 1, 2).reshape(B * hidden_dim, N, N)
+    right_bdh = right.permute(0, 3, 1, 2).reshape(B * hidden_dim, N, N)
+    out = torch.bmm(left_bdh, right_bdh.transpose(1, 2))
+    out = out.reshape(B, hidden_dim, N, N).permute(0, 2, 3, 1).contiguous()
+
+    # Normalize contraction output.
+    out = torch.nn.functional.layer_norm(
+        out, (hidden_dim,), to_out_norm_weight, to_out_norm_bias, 1e-5
+    )
+
+    # Fused out_gate multiply and final hidden->dim projection.
+    total_rows = B * N * N
+    out_flat = out.reshape(total_rows, hidden_dim)
+    gate_flat = out_gate.reshape(total_rows, hidden_dim)
+    result = torch.empty((total_rows, dim), device=x.device, dtype=torch.float32)
+
+    BLOCK_M = 16
+    BLOCK_D = 32
+    grid = (triton.cdiv(total_rows, BLOCK_M), triton.cdiv(dim, BLOCK_D))
+    _gate_to_out_kernel[grid](
+        out_flat, gate_flat, to_out_weight, result,
+        total_rows, dim,
+        BLOCK_M=BLOCK_M, BLOCK_D=BLOCK_D, BLOCK_H=128,
+        num_warps=4,
+    )
+
+    return result.reshape(B, N, N, dim)
+```

@@ -1,0 +1,282 @@
+"""
+Outgoing Triangle Multiplicative Update with layout-aware Triton fusion.
+
+For dim=128 a Triton kernel fuses input LayerNorm, projections, gates, masking,
+and writes left/right directly as [B, H, N, N] BF16 matrices.  Wider inputs use a
+TF32 cuBLAS projection followed by a Triton post-projection layout/gating kernel.
+The triangle contraction is a batched BF16 bmm over hidden channels, then Triton
+fuses output LayerNorm and output gating before a final TF32 cuBLAS projection.
+"""
+
+import torch
+import torch.nn.functional as F
+import triton
+import triton.language as tl
+
+
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.set_float32_matmul_precision("high")
+
+
+@triton.jit
+def _project_kernel(
+    x_ptr,
+    mask_ptr,
+    norm_w_ptr,
+    norm_b_ptr,
+    left_w_ptr,
+    right_w_ptr,
+    left_gate_w_ptr,
+    right_gate_w_ptr,
+    out_gate_w_ptr,
+    left_ptr,
+    right_ptr,
+    out_gate_ptr,
+    total_rows: tl.constexpr,
+    nn: tl.constexpr,
+    dim: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    H: tl.constexpr,
+    HAS_MASK: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    rows = pid * BLOCK_M + tl.arange(0, BLOCK_M)
+    cols = tl.arange(0, BLOCK_D)
+    hs = tl.arange(0, H)
+    row_mask = rows < total_rows
+
+    x_full = tl.load(
+        x_ptr + rows[:, None] * dim + cols[None, :],
+        mask=row_mask[:, None] & (cols[None, :] < dim),
+        other=0.0,
+    ).to(tl.float32)
+    valid_cols = cols < dim
+    x_sum = tl.sum(x_full, axis=1)
+    mean = x_sum * (1.0 / dim)
+    centered_full = tl.where(valid_cols[None, :], x_full - mean[:, None], 0.0)
+    var = tl.sum(centered_full * centered_full, axis=1) * (1.0 / dim)
+    rstd = tl.rsqrt(var + 1.0e-5)
+
+    acc_l = tl.zeros((BLOCK_M, H), dtype=tl.float32)
+    acc_r = tl.zeros((BLOCK_M, H), dtype=tl.float32)
+    acc_lg = tl.zeros((BLOCK_M, H), dtype=tl.float32)
+    acc_rg = tl.zeros((BLOCK_M, H), dtype=tl.float32)
+    acc_og = tl.zeros((BLOCK_M, H), dtype=tl.float32)
+
+    for start in range(0, dim, BLOCK_K):
+        ks = start + tl.arange(0, BLOCK_K)
+        k_mask = ks < dim
+        xv = tl.load(
+            x_ptr + rows[:, None] * dim + ks[None, :],
+            mask=row_mask[:, None] & k_mask[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        nw = tl.load(norm_w_ptr + ks, mask=k_mask, other=0.0).to(tl.float32)
+        nb = tl.load(norm_b_ptr + ks, mask=k_mask, other=0.0).to(tl.float32)
+        xn = (xv - mean[:, None]) * rstd[:, None] * nw[None, :] + nb[None, :]
+        xn = tl.where(k_mask[None, :], xn, 0.0)
+
+        w_offsets = hs[None, :] * dim + ks[:, None]
+        w_mask = k_mask[:, None]
+
+        w_proj = tl.load(left_w_ptr + w_offsets, mask=w_mask, other=0.0).to(tl.float32)
+        acc_l += tl.dot(xn, w_proj, input_precision="tf32")
+        w_proj = tl.load(right_w_ptr + w_offsets, mask=w_mask, other=0.0).to(tl.float32)
+        acc_r += tl.dot(xn, w_proj, input_precision="tf32")
+        w_proj = tl.load(left_gate_w_ptr + w_offsets, mask=w_mask, other=0.0).to(tl.float32)
+        acc_lg += tl.dot(xn, w_proj, input_precision="tf32")
+        w_proj = tl.load(right_gate_w_ptr + w_offsets, mask=w_mask, other=0.0).to(tl.float32)
+        acc_rg += tl.dot(xn, w_proj, input_precision="tf32")
+        w_proj = tl.load(out_gate_w_ptr + w_offsets, mask=w_mask, other=0.0).to(tl.float32)
+        acc_og += tl.dot(xn, w_proj, input_precision="tf32")
+
+    if HAS_MASK:
+        mask_v = tl.load(mask_ptr + rows, mask=row_mask, other=0.0).to(tl.float32)
+    else:
+        mask_v = tl.full((BLOCK_M,), 1.0, dtype=tl.float32)
+    l_val = acc_l * tl.sigmoid(acc_lg) * mask_v[:, None]
+    r_val = acc_r * tl.sigmoid(acc_rg) * mask_v[:, None]
+    og_val = tl.sigmoid(acc_og)
+
+    b = rows // nn
+    ij = rows - b * nn
+    bh_offsets = b[:, None] * (H * nn) + hs[None, :] * nn + ij[:, None]
+    tl.store(left_ptr + bh_offsets, l_val, mask=row_mask[:, None])
+    tl.store(right_ptr + bh_offsets, r_val, mask=row_mask[:, None])
+    tl.store(out_gate_ptr + rows[:, None] * H + hs[None, :], og_val, mask=row_mask[:, None])
+
+
+@triton.jit
+def _post_project_kernel(
+    proj_ptr,
+    mask_ptr,
+    left_ptr,
+    right_ptr,
+    out_gate_ptr,
+    total_rows: tl.constexpr,
+    nn: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    H: tl.constexpr,
+    HAS_MASK: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    rows = pid * BLOCK_M + tl.arange(0, BLOCK_M)
+    hs = tl.arange(0, H)
+    row_mask = rows < total_rows
+
+    base = rows[:, None] * (5 * H) + hs[None, :]
+    left = tl.load(proj_ptr + base, mask=row_mask[:, None], other=0.0).to(tl.float32)
+    right = tl.load(proj_ptr + base + H, mask=row_mask[:, None], other=0.0).to(tl.float32)
+    left_gate = tl.load(proj_ptr + base + 2 * H, mask=row_mask[:, None], other=0.0).to(tl.float32)
+    right_gate = tl.load(proj_ptr + base + 3 * H, mask=row_mask[:, None], other=0.0).to(tl.float32)
+    out_gate = tl.load(proj_ptr + base + 4 * H, mask=row_mask[:, None], other=0.0).to(tl.float32)
+
+    if HAS_MASK:
+        mask_v = tl.load(mask_ptr + rows, mask=row_mask, other=0.0).to(tl.float32)
+    else:
+        mask_v = tl.full((BLOCK_M,), 1.0, dtype=tl.float32)
+    left = left * tl.sigmoid(left_gate) * mask_v[:, None]
+    right = right * tl.sigmoid(right_gate) * mask_v[:, None]
+    out_gate = tl.sigmoid(out_gate)
+
+    b = rows // nn
+    ij = rows - b * nn
+    bh_offsets = b[:, None] * (H * nn) + hs[None, :] * nn + ij[:, None]
+    tl.store(left_ptr + bh_offsets, left, mask=row_mask[:, None])
+    tl.store(right_ptr + bh_offsets, right, mask=row_mask[:, None])
+    tl.store(out_gate_ptr + rows[:, None] * H + hs[None, :], out_gate, mask=row_mask[:, None])
+
+
+@triton.jit
+def _norm_gate_kernel(
+    tri_ptr,
+    gate_ptr,
+    norm_w_ptr,
+    norm_b_ptr,
+    v_ptr,
+    total_rows: tl.constexpr,
+    nn: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    H: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    rows = pid * BLOCK_M + tl.arange(0, BLOCK_M)
+    hs = tl.arange(0, H)
+    row_mask = rows < total_rows
+
+    b = rows // nn
+    ij = rows - b * nn
+    tri_offsets = b[:, None] * (H * nn) + hs[None, :] * nn + ij[:, None]
+    tri = tl.load(tri_ptr + tri_offsets, mask=row_mask[:, None], other=0.0).to(tl.float32)
+
+    mean = tl.sum(tri, axis=1) * (1.0 / H)
+    centered = tri - mean[:, None]
+    var = tl.sum(centered * centered, axis=1) * (1.0 / H)
+    rstd = tl.rsqrt(var + 1.0e-5)
+
+    nw = tl.load(norm_w_ptr + hs).to(tl.float32)
+    nb = tl.load(norm_b_ptr + hs).to(tl.float32)
+    gate = tl.load(
+        gate_ptr + rows[:, None] * H + hs[None, :],
+        mask=row_mask[:, None],
+        other=0.0,
+    ).to(tl.float32)
+    v = (centered * rstd[:, None] * nw[None, :] + nb[None, :]) * gate
+    tl.store(v_ptr + rows[:, None] * H + hs[None, :], v, mask=row_mask[:, None])
+
+
+def custom_kernel(data):
+    input_tensor, mask, weights, config = data
+    dim = config["dim"]
+    hidden = config["hidden_dim"]
+    bsz, n, _, _ = input_tensor.shape
+    total_rows = bsz * n * n
+    nn = n * n
+    has_mask = mask.dtype != torch.float32
+
+    if dim == 128:
+        left_bh = torch.empty((bsz, hidden, n, n), device=input_tensor.device, dtype=torch.bfloat16)
+        right_bh = torch.empty((bsz, hidden, n, n), device=input_tensor.device, dtype=torch.bfloat16)
+        out_gate = torch.empty((bsz, n, n, hidden), device=input_tensor.device, dtype=torch.float32)
+
+        _project_kernel[(triton.cdiv(total_rows, 16),)](
+            input_tensor,
+            mask,
+            weights["norm.weight"],
+            weights["norm.bias"],
+            weights["left_proj.weight"],
+            weights["right_proj.weight"],
+            weights["left_gate.weight"],
+            weights["right_gate.weight"],
+            weights["out_gate.weight"],
+            left_bh,
+            right_bh,
+            out_gate,
+            total_rows,
+            nn,
+            dim,
+            BLOCK_M=16,
+            BLOCK_D=128,
+            BLOCK_K=32,
+            H=hidden,
+            HAS_MASK=has_mask,
+            num_warps=4,
+            num_stages=1,
+        )
+    else:
+        x = F.layer_norm(
+            input_tensor,
+            (dim,),
+            weights["norm.weight"],
+            weights["norm.bias"],
+            eps=1e-5,
+        )
+        proj_w = torch.cat(
+            (
+                weights["left_proj.weight"],
+                weights["right_proj.weight"],
+                weights["left_gate.weight"],
+                weights["right_gate.weight"],
+                weights["out_gate.weight"],
+            ),
+            dim=0,
+        )
+        proj = F.linear(x, proj_w)
+        left_bh = torch.empty((bsz, hidden, n, n), device=input_tensor.device, dtype=torch.bfloat16)
+        right_bh = torch.empty((bsz, hidden, n, n), device=input_tensor.device, dtype=torch.bfloat16)
+        out_gate = torch.empty((bsz, n, n, hidden), device=input_tensor.device, dtype=torch.float32)
+        _post_project_kernel[(triton.cdiv(total_rows, 16),)](
+            proj,
+            mask,
+            left_bh,
+            right_bh,
+            out_gate,
+            total_rows,
+            nn,
+            BLOCK_M=16,
+            H=hidden,
+            HAS_MASK=True,
+            num_warps=4,
+        )
+
+    tri = torch.bmm(
+        left_bh.reshape(bsz * hidden, n, n),
+        right_bh.reshape(bsz * hidden, n, n).transpose(1, 2),
+    ).reshape(bsz, hidden, n, n)
+
+    v = torch.empty((total_rows, hidden), device=input_tensor.device, dtype=torch.float32)
+    _norm_gate_kernel[(triton.cdiv(total_rows, 16),)](
+        tri,
+        out_gate,
+        weights["to_out_norm.weight"],
+        weights["to_out_norm.bias"],
+        v,
+        total_rows,
+        nn,
+        BLOCK_M=16,
+        H=hidden,
+        num_warps=4,
+    )
+    return F.linear(v, weights["to_out.weight"]).reshape(bsz, n, n, dim).to(torch.float32)

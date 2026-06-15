@@ -1,0 +1,118 @@
+```python
+"""
+Fused outgoing TriMul forward: LayerNorm/input projections are done with
+Tensor-Core PyTorch linears, the N^3 triangular multiplication is mapped to
+batched GEMMs over hidden channels, and a Triton kernel fuses output
+LayerNorm, output gate, and final projection to float32.
+"""
+
+import torch
+import torch.nn.functional as F
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def _final_norm_gate_proj_kernel(
+    tri_ptr, gate_ptr, w_ptr, norm_w_ptr, norm_b_ptr, out_ptr,
+    total_rows: tl.constexpr, dim: tl.constexpr, hidden: tl.constexpr,
+    BLOCK_D: tl.constexpr, BLOCK_H: tl.constexpr,
+):
+    pid_r = tl.program_id(0)
+    pid_d = tl.program_id(1)
+
+    offs_h = tl.arange(0, BLOCK_H)
+    hmask = offs_h < hidden
+
+    vals = tl.load(tri_ptr + pid_r * hidden + offs_h, mask=hmask, other=0.0).to(tl.float32)
+    mean = tl.sum(vals, axis=0) / hidden
+    centered = vals - mean
+    var = tl.sum(centered * centered, axis=0) / hidden
+    inv = tl.rsqrt(var + 1.0e-5)
+
+    nw = tl.load(norm_w_ptr + offs_h, mask=hmask, other=0.0).to(tl.float32)
+    nb = tl.load(norm_b_ptr + offs_h, mask=hmask, other=0.0).to(tl.float32)
+    gate = tl.load(gate_ptr + pid_r * hidden + offs_h, mask=hmask, other=0.0).to(tl.float32)
+    y = centered * inv * nw + nb
+    y = y * gate
+
+    offs_d = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
+    dmask = offs_d < dim
+
+    w = tl.load(
+        w_ptr + offs_d[:, None] * hidden + offs_h[None, :],
+        mask=dmask[:, None] & hmask[None, :],
+        other=0.0,
+    ).to(tl.float32)
+
+    acc = tl.sum(w * y[None, :], axis=1)
+    tl.store(out_ptr + pid_r * dim + offs_d, acc, mask=(pid_r < total_rows) & dmask)
+
+
+def _sigmoid(x):
+    return torch.sigmoid(x)
+
+
+def custom_kernel(data):
+    input_tensor, mask, weights, config = data
+    dim = int(config["dim"])
+    hidden_dim = int(config["hidden_dim"])
+
+    x = input_tensor
+    B, N, _, _ = x.shape
+    rows = B * N * N
+
+    norm_weight = weights["norm.weight"]
+    norm_bias = weights["norm.bias"]
+    left_proj_weight = weights["left_proj.weight"]
+    right_proj_weight = weights["right_proj.weight"]
+    left_gate_weight = weights["left_gate.weight"]
+    right_gate_weight = weights["right_gate.weight"]
+    out_gate_weight = weights["out_gate.weight"]
+    to_out_norm_weight = weights["to_out_norm.weight"]
+    to_out_norm_bias = weights["to_out_norm.bias"]
+    to_out_weight = weights["to_out.weight"]
+
+    x_norm = F.layer_norm(x, (dim,), norm_weight, norm_bias, 1.0e-5)
+
+    # Use fp16 Tensor Cores for the projection-heavy path; normalization remains fp32.
+    xp = x_norm.to(torch.float16)
+    lp_w = left_proj_weight.to(torch.float16)
+    rp_w = right_proj_weight.to(torch.float16)
+    lg_w = left_gate_weight.to(torch.float16)
+    rg_w = right_gate_weight.to(torch.float16)
+    og_w = out_gate_weight.to(torch.float16)
+
+    left = F.linear(xp, lp_w)
+    right = F.linear(xp, rp_w)
+
+    if mask is not None and not bool(config.get("nomask", False)):
+        m = mask.to(left.dtype).unsqueeze(-1)
+        left = left * m
+        right = right * m
+
+    left = left * _sigmoid(F.linear(xp, lg_w))
+    right = right * _sigmoid(F.linear(xp, rg_w))
+    out_gate = _sigmoid(F.linear(xp, og_w)).contiguous()
+
+    # Channel-wise batched GEMM:
+    # out[b, i, j, h] = sum_k left[b, i, k, h] * right[b, j, k, h]
+    left_bh = left.permute(0, 3, 1, 2).contiguous().view(B * hidden_dim, N, N)
+    right_bh = right.permute(0, 3, 1, 2).contiguous().view(B * hidden_dim, N, N)
+    tri_bh = torch.bmm(left_bh, right_bh.transpose(1, 2))
+    tri = tri_bh.view(B, hidden_dim, N, N).permute(0, 2, 3, 1).contiguous()
+
+    out = torch.empty((B, N, N, dim), device=x.device, dtype=torch.float32)
+
+    block_d = 16 if dim <= 128 else 32
+    grid = (rows, triton.cdiv(dim, block_d))
+    _final_norm_gate_proj_kernel[grid](
+        tri, out_gate, to_out_weight, to_out_norm_weight, to_out_norm_bias, out,
+        rows, dim, hidden_dim,
+        BLOCK_D=block_d,
+        BLOCK_H=triton.next_power_of_2(hidden_dim),
+        num_warps=4,
+    )
+
+    return out
+```

@@ -1,0 +1,168 @@
+```python
+"""
+Hybrid Triton/CUDA implementation of outgoing Triangle Multiplicative Update.
+
+The input LayerNorm and dense projections use cuBLAS-backed PyTorch GEMMs.
+Triton kernels fuse projection post-processing into channel-major matrices for
+batched GEMM, then fuse the output transpose, hidden LayerNorm, and output gate.
+The N^3 contraction is computed as B*H independent N x N batched matmuls.
+"""
+
+import torch
+import torch.nn.functional as F
+import triton
+import triton.language as tl
+
+
+torch.backends.cuda.matmul.allow_tf32 = True
+
+
+@triton.jit
+def _prepare_kernel(
+    proj, mask, left_h, right_h, out_gate,
+    total: tl.constexpr, N: tl.constexpr, H: tl.constexpr,
+    HAS_MASK: tl.constexpr,
+    BLOCK_R: tl.constexpr, BLOCK_H: tl.constexpr,
+):
+    pid_r = tl.program_id(0)
+    pid_h = tl.program_id(1)
+
+    rows = pid_r * BLOCK_R + tl.arange(0, BLOCK_R)
+    hs = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
+
+    row_mask = rows < total
+    h_mask = hs < H
+    m = row_mask[:, None] & h_mask[None, :]
+
+    base = rows[:, None] * (5 * H) + hs[None, :]
+
+    lp = tl.load(proj + base, mask=m, other=0.0).to(tl.float32)
+    rp = tl.load(proj + base + H, mask=m, other=0.0).to(tl.float32)
+    lg = tl.load(proj + base + 2 * H, mask=m, other=0.0).to(tl.float32)
+    rg = tl.load(proj + base + 3 * H, mask=m, other=0.0).to(tl.float32)
+    og = tl.load(proj + base + 4 * H, mask=m, other=0.0).to(tl.float32)
+
+    if HAS_MASK:
+        mv = tl.load(mask + rows, mask=row_mask, other=0.0).to(tl.float32)
+        lp *= mv[:, None]
+        rp *= mv[:, None]
+
+    lval = lp * tl.sigmoid(lg)
+    rval = rp * tl.sigmoid(rg)
+    oval = tl.sigmoid(og)
+
+    nn = N * N
+    b = rows // nn
+    ij = rows - b * nn
+    chan = b[:, None] * H + hs[None, :]
+
+    dst = chan * nn + ij[:, None]
+    tl.store(left_h + dst, lval, mask=m)
+    tl.store(right_h + dst, rval, mask=m)
+    tl.store(out_gate + rows[:, None] * H + hs[None, :], oval, mask=m)
+
+
+@triton.jit
+def _post_kernel(
+    out_h, out_gate, ln_w, ln_b, preout,
+    total: tl.constexpr, N: tl.constexpr, H: tl.constexpr,
+    BLOCK_R: tl.constexpr, BLOCK_H: tl.constexpr,
+):
+    pid = tl.program_id(0)
+
+    rs = pid * BLOCK_R + tl.arange(0, BLOCK_R)
+    hs = tl.arange(0, BLOCK_H)
+
+    nn = N * N
+    b = rs // nn
+    ij = rs - b * nn
+
+    mask = (rs[None, :] < total) & (hs[:, None] < H)
+    vals = tl.load(
+        out_h + (b[None, :] * H + hs[:, None]) * nn + ij[None, :],
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+
+    mean = tl.sum(vals, axis=0) / H
+    diff = vals - mean[None, :]
+    var = tl.sum(diff * diff, axis=0) / H
+    norm = diff * tl.rsqrt(var[None, :] + 1.0e-5)
+
+    w = tl.load(ln_w + hs, mask=hs < H, other=0.0).to(tl.float32)
+    bias = tl.load(ln_b + hs, mask=hs < H, other=0.0).to(tl.float32)
+    gate = tl.load(
+        out_gate + rs[None, :] * H + hs[:, None],
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+
+    y = (norm * w[:, None] + bias[:, None]) * gate
+    tl.store(preout + rs[None, :] * H + hs[:, None], y, mask=mask)
+
+
+def custom_kernel(data):
+    input_tensor, mask, weights, config = data
+
+    B, N, _, dim = input_tensor.shape
+    H = int(config["hidden_dim"])
+    total = B * N * N
+
+    x = input_tensor if input_tensor.dtype == torch.float32 else input_tensor.float()
+
+    x = F.layer_norm(
+        x,
+        (dim,),
+        weights["norm.weight"],
+        weights["norm.bias"],
+        eps=1.0e-5,
+    )
+
+    proj_w = torch.cat(
+        (
+            weights["left_proj.weight"],
+            weights["right_proj.weight"],
+            weights["left_gate.weight"],
+            weights["right_gate.weight"],
+            weights["out_gate.weight"],
+        ),
+        dim=0,
+    )
+
+    proj = F.linear(x.reshape(total, dim), proj_w)
+
+    left_h = torch.empty((B * H, N, N), device=x.device, dtype=torch.float32)
+    right_h = torch.empty_like(left_h)
+    out_gate = torch.empty((total, H), device=x.device, dtype=torch.float32)
+
+    use_mask = (mask is not None) and (not bool(config.get("nomask", False)))
+    mask_flat = mask.reshape(total) if use_mask else proj
+
+    grid_prepare = (triton.cdiv(total, 16), triton.cdiv(H, 32))
+    _prepare_kernel[grid_prepare](
+        proj, mask_flat, left_h, right_h, out_gate,
+        total, N, H, use_mask,
+        BLOCK_R=16, BLOCK_H=32,
+        num_warps=4,
+    )
+
+    out_h = torch.bmm(left_h, right_h.transpose(1, 2))
+
+    preout = torch.empty((total, H), device=x.device, dtype=torch.float32)
+    _post_kernel[(triton.cdiv(total, 8),)](
+        out_h,
+        out_gate,
+        weights["to_out_norm.weight"],
+        weights["to_out_norm.bias"],
+        preout,
+        total,
+        N,
+        H,
+        BLOCK_R=8,
+        BLOCK_H=128,
+        num_warps=8,
+    )
+
+    out = F.linear(preout, weights["to_out.weight"])
+    return out.reshape(B, N, N, dim).float()
+```
