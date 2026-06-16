@@ -1,0 +1,284 @@
+```python
+"""
+Outgoing TriMul forward pass using Triton for both LayerNorm stages and gating,
+with tensor-core GEMMs/BMMs for the dense projection and triangular contraction.
+
+The implementation materializes the input LayerNorm in fp16, packs the five input
+linear projections into one cached GEMM, applies left/right masks and gates
+in-place, computes the outgoing triangle product as hidden-channel batched GEMMs,
+then fuses output LayerNorm, output gate, and the final projection for all tested
+hidden_dim=128 cases so no intermediate normed tensor GEMM is needed.
+"""
+
+import torch
+import triton
+import triton.language as tl
+
+
+_WEIGHT_CACHE = {}
+
+
+@triton.jit
+def _ln128_to_half_kernel(x, y, norm_w, norm_b, total: tl.constexpr, BLOCK_M: tl.constexpr):
+    pid = tl.program_id(0)
+    offs_m = pid * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_d = tl.arange(0, 128)
+    m = offs_m < total
+
+    vals = tl.load(x + offs_m[:, None] * 128 + offs_d[None, :], mask=m[:, None], other=0.0).to(tl.float32)
+    mean = tl.sum(vals, axis=1) * 0.0078125
+    centered = vals - mean[:, None]
+    var = tl.sum(centered * centered, axis=1) * 0.0078125
+    rstd = tl.rsqrt(var + 1.0e-5)
+
+    w = tl.load(norm_w + offs_d).to(tl.float32)
+    b = tl.load(norm_b + offs_d).to(tl.float32)
+    out = centered * rstd[:, None] * w[None, :] + b[None, :]
+    tl.store(y + offs_m[:, None] * 128 + offs_d[None, :], out.to(tl.float16), mask=m[:, None])
+
+
+@triton.jit
+def _ln384_to_half_kernel(x, y, norm_w, norm_b, total: tl.constexpr, BLOCK_M: tl.constexpr):
+    pid = tl.program_id(0)
+    offs_m = pid * BLOCK_M + tl.arange(0, BLOCK_M)
+    d0 = tl.arange(0, 256)
+    d1 = tl.arange(0, 128)
+    m = offs_m < total
+
+    v0 = tl.load(x + offs_m[:, None] * 384 + d0[None, :], mask=m[:, None], other=0.0).to(tl.float32)
+    v1 = tl.load(x + offs_m[:, None] * 384 + 256 + d1[None, :], mask=m[:, None], other=0.0).to(tl.float32)
+
+    mean = (tl.sum(v0, axis=1) + tl.sum(v1, axis=1)) * 0.0026041666666666665
+    c0 = v0 - mean[:, None]
+    c1 = v1 - mean[:, None]
+    var = (tl.sum(c0 * c0, axis=1) + tl.sum(c1 * c1, axis=1)) * 0.0026041666666666665
+    rstd = tl.rsqrt(var + 1.0e-5)
+
+    w0 = tl.load(norm_w + d0).to(tl.float32)
+    b0 = tl.load(norm_b + d0).to(tl.float32)
+    w1 = tl.load(norm_w + 256 + d1).to(tl.float32)
+    b1 = tl.load(norm_b + 256 + d1).to(tl.float32)
+
+    tl.store(y + offs_m[:, None] * 384 + d0[None, :], (c0 * rstd[:, None] * w0[None, :] + b0[None, :]).to(tl.float16), mask=m[:, None])
+    tl.store(y + offs_m[:, None] * 384 + 256 + d1[None, :], (c1 * rstd[:, None] * w1[None, :] + b1[None, :]).to(tl.float16), mask=m[:, None])
+
+
+@triton.jit
+def _ln768_to_half_kernel(x, y, norm_w, norm_b, total: tl.constexpr, BLOCK_M: tl.constexpr):
+    pid = tl.program_id(0)
+    offs_m = pid * BLOCK_M + tl.arange(0, BLOCK_M)
+    d0 = tl.arange(0, 512)
+    d1 = tl.arange(0, 256)
+    m = offs_m < total
+
+    v0 = tl.load(x + offs_m[:, None] * 768 + d0[None, :], mask=m[:, None], other=0.0).to(tl.float32)
+    v1 = tl.load(x + offs_m[:, None] * 768 + 512 + d1[None, :], mask=m[:, None], other=0.0).to(tl.float32)
+
+    mean = (tl.sum(v0, axis=1) + tl.sum(v1, axis=1)) * 0.0013020833333333333
+    c0 = v0 - mean[:, None]
+    c1 = v1 - mean[:, None]
+    var = (tl.sum(c0 * c0, axis=1) + tl.sum(c1 * c1, axis=1)) * 0.0013020833333333333
+    rstd = tl.rsqrt(var + 1.0e-5)
+
+    w0 = tl.load(norm_w + d0).to(tl.float32)
+    b0 = tl.load(norm_b + d0).to(tl.float32)
+    w1 = tl.load(norm_w + 512 + d1).to(tl.float32)
+    b1 = tl.load(norm_b + 512 + d1).to(tl.float32)
+
+    tl.store(y + offs_m[:, None] * 768 + d0[None, :], (c0 * rstd[:, None] * w0[None, :] + b0[None, :]).to(tl.float16), mask=m[:, None])
+    tl.store(y + offs_m[:, None] * 768 + 512 + d1[None, :], (c1 * rstd[:, None] * w1[None, :] + b1[None, :]).to(tl.float16), mask=m[:, None])
+
+
+@triton.jit
+def _gate_h_inplace_kernel(
+    proj_h, mask,
+    total: tl.constexpr, hidden: tl.constexpr, has_mask: tl.constexpr,
+    BLOCK_P: tl.constexpr, BLOCK_H: tl.constexpr,
+):
+    pid_p = tl.program_id(0)
+    pid_h = tl.program_id(1)
+
+    offs_p = pid_p * BLOCK_P + tl.arange(0, BLOCK_P)
+    offs_h = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
+    valid = (offs_p[None, :] < total) & (offs_h[:, None] < hidden)
+    base = offs_h[:, None] * total + offs_p[None, :]
+
+    left = tl.load(proj_h + base, mask=valid, other=0.0).to(tl.float32)
+    right = tl.load(proj_h + hidden * total + base, mask=valid, other=0.0).to(tl.float32)
+    lg = tl.load(proj_h + 2 * hidden * total + base, mask=valid, other=0.0).to(tl.float32)
+    rg = tl.load(proj_h + 3 * hidden * total + base, mask=valid, other=0.0).to(tl.float32)
+
+    left = left * tl.sigmoid(lg)
+    right = right * tl.sigmoid(rg)
+
+    if has_mask:
+        mv = tl.load(mask + offs_p, mask=offs_p < total, other=0.0).to(tl.float32)
+        left = left * mv[None, :]
+        right = right * mv[None, :]
+
+    tl.store(proj_h + base, left.to(tl.float16), mask=valid)
+    tl.store(proj_h + hidden * total + base, right.to(tl.float16), mask=valid)
+
+
+@triton.jit
+def _norm_gate_out128_b1_kernel(
+    tri_h, proj_h, out, norm_w, norm_b, w_out_t,
+    total: tl.constexpr, dim: tl.constexpr,
+    BLOCK_P: tl.constexpr, BLOCK_D: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offs_p = pid * BLOCK_P + tl.arange(0, BLOCK_P)
+    offs_h = tl.arange(0, 128)
+    offs_d = tl.arange(0, BLOCK_D)
+
+    src = offs_h[:, None] * total + offs_p[None, :]
+    valid = offs_p[None, :] < total
+
+    vals = tl.load(tri_h + src, mask=valid, other=0.0).to(tl.float32)
+    mean = tl.sum(vals, axis=0) * 0.0078125
+    centered = vals - mean[None, :]
+    var = tl.sum(centered * centered, axis=0) * 0.0078125
+    rstd = tl.rsqrt(var + 1.0e-5)
+
+    nw = tl.load(norm_w + offs_h).to(tl.float32)
+    nb = tl.load(norm_b + offs_h).to(tl.float32)
+    gate = tl.load(proj_h + (512 + offs_h[:, None]) * total + offs_p[None, :], mask=valid, other=0.0).to(tl.float32)
+    y = ((centered * rstd[None, :]) * nw[:, None] + nb[:, None]) * tl.sigmoid(gate)
+    yh = tl.trans(y.to(tl.float16))
+
+    w = tl.load(
+        w_out_t + offs_h[:, None] * dim + offs_d[None, :],
+        mask=offs_d[None, :] < dim,
+        other=0.0,
+    )
+    acc = tl.dot(yh, w, out_dtype=tl.float32)
+    tl.store(out + offs_p[:, None] * dim + offs_d[None, :], acc, mask=(offs_p[:, None] < total) & (offs_d[None, :] < dim))
+
+
+@triton.jit
+def _norm_gate_out128_hb_kernel(
+    tri_h, proj_h, out, norm_w, norm_b, w_out_t,
+    total: tl.constexpr, n2: tl.constexpr, bsz: tl.constexpr, dim: tl.constexpr,
+    BLOCK_P: tl.constexpr, BLOCK_D: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offs_p = pid * BLOCK_P + tl.arange(0, BLOCK_P)
+    offs_h = tl.arange(0, 128)
+    offs_d = tl.arange(0, BLOCK_D)
+
+    b = offs_p // n2
+    pos = offs_p - b * n2
+    tri_src = ((offs_h[:, None] * bsz + b[None, :]) * n2) + pos[None, :]
+    valid = offs_p[None, :] < total
+
+    vals = tl.load(tri_h + tri_src, mask=valid, other=0.0).to(tl.float32)
+    mean = tl.sum(vals, axis=0) * 0.0078125
+    centered = vals - mean[None, :]
+    var = tl.sum(centered * centered, axis=0) * 0.0078125
+    rstd = tl.rsqrt(var + 1.0e-5)
+
+    nw = tl.load(norm_w + offs_h).to(tl.float32)
+    nb = tl.load(norm_b + offs_h).to(tl.float32)
+    gate = tl.load(proj_h + (512 + offs_h[:, None]) * total + offs_p[None, :], mask=valid, other=0.0).to(tl.float32)
+    y = ((centered * rstd[None, :]) * nw[:, None] + nb[:, None]) * tl.sigmoid(gate)
+    yh = tl.trans(y.to(tl.float16))
+
+    w = tl.load(
+        w_out_t + offs_h[:, None] * dim + offs_d[None, :],
+        mask=offs_d[None, :] < dim,
+        other=0.0,
+    )
+    acc = tl.dot(yh, w, out_dtype=tl.float32)
+    tl.store(out + offs_p[:, None] * dim + offs_d[None, :], acc, mask=(offs_p[:, None] < total) & (offs_d[None, :] < dim))
+
+
+def _cached_weights(weights):
+    tensors = (
+        weights["left_proj.weight"],
+        weights["right_proj.weight"],
+        weights["left_gate.weight"],
+        weights["right_gate.weight"],
+        weights["out_gate.weight"],
+        weights["to_out.weight"],
+    )
+    key = tuple((id(t), t.data_ptr(), tuple(t.shape), t.dtype) for t in tensors)
+    cached = _WEIGHT_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    w_proj = torch.cat(tensors[:5], dim=0).contiguous().to(torch.float16)
+    w_out_t = tensors[5].t().contiguous().to(torch.float16)
+
+    if len(_WEIGHT_CACHE) >= 8:
+        _WEIGHT_CACHE.clear()
+    _WEIGHT_CACHE[key] = (w_proj, w_out_t)
+    return w_proj, w_out_t
+
+
+def custom_kernel(data):
+    input_tensor, mask, weights, config = data
+    bsz, n, _, dim = input_tensor.shape
+    hidden = config["hidden_dim"]
+    total = bsz * n * n
+    n2 = n * n
+
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = True
+
+    w_proj, w_out_t = _cached_weights(weights)
+    xh = torch.empty((total, dim), device=input_tensor.device, dtype=torch.float16)
+
+    if dim == 128:
+        _ln128_to_half_kernel[(triton.cdiv(total, 16),)](
+            input_tensor, xh, weights["norm.weight"], weights["norm.bias"],
+            total, BLOCK_M=16, num_warps=4,
+        )
+    elif dim == 384:
+        _ln384_to_half_kernel[(triton.cdiv(total, 8),)](
+            input_tensor, xh, weights["norm.weight"], weights["norm.bias"],
+            total, BLOCK_M=8, num_warps=8,
+        )
+    else:
+        _ln768_to_half_kernel[(triton.cdiv(total, 4),)](
+            input_tensor, xh, weights["norm.weight"], weights["norm.bias"],
+            total, BLOCK_M=4, num_warps=8,
+        )
+
+    proj_h = torch.mm(w_proj, xh.t())
+
+    has_mask = mask is not None and not bool(config.get("nomask", False))
+    mask_arg = mask.reshape(total) if has_mask else input_tensor
+
+    _gate_h_inplace_kernel[(triton.cdiv(total, 64), 4)](
+        proj_h, mask_arg, total, hidden, has_mask,
+        BLOCK_P=64, BLOCK_H=32, num_warps=4,
+    )
+
+    left_h = proj_h[:128].view(128 * bsz, n, n)
+    right_h = proj_h[128:256].view(128 * bsz, n, n)
+    tri_h = torch.bmm(left_h, right_h.transpose(1, 2))
+
+    out = torch.empty((total, dim), device=input_tensor.device, dtype=torch.float32)
+    block_p = 16 if dim == 128 else 8
+
+    if bsz == 1:
+        _norm_gate_out128_b1_kernel[(triton.cdiv(total, block_p),)](
+            tri_h, proj_h, out,
+            weights["to_out_norm.weight"], weights["to_out_norm.bias"], w_out_t,
+            total, dim,
+            BLOCK_P=block_p,
+            BLOCK_D=triton.next_power_of_2(dim),
+            num_warps=8,
+        )
+    else:
+        _norm_gate_out128_hb_kernel[(triton.cdiv(total, block_p),)](
+            tri_h, proj_h, out,
+            weights["to_out_norm.weight"], weights["to_out_norm.bias"], w_out_t,
+            total, n2, bsz, dim,
+            BLOCK_P=block_p,
+            BLOCK_D=triton.next_power_of_2(dim),
+            num_warps=8,
+        )
+
+    return out.reshape(bsz, n, n, dim)
+```

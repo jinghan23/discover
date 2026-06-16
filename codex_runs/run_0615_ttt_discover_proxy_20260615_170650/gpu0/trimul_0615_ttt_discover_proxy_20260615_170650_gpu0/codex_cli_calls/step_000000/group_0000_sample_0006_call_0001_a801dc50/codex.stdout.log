@@ -1,0 +1,126 @@
+```python
+"""
+TriMul outgoing forward: normalize input with PyTorch, fuse projection/gating/masking in
+Triton, compute the N^3 channelwise contraction with batched matmul, then apply output
+LayerNorm/gate/projection. The Triton stage avoids materializing separate projection and
+gate intermediates before the contraction inputs.
+"""
+
+import torch
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def _proj_gate_kernel(
+    x_ptr, mask_ptr,
+    proj_w_ptr, gate_w_ptr,
+    out_ptr,
+    total_tokens: tl.constexpr,
+    dim: tl.constexpr,
+    hidden: tl.constexpr,
+    has_mask: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    pid_tok = tl.program_id(0)
+    pid_h = tl.program_id(1)
+
+    offs_h = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
+    offs_d = tl.arange(0, BLOCK_D)
+
+    x = tl.load(x_ptr + pid_tok * dim + offs_d, mask=offs_d < dim, other=0.0).to(tl.float32)
+
+    proj_acc = tl.zeros((BLOCK_H,), dtype=tl.float32)
+    gate_acc = tl.zeros((BLOCK_H,), dtype=tl.float32)
+
+    for d0 in range(0, dim, BLOCK_D):
+        d = d0 + offs_d
+        xv = tl.load(x_ptr + pid_tok * dim + d, mask=d < dim, other=0.0).to(tl.float32)
+
+        pw = tl.load(
+            proj_w_ptr + offs_h[:, None] * dim + d[None, :],
+            mask=(offs_h[:, None] < hidden) & (d[None, :] < dim),
+            other=0.0,
+        ).to(tl.float32)
+        gw = tl.load(
+            gate_w_ptr + offs_h[:, None] * dim + d[None, :],
+            mask=(offs_h[:, None] < hidden) & (d[None, :] < dim),
+            other=0.0,
+        ).to(tl.float32)
+
+        proj_acc += tl.sum(pw * xv[None, :], axis=1)
+        gate_acc += tl.sum(gw * xv[None, :], axis=1)
+
+    gate = 1.0 / (1.0 + tl.exp(-gate_acc))
+    val = proj_acc * gate
+
+    if has_mask:
+        m = tl.load(mask_ptr + pid_tok).to(tl.float32)
+        val *= m
+
+    tl.store(out_ptr + pid_tok * hidden + offs_h, val, mask=offs_h < hidden)
+
+
+def _project_gate(xn, mask, proj_w, gate_w, has_mask: bool):
+    b, n, _, dim = xn.shape
+    hidden = proj_w.shape[0]
+    out = torch.empty((b, n, n, hidden), device=xn.device, dtype=torch.float32)
+    total = b * n * n
+
+    block_h = 32
+    block_d = triton.next_power_of_2(dim)
+    _proj_gate_kernel[(total, triton.cdiv(hidden, block_h))](
+        xn, mask, proj_w, gate_w, out,
+        total, dim, hidden, has_mask,
+        BLOCK_H=block_h,
+        BLOCK_D=block_d,
+        num_warps=4,
+    )
+    return out
+
+
+def custom_kernel(data):
+    input_tensor, mask, weights, config = data
+    dim = int(config["dim"])
+    hidden_dim = int(config["hidden_dim"])
+
+    norm_weight = weights["norm.weight"]
+    norm_bias = weights["norm.bias"]
+    left_proj_weight = weights["left_proj.weight"]
+    right_proj_weight = weights["right_proj.weight"]
+    left_gate_weight = weights["left_gate.weight"]
+    right_gate_weight = weights["right_gate.weight"]
+    out_gate_weight = weights["out_gate.weight"]
+    to_out_norm_weight = weights["to_out_norm.weight"]
+    to_out_norm_bias = weights["to_out_norm.bias"]
+    to_out_weight = weights["to_out.weight"]
+
+    x = input_tensor.float()
+    mask_f = mask.float()
+
+    xn = torch.nn.functional.layer_norm(x, (dim,), norm_weight.float(), norm_bias.float(), 1e-5)
+
+    nomask = bool(config.get("nomask", False))
+    has_mask = not nomask
+
+    left = _project_gate(xn, mask_f, left_proj_weight.float(), left_gate_weight.float(), has_mask)
+    right = _project_gate(xn, mask_f, right_proj_weight.float(), right_gate_weight.float(), has_mask)
+
+    b, n, _, _ = left.shape
+    left_m = left.permute(0, 3, 1, 2).reshape(b * hidden_dim, n, n)
+    right_m = right.permute(0, 3, 2, 1).reshape(b * hidden_dim, n, n)
+    out = torch.bmm(left_m, right_m).reshape(b, hidden_dim, n, n).permute(0, 2, 3, 1).contiguous()
+
+    out_gate = torch.sigmoid(torch.nn.functional.linear(xn, out_gate_weight.float()))
+    out = torch.nn.functional.layer_norm(
+        out,
+        (hidden_dim,),
+        to_out_norm_weight.float(),
+        to_out_norm_bias.float(),
+        1e-5,
+    )
+    out = out * out_gate
+    out = torch.nn.functional.linear(out, to_out_weight.float())
+    return out.float()
+```
