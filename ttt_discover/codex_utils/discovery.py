@@ -33,6 +33,14 @@ class DiscoverConfig:
     num_cpus_per_task: int = 0
     eval_timeout: int = 1000
 
+    # Optional fixed score shaping preset for sampler state values.
+    reward_shaping: bool = False
+    reward_shaping_threshold_start: float = 0.010
+    reward_shaping_threshold_end: float = 0.002
+    reward_shaping_decay_steps: int = 20
+    reward_shaping_small_weight: float = 0.1
+    reward_shaping_large_weight: float = 1.2
+
     codex_backend: Literal["cli", "responses"] = "cli"
     codex_model_name: str | None = None
     codex_max_output_tokens: int = 8192
@@ -99,6 +107,12 @@ def _run_codex_no_finetune(config: DiscoverConfig) -> None:
         remove_constant_reward_groups=(
             config.remove_constant_reward_groups and config.group_size > 1
         ),
+        reward_shaping=config.reward_shaping,
+        reward_shaping_threshold_start=config.reward_shaping_threshold_start,
+        reward_shaping_threshold_end=config.reward_shaping_threshold_end,
+        reward_shaping_decay_steps=config.reward_shaping_decay_steps,
+        reward_shaping_small_weight=config.reward_shaping_small_weight,
+        reward_shaping_large_weight=config.reward_shaping_large_weight,
     )
     asyncio.run(codex_no_finetune_main(codex_config))
 

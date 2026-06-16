@@ -79,6 +79,7 @@ from ttt_discover.codex_utils.sampler import (
     seed_initial_pool_paths,
     seed_initial_program_paths,
 )
+from ttt_discover.reward_shaping import shape_state_value
 
 logger = logging.getLogger(__name__)
 
@@ -154,6 +155,12 @@ class CodexNoFinetuneConfig:
 
     log_path: str = ""
     remove_constant_reward_groups: bool = False
+    reward_shaping: bool = False
+    reward_shaping_threshold_start: float = 0.010
+    reward_shaping_threshold_end: float = 0.002
+    reward_shaping_decay_steps: int = 20
+    reward_shaping_small_weight: float = 0.1
+    reward_shaping_large_weight: float = 1.2
 
 
 class MetricsLogger:
@@ -933,6 +940,20 @@ async def _run_candidate(
         if autonomous_submission_path is not None:
             metrics["codex/autonomous_submission_path"] = autonomous_submission_path
         next_state = _maybe_create_next_state(env, step_idx, parsed_code, outs)
+        if next_state is not None:
+            shaped_value, shaping_metrics = shape_state_value(
+                getattr(next_state, "value", None),
+                getattr(parent_state, "value", None),
+                step_idx,
+                enabled=cfg.reward_shaping,
+                threshold_start=cfg.reward_shaping_threshold_start,
+                threshold_end=cfg.reward_shaping_threshold_end,
+                decay_steps=cfg.reward_shaping_decay_steps,
+                small_weight=cfg.reward_shaping_small_weight,
+                large_weight=cfg.reward_shaping_large_weight,
+            )
+            next_state.value = shaped_value
+            metrics.update(shaping_metrics)
         return CandidateResult(
             parent_state=parent_state,
             group_idx=group_idx,
