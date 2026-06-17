@@ -64,7 +64,7 @@ fi
     --gpu "$GPU" \
     --cuda-device-order "$CUDA_DEVICE_ORDER_VALUE" \
     --torch-cuda-arch-list "$TORCH_CUDA_ARCH_LIST_VALUE" \
-    --num-epochs 8 \
+    --num-epochs 20 \
     --group-size 2 \
     --groups-per-batch 1 \
     --num-cpus-per-task 1 \
