@@ -1,0 +1,129 @@
+```python
+"""
+TriMul outgoing forward: use PyTorch/cuBLAS for the large dense projections and
+per-channel N x N products, while a Triton kernel fuses the final hidden
+LayerNorm, output gate, and to_out projection. Projection weights are cached
+per weight pointer/config to avoid repeated concatenation during benchmarking.
+"""
+
+import torch
+import torch.nn.functional as F
+import triton
+import triton.language as tl
+
+
+_PROJ_W_CACHE = {}
+
+
+@triton.jit
+def _final_norm_gate_out_kernel(
+    y_ptr,
+    gate_ptr,
+    w_norm_ptr,
+    b_norm_ptr,
+    w_out_ptr,
+    out_ptr,
+    dim_out: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    BLOCK_O: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offs_d = tl.arange(0, BLOCK_D)
+
+    y = tl.load(y_ptr + pid * BLOCK_D + offs_d).to(tl.float32)
+    mean = tl.sum(y, axis=0) / BLOCK_D
+    yc = y - mean
+    var = tl.sum(yc * yc, axis=0) / BLOCK_D
+    rstd = tl.rsqrt(var + 1.0e-5)
+
+    nw = tl.load(w_norm_ptr + offs_d).to(tl.float32)
+    nb = tl.load(b_norm_ptr + offs_d).to(tl.float32)
+    gate = tl.load(gate_ptr + pid * BLOCK_D + offs_d).to(tl.float32)
+
+    h = (yc * rstd * nw + nb) * gate
+
+    offs_o = tl.arange(0, BLOCK_O)
+    for o0 in range(0, dim_out, BLOCK_O):
+        o = o0 + offs_o
+        wo = tl.load(
+            w_out_ptr + o[:, None] * BLOCK_D + offs_d[None, :],
+            mask=o[:, None] < dim_out,
+            other=0.0,
+        ).to(tl.float32)
+        acc = tl.sum(wo * h[None, :], axis=1)
+        tl.store(out_ptr + pid * dim_out + o, acc, mask=o < dim_out)
+
+
+def _get_proj_weight(weights, hidden_dim, dim):
+    ws = (
+        weights["left_proj.weight"],
+        weights["right_proj.weight"],
+        weights["left_gate.weight"],
+        weights["right_gate.weight"],
+        weights["out_gate.weight"],
+    )
+    key = tuple(w.data_ptr() for w in ws) + (hidden_dim, dim)
+    cached = _PROJ_W_CACHE.get(key)
+    if cached is None:
+        cached = torch.cat(ws, dim=0).contiguous()
+        _PROJ_W_CACHE.clear()
+        _PROJ_W_CACHE[key] = cached
+    return cached
+
+
+def custom_kernel(data):
+    input_tensor, mask, weights, config = data
+    dim = int(config["dim"])
+    hidden_dim = int(config["hidden_dim"])
+
+    x = input_tensor
+    bsz, n, _, _ = x.shape
+    rows = bsz * n * n
+
+    x_flat = x.reshape(rows, dim)
+    x_norm = F.layer_norm(
+        x_flat,
+        (dim,),
+        weights["norm.weight"],
+        weights["norm.bias"],
+        eps=1.0e-5,
+    )
+
+    proj_w = _get_proj_weight(weights, hidden_dim, dim)
+    proj = F.linear(x_norm, proj_w)
+    left, right, left_gate, right_gate, out_gate = proj.split(hidden_dim, dim=-1)
+
+    left = left * torch.sigmoid(left_gate)
+    right = right * torch.sigmoid(right_gate)
+    out_gate = torch.sigmoid(out_gate).contiguous()
+
+    if mask is not None:
+        m = mask.reshape(rows, 1).to(left.dtype)
+        left = left * m
+        right = right * m
+
+    left = left.reshape(bsz, n, n, hidden_dim)
+    right = right.reshape(bsz, n, n, hidden_dim)
+
+    left_bdh = left.permute(0, 3, 1, 2).reshape(bsz * hidden_dim, n, n).contiguous()
+    right_bdh = right.permute(0, 3, 1, 2).reshape(bsz * hidden_dim, n, n).contiguous()
+
+    y = torch.bmm(left_bdh, right_bdh.transpose(1, 2))
+    y = y.reshape(bsz, hidden_dim, n, n).permute(0, 2, 3, 1).contiguous()
+
+    out = torch.empty((rows, dim), device=x.device, dtype=torch.float32)
+    _final_norm_gate_out_kernel[(rows,)](
+        y,
+        out_gate,
+        weights["to_out_norm.weight"],
+        weights["to_out_norm.bias"],
+        weights["to_out.weight"],
+        out,
+        dim,
+        BLOCK_D=hidden_dim,
+        BLOCK_O=32,
+        num_warps=4,
+    )
+
+    return out.reshape(bsz, n, n, dim)
+```

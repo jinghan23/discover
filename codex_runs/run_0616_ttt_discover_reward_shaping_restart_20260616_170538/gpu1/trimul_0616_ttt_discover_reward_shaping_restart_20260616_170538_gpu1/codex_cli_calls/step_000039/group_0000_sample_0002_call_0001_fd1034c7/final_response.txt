@@ -1,0 +1,218 @@
+```python
+"""TriMul outgoing forward using packed fp16 projections, Triton gate/mask packing,
+cuBLAS batched GEMM for the N^3 contraction, and a Triton fused hidden LayerNorm +
+out-gate before the final tensor-core projection. Output is returned as float32.
+"""
+
+import torch
+import torch.nn.functional as F
+import triton
+import triton.language as tl
+
+
+_WEIGHT_CACHE = {}
+_BACKENDS_SET = False
+
+
+@triton.jit
+def _gate_pack_kernel(
+    proj_ptr,
+    mask_ptr,
+    left_ptr,
+    right_ptr,
+    out_gate_ptr,
+    P: tl.constexpr,
+    N2: tl.constexpr,
+    H: tl.constexpr,
+    HAS_MASK: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    rows = pid * BLOCK_M + tl.arange(0, BLOCK_M)
+    hs = tl.arange(0, BLOCK_H)
+
+    valid = (rows[:, None] < P) & (hs[None, :] < H)
+    proj_base = rows[:, None] * (5 * H) + hs[None, :]
+
+    l = tl.load(proj_ptr + proj_base, mask=valid, other=0.0).to(tl.float32)
+    r = tl.load(proj_ptr + proj_base + H, mask=valid, other=0.0).to(tl.float32)
+    lg = tl.load(proj_ptr + proj_base + 2 * H, mask=valid, other=0.0).to(tl.float32)
+    rg = tl.load(proj_ptr + proj_base + 3 * H, mask=valid, other=0.0).to(tl.float32)
+    og = tl.load(proj_ptr + proj_base + 4 * H, mask=valid, other=0.0).to(tl.float32)
+
+    l = l * (1.0 / (1.0 + tl.exp(-lg)))
+    r = r * (1.0 / (1.0 + tl.exp(-rg)))
+    og = 1.0 / (1.0 + tl.exp(-og))
+
+    if HAS_MASK:
+        m = tl.load(mask_ptr + rows, mask=rows < P, other=0.0).to(tl.float32)
+        l = l * m[:, None]
+        r = r * m[:, None]
+
+    b = rows // N2
+    pair = rows - b * N2
+    bh_addr = (b[:, None] * H + hs[None, :]) * N2 + pair[:, None]
+
+    tl.store(left_ptr + bh_addr, l, mask=valid)
+    tl.store(right_ptr + bh_addr, r, mask=valid)
+    tl.store(out_gate_ptr + rows[:, None] * H + hs[None, :], og, mask=valid)
+
+
+@triton.jit
+def _norm_gate_kernel(
+    tri_ptr,
+    out_gate_ptr,
+    y_ptr,
+    norm_w_ptr,
+    norm_b_ptr,
+    P: tl.constexpr,
+    N2: tl.constexpr,
+    H: tl.constexpr,
+    EPS: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    rows = pid * BLOCK_M + tl.arange(0, BLOCK_M)
+    hs = tl.arange(0, BLOCK_H)
+
+    b = rows // N2
+    pair = rows - b * N2
+    valid = (rows[:, None] < P) & (hs[None, :] < H)
+
+    tri_addr = (b[:, None] * H + hs[None, :]) * N2 + pair[:, None]
+    vals = tl.load(tri_ptr + tri_addr, mask=valid, other=0.0).to(tl.float32)
+
+    hmask = hs[None, :] < H
+    mean = tl.sum(vals, axis=1) * (1.0 / H)
+    centered = tl.where(hmask, vals - mean[:, None], 0.0)
+    var = tl.sum(centered * centered, axis=1) * (1.0 / H)
+    inv_std = tl.rsqrt(var + EPS)
+
+    nw = tl.load(norm_w_ptr + hs, mask=hs < H, other=0.0).to(tl.float32)
+    nb = tl.load(norm_b_ptr + hs, mask=hs < H, other=0.0).to(tl.float32)
+    og = tl.load(out_gate_ptr + rows[:, None] * H + hs[None, :], mask=valid, other=0.0).to(tl.float32)
+
+    y = (centered * inv_std[:, None] * nw[None, :] + nb[None, :]) * og
+    tl.store(y_ptr + rows[:, None] * H + hs[None, :], y, mask=valid)
+
+
+def _set_fast_backends():
+    global _BACKENDS_SET
+    if not _BACKENDS_SET:
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        _BACKENDS_SET = True
+
+
+def _cache_key(name, tensors, dtype):
+    return (
+        name,
+        str(dtype),
+        tuple(
+            (id(t), t.data_ptr(), tuple(t.shape), str(t.dtype), str(t.device), getattr(t, "_version", 0))
+            for t in tensors
+        ),
+    )
+
+
+def _cached_projection_weight(weights, dtype):
+    tensors = (
+        weights["left_proj.weight"],
+        weights["right_proj.weight"],
+        weights["left_gate.weight"],
+        weights["right_gate.weight"],
+        weights["out_gate.weight"],
+    )
+    key = _cache_key("packed_proj", tensors, dtype)
+    cached = _WEIGHT_CACHE.get(key)
+    if cached is None:
+        if len(_WEIGHT_CACHE) > 32:
+            _WEIGHT_CACHE.clear()
+        cached = torch.cat([t.detach() for t in tensors], dim=0).to(dtype).contiguous()
+        _WEIGHT_CACHE[key] = cached
+    return cached
+
+
+def _cached_to_out_weight(w, dtype):
+    key = _cache_key("to_out", (w,), dtype)
+    cached = _WEIGHT_CACHE.get(key)
+    if cached is None:
+        if len(_WEIGHT_CACHE) > 32:
+            _WEIGHT_CACHE.clear()
+        cached = w.detach().to(dtype).contiguous()
+        _WEIGHT_CACHE[key] = cached
+    return cached
+
+
+def custom_kernel(data):
+    input_tensor, mask, weights, config = data
+    _set_fast_backends()
+
+    with torch.no_grad():
+        bs, n, _, dim = input_tensor.shape
+        hidden_dim = int(weights["left_proj.weight"].shape[0])
+        out_dim = int(weights["to_out.weight"].shape[0])
+        p = bs * n * n
+        n2 = n * n
+        eps = float(config.get("eps", 1e-5))
+        compute_dtype = torch.float16
+
+        x_norm = F.layer_norm(
+            input_tensor,
+            (dim,),
+            weights["norm.weight"],
+            weights["norm.bias"],
+            eps,
+        )
+        x_flat = x_norm.reshape(p, dim).to(compute_dtype)
+
+        packed_w = _cached_projection_weight(weights, compute_dtype)
+        proj = F.linear(x_flat, packed_w).contiguous()
+
+        left = torch.empty((bs * hidden_dim, n, n), device=input_tensor.device, dtype=compute_dtype)
+        right = torch.empty_like(left)
+        out_gate = torch.empty((p, hidden_dim), device=input_tensor.device, dtype=compute_dtype)
+
+        has_mask = (mask is not None) and (not bool(config.get("nomask", False)))
+        mask_arg = mask.contiguous() if has_mask else input_tensor
+
+        block_h = 1 << (hidden_dim - 1).bit_length()
+        _gate_pack_kernel[(triton.cdiv(p, 16),)](
+            proj,
+            mask_arg,
+            left,
+            right,
+            out_gate,
+            p,
+            n2,
+            hidden_dim,
+            has_mask,
+            BLOCK_M=16,
+            BLOCK_H=block_h,
+            num_warps=8,
+        )
+
+        tri = torch.bmm(left, right.transpose(1, 2))
+
+        y = torch.empty((p, hidden_dim), device=input_tensor.device, dtype=compute_dtype)
+        _norm_gate_kernel[(triton.cdiv(p, 16),)](
+            tri,
+            out_gate,
+            y,
+            weights["to_out_norm.weight"],
+            weights["to_out_norm.bias"],
+            p,
+            n2,
+            hidden_dim,
+            eps,
+            BLOCK_M=16,
+            BLOCK_H=block_h,
+            num_warps=8,
+        )
+
+        to_out_w = _cached_to_out_weight(weights["to_out.weight"], compute_dtype)
+        out = F.linear(y, to_out_w).reshape(bs, n, n, out_dim)
+        return out.to(torch.float32)
+```

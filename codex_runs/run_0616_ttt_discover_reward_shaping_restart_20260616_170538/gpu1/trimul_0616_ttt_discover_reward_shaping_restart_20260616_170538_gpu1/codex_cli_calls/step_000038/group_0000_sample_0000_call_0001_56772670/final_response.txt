@@ -1,0 +1,175 @@
+```python
+"""
+TriMul outgoing forward pass.
+
+The implementation fuses the input LayerNorm, five input projections, sigmoid gates,
+and optional masking into one Triton kernel, materializes left/right/out_gate, computes
+the outgoing triangular multiplication as grouped GEMMs with torch.bmm, then fuses
+the hidden LayerNorm, output gate, and final projection in a second Triton kernel.
+"""
+
+import torch
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def _tri_in_proj_kernel(
+    x, mask,
+    norm_w, norm_b,
+    w_left, w_right, w_lgate, w_rgate, w_ogate,
+    left, right, ogate,
+    total_rows: tl.constexpr,
+    dim: tl.constexpr,
+    hidden: tl.constexpr,
+    has_mask: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    row = tl.program_id(0)
+    hblk = tl.program_id(1)
+
+    offs_d = tl.arange(0, BLOCK_D)
+    x_mask = offs_d < dim
+    xv = tl.load(x + row * dim + offs_d, mask=x_mask, other=0.0).to(tl.float32)
+
+    mean = tl.sum(xv, axis=0) / dim
+    xc = tl.where(x_mask, xv - mean, 0.0)
+    var = tl.sum(xc * xc, axis=0) / dim
+    inv = tl.rsqrt(var + 1.0e-5)
+
+    nw = tl.load(norm_w + offs_d, mask=x_mask, other=0.0).to(tl.float32)
+    nb = tl.load(norm_b + offs_d, mask=x_mask, other=0.0).to(tl.float32)
+    xn = (xv - mean) * inv * nw + nb
+    xn = tl.where(x_mask, xn, 0.0)
+
+    offs_h = hblk * BLOCK_H + tl.arange(0, BLOCK_H)
+    h_mask = offs_h < hidden
+
+    wl = tl.load(w_left + offs_h[:, None] * dim + offs_d[None, :],
+                 mask=h_mask[:, None] & x_mask[None, :], other=0.0).to(tl.float32)
+    wr = tl.load(w_right + offs_h[:, None] * dim + offs_d[None, :],
+                 mask=h_mask[:, None] & x_mask[None, :], other=0.0).to(tl.float32)
+    wlg = tl.load(w_lgate + offs_h[:, None] * dim + offs_d[None, :],
+                  mask=h_mask[:, None] & x_mask[None, :], other=0.0).to(tl.float32)
+    wrg = tl.load(w_rgate + offs_h[:, None] * dim + offs_d[None, :],
+                  mask=h_mask[:, None] & x_mask[None, :], other=0.0).to(tl.float32)
+    wog = tl.load(w_ogate + offs_h[:, None] * dim + offs_d[None, :],
+                  mask=h_mask[:, None] & x_mask[None, :], other=0.0).to(tl.float32)
+
+    l = tl.sum(wl * xn[None, :], axis=1)
+    r = tl.sum(wr * xn[None, :], axis=1)
+    lg = tl.sigmoid(tl.sum(wlg * xn[None, :], axis=1))
+    rg = tl.sigmoid(tl.sum(wrg * xn[None, :], axis=1))
+    og = tl.sigmoid(tl.sum(wog * xn[None, :], axis=1))
+
+    m = 1.0
+    if has_mask:
+        m = tl.load(mask + row).to(tl.float32)
+
+    base = row * hidden + offs_h
+    tl.store(left + base, (l * lg * m).to(tl.float32), mask=h_mask)
+    tl.store(right + base, (r * rg * m).to(tl.float32), mask=h_mask)
+    tl.store(ogate + base, og.to(tl.float32), mask=h_mask)
+
+
+@triton.jit
+def _tri_out_kernel(
+    tri, ogate,
+    norm_w, norm_b,
+    to_out_w,
+    out,
+    total_rows: tl.constexpr,
+    hidden: tl.constexpr,
+    dim: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    row = tl.program_id(0)
+    dblk = tl.program_id(1)
+
+    offs_h = tl.arange(0, BLOCK_H)
+    h_mask = offs_h < hidden
+    tv = tl.load(tri + row * hidden + offs_h, mask=h_mask, other=0.0).to(tl.float32)
+
+    mean = tl.sum(tv, axis=0) / hidden
+    tc = tl.where(h_mask, tv - mean, 0.0)
+    var = tl.sum(tc * tc, axis=0) / hidden
+    inv = tl.rsqrt(var + 1.0e-5)
+
+    nw = tl.load(norm_w + offs_h, mask=h_mask, other=0.0).to(tl.float32)
+    nb = tl.load(norm_b + offs_h, mask=h_mask, other=0.0).to(tl.float32)
+    og = tl.load(ogate + row * hidden + offs_h, mask=h_mask, other=0.0).to(tl.float32)
+    y = ((tv - mean) * inv * nw + nb) * og
+    y = tl.where(h_mask, y, 0.0)
+
+    offs_d = dblk * BLOCK_D + tl.arange(0, BLOCK_D)
+    d_mask = offs_d < dim
+    w = tl.load(to_out_w + offs_d[:, None] * hidden + offs_h[None, :],
+                mask=d_mask[:, None] & h_mask[None, :], other=0.0).to(tl.float32)
+
+    acc = tl.sum(w * y[None, :], axis=1)
+    tl.store(out + row * dim + offs_d, acc.to(tl.float32), mask=d_mask)
+
+
+def custom_kernel(data):
+    input_tensor, mask, weights, config = data
+    dim = int(config["dim"])
+    hidden_dim = int(config["hidden_dim"])
+
+    x = input_tensor.contiguous()
+    B, N, _, _ = x.shape
+    total = B * N * N
+    has_mask = mask is not None
+
+    if has_mask:
+        mask_c = mask.contiguous()
+        if bool(config.get("nomask", False)):
+            has_mask = False
+    else:
+        mask_c = x.new_empty((1,), dtype=torch.float32)
+
+    left = torch.empty((B, N, N, hidden_dim), device=x.device, dtype=torch.float32)
+    right = torch.empty_like(left)
+    ogate = torch.empty_like(left)
+
+    block_d = triton.next_power_of_2(dim)
+    block_h = 32
+
+    _tri_in_proj_kernel[(total, triton.cdiv(hidden_dim, block_h))](
+        x, mask_c,
+        weights["norm.weight"].contiguous(),
+        weights["norm.bias"].contiguous(),
+        weights["left_proj.weight"].contiguous(),
+        weights["right_proj.weight"].contiguous(),
+        weights["left_gate.weight"].contiguous(),
+        weights["right_gate.weight"].contiguous(),
+        weights["out_gate.weight"].contiguous(),
+        left, right, ogate,
+        total, dim, hidden_dim, has_mask,
+        BLOCK_D=block_d,
+        BLOCK_H=block_h,
+        num_warps=8,
+    )
+
+    l = left.permute(0, 3, 1, 2).reshape(B * hidden_dim, N, N).contiguous()
+    r = right.permute(0, 3, 1, 2).reshape(B * hidden_dim, N, N).contiguous()
+    tri = torch.bmm(l, r.transpose(1, 2))
+    tri = tri.reshape(B, hidden_dim, N, N).permute(0, 2, 3, 1).contiguous()
+
+    out = torch.empty((B, N, N, dim), device=x.device, dtype=torch.float32)
+
+    _tri_out_kernel[(total, triton.cdiv(dim, 32))](
+        tri, ogate,
+        weights["to_out_norm.weight"].contiguous(),
+        weights["to_out_norm.bias"].contiguous(),
+        weights["to_out.weight"].contiguous(),
+        out,
+        total, hidden_dim, dim,
+        BLOCK_H=triton.next_power_of_2(hidden_dim),
+        BLOCK_D=32,
+        num_warps=8,
+    )
+
+    return out
+```

@@ -1,0 +1,160 @@
+```python
+"""TriMul outgoing forward using PyTorch tensor-core projections plus Triton fusion.
+The input is layer-normalized, five hidden projections are computed in one GEMM, Triton fuses
+sigmoid gates, optional masking, and layout conversion for the N^3 contraction, torch.bmm performs
+the channel-wise pair contraction, then Triton fuses hidden LayerNorm with the output gate before the
+final projection. Intermediates use fp16 and the returned tensor is fp32.
+"""
+
+import torch
+import torch.nn.functional as F
+import triton
+import triton.language as tl
+
+
+_WEIGHT_CACHE = {}
+
+
+@triton.jit
+def _gate_transpose_kernel(
+    proj_p, mask_p, left_t, right_t,
+    total: tl.constexpr, n: tl.constexpr, hdim: tl.constexpr,
+    stride_row: tl.constexpr, has_mask: tl.constexpr, BLOCK: tl.constexpr,
+):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    valid = offs < total
+
+    h = offs % hdim
+    tmp = offs // hdim
+    k = tmp % n
+    i = (tmp // n) % n
+    b = tmp // (n * n)
+    row = b * n * n + i * n + k
+
+    lp = tl.load(proj_p + row * stride_row + h, mask=valid, other=0.0).to(tl.float32)
+    rp = tl.load(proj_p + row * stride_row + hdim + h, mask=valid, other=0.0).to(tl.float32)
+    lg = tl.load(proj_p + row * stride_row + 2 * hdim + h, mask=valid, other=0.0).to(tl.float32)
+    rg = tl.load(proj_p + row * stride_row + 3 * hdim + h, mask=valid, other=0.0).to(tl.float32)
+
+    lval = lp * (1.0 / (1.0 + tl.exp(-lg)))
+    rval = rp * (1.0 / (1.0 + tl.exp(-rg)))
+
+    if has_mask:
+        m = tl.load(mask_p + row, mask=valid, other=0.0).to(tl.float32)
+        lval *= m
+        rval *= m
+
+    dst = (b * hdim + h) * n * n + i * n + k
+    tl.store(left_t + dst, lval, mask=valid)
+    tl.store(right_t + dst, rval, mask=valid)
+
+
+@triton.jit
+def _post_ln_gate_kernel(
+    tri_p, proj_p, norm_w_p, norm_b_p, post_p,
+    rows: tl.constexpr, n: tl.constexpr, hdim: tl.constexpr,
+    stride_row: tl.constexpr, eps: tl.constexpr, BLOCK_H: tl.constexpr,
+):
+    row = tl.program_id(0)
+    hs = tl.arange(0, BLOCK_H)
+    hmask = hs < hdim
+
+    b = row // (n * n)
+    rem = row - b * n * n
+    i = rem // n
+    j = rem - i * n
+
+    vals = tl.load(
+        tri_p + (b * hdim + hs) * n * n + i * n + j,
+        mask=hmask,
+        other=0.0,
+    ).to(tl.float32)
+
+    mean = tl.sum(vals, axis=0) / hdim
+    centered = vals - mean
+    var = tl.sum(centered * centered, axis=0) / hdim
+    vals = centered * tl.rsqrt(var + eps)
+
+    nw = tl.load(norm_w_p + hs, mask=hmask, other=0.0).to(tl.float32)
+    nb = tl.load(norm_b_p + hs, mask=hmask, other=0.0).to(tl.float32)
+    og = tl.load(proj_p + row * stride_row + 4 * hdim + hs, mask=hmask, other=0.0).to(tl.float32)
+    gate = 1.0 / (1.0 + tl.exp(-og))
+
+    tl.store(post_p + row * hdim + hs, (vals * nw + nb) * gate, mask=hmask)
+
+
+def _half_weight(w):
+    w = w.contiguous()
+    return w if w.dtype == torch.float16 else w.to(torch.float16)
+
+
+def _stacked_projection_weight(weights, device):
+    keys = (
+        "left_proj.weight",
+        "right_proj.weight",
+        "left_gate.weight",
+        "right_gate.weight",
+        "out_gate.weight",
+    )
+    sig = tuple((weights[k].data_ptr(), weights[k].shape, weights[k].dtype) for k in keys)
+    cached = _WEIGHT_CACHE.get(sig)
+    if cached is not None:
+        return cached
+
+    w = torch.cat([_half_weight(weights[k]) for k in keys], dim=0).contiguous()
+    if len(_WEIGHT_CACHE) > 16:
+        _WEIGHT_CACHE.clear()
+    _WEIGHT_CACHE[sig] = w
+    return w
+
+
+def custom_kernel(data):
+    input_tensor, mask, weights, config = data
+
+    bs, n, _, dim = input_tensor.shape
+    hidden_dim = int(config.get("hidden_dim", weights["left_proj.weight"].shape[0]))
+    eps = float(config.get("eps", 1e-5))
+    rows = bs * n * n
+    total = rows * hidden_dim
+
+    x = F.layer_norm(
+        input_tensor.float(),
+        (dim,),
+        weights["norm.weight"].contiguous().float(),
+        weights["norm.bias"].contiguous().float(),
+        eps,
+    ).to(torch.float16)
+
+    proj_w = _stacked_projection_weight(weights, input_tensor.device)
+    proj = F.linear(x.reshape(rows, dim), proj_w)
+
+    left_t = torch.empty((bs * hidden_dim, n, n), device=input_tensor.device, dtype=torch.float16)
+    right_t = torch.empty_like(left_t)
+
+    has_mask = (mask is not None) and (not bool(config.get("nomask", False)))
+    mask_c = mask.contiguous() if has_mask else input_tensor
+
+    _gate_transpose_kernel[(triton.cdiv(total, 256),)](
+        proj, mask_c, left_t, right_t,
+        total, n, hidden_dim, 5 * hidden_dim, has_mask,
+        BLOCK=256,
+        num_warps=4,
+    )
+
+    tri = torch.bmm(left_t, right_t.transpose(1, 2))
+    post = torch.empty((rows, hidden_dim), device=input_tensor.device, dtype=torch.float16)
+
+    _post_ln_gate_kernel[(rows,)](
+        tri, proj,
+        weights["to_out_norm.weight"].contiguous(),
+        weights["to_out_norm.bias"].contiguous(),
+        post,
+        rows, n, hidden_dim, 5 * hidden_dim, eps,
+        BLOCK_H=triton.next_power_of_2(hidden_dim),
+        num_warps=4,
+    )
+
+    tow = _half_weight(weights["to_out.weight"])
+    out = F.linear(post, tow)
+    return out.reshape(bs, n, n, tow.shape[0]).float()
+```

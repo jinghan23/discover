@@ -1,0 +1,156 @@
+```python
+"""TriMul outgoing forward using PyTorch tensor-core projections/BMM plus Triton kernels for
+gate-mask-layout fusion and post-contraction LayerNorm+output gate. Intermediates use fp16,
+the output is returned as fp32.
+"""
+
+import torch
+import torch.nn.functional as F
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def _gate_transpose_kernel(
+    left_p, right_p, left_g, right_g, mask_p,
+    left_t, right_t,
+    total: tl.constexpr,
+    n: tl.constexpr,
+    hdim: tl.constexpr,
+    has_mask: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    valid = offs < total
+
+    h = offs % hdim
+    tmp = offs // hdim
+    k = tmp % n
+    i = (tmp // n) % n
+    b = tmp // (n * n)
+
+    lp = tl.load(left_p + offs, mask=valid, other=0.0).to(tl.float32)
+    rp = tl.load(right_p + offs, mask=valid, other=0.0).to(tl.float32)
+    lg = tl.load(left_g + offs, mask=valid, other=0.0).to(tl.float32)
+    rg = tl.load(right_g + offs, mask=valid, other=0.0).to(tl.float32)
+
+    lval = lp * (1.0 / (1.0 + tl.exp(-lg)))
+    rval = rp * (1.0 / (1.0 + tl.exp(-rg)))
+
+    if has_mask:
+        m = tl.load(mask_p + b * n * n + i * n + k, mask=valid, other=0.0).to(tl.float32)
+        lval *= m
+        rval *= m
+
+    dst = (b * hdim + h) * n * n + i * n + k
+    tl.store(left_t + dst, lval, mask=valid)
+    tl.store(right_t + dst, rval, mask=valid)
+
+
+@triton.jit
+def _post_ln_gate_kernel(
+    tri_p, out_gate_p, norm_w_p, norm_b_p, post_p,
+    rows: tl.constexpr,
+    n: tl.constexpr,
+    hdim: tl.constexpr,
+    eps: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    row = tl.program_id(0)
+    hs = tl.arange(0, BLOCK_H)
+    hmask = hs < hdim
+
+    b = row // (n * n)
+    rem = row - b * n * n
+    i = rem // n
+    j = rem - i * n
+
+    vals = tl.load(
+        tri_p + (b * hdim + hs) * n * n + i * n + j,
+        mask=hmask,
+        other=0.0,
+    ).to(tl.float32)
+
+    mean = tl.sum(vals, axis=0) / hdim
+    centered = vals - mean
+    var = tl.sum(centered * centered, axis=0) / hdim
+    vals = centered * tl.rsqrt(var + eps)
+
+    nw = tl.load(norm_w_p + hs, mask=hmask, other=0.0).to(tl.float32)
+    nb = tl.load(norm_b_p + hs, mask=hmask, other=0.0).to(tl.float32)
+    og = tl.load(out_gate_p + row * hdim + hs, mask=hmask, other=0.0).to(tl.float32)
+
+    out = (vals * nw + nb) * (1.0 / (1.0 + tl.exp(-og)))
+    tl.store(post_p + row * hdim + hs, out, mask=hmask)
+
+
+def _half_weight(w):
+    w = w.contiguous()
+    return w if w.dtype == torch.float16 else w.to(torch.float16)
+
+
+def custom_kernel(data):
+    input_tensor, mask, weights, config = data
+
+    bs, n, _, dim = input_tensor.shape
+    hidden_dim = int(config.get("hidden_dim", weights["left_proj.weight"].shape[0]))
+    eps = float(config.get("eps", 1e-5))
+    rows = bs * n * n
+    total = rows * hidden_dim
+
+    x = F.layer_norm(
+        input_tensor.float(),
+        (dim,),
+        weights["norm.weight"].contiguous().float(),
+        weights["norm.bias"].contiguous().float(),
+        eps,
+    ).to(torch.float16)
+    x2 = x.reshape(rows, dim)
+
+    left = F.linear(x2, _half_weight(weights["left_proj.weight"]))
+    right = F.linear(x2, _half_weight(weights["right_proj.weight"]))
+    left_gate = F.linear(x2, _half_weight(weights["left_gate.weight"]))
+    right_gate = F.linear(x2, _half_weight(weights["right_gate.weight"]))
+
+    left_t = torch.empty((bs * hidden_dim, n, n), device=input_tensor.device, dtype=torch.float16)
+    right_t = torch.empty_like(left_t)
+
+    has_mask = (mask is not None) and (not bool(config.get("nomask", False)))
+    mask_c = mask.contiguous() if has_mask else input_tensor
+
+    _gate_transpose_kernel[(triton.cdiv(total, 256),)](
+        left, right, left_gate, right_gate, mask_c,
+        left_t, right_t,
+        total, n, hidden_dim, has_mask,
+        BLOCK=256,
+        num_warps=4,
+    )
+
+    del left, right, left_gate, right_gate
+
+    out_gate = F.linear(x2, _half_weight(weights["out_gate.weight"]))
+    del x, x2
+
+    tri = torch.bmm(left_t, right_t.transpose(1, 2))
+    del left_t, right_t
+
+    post = torch.empty((rows, hidden_dim), device=input_tensor.device, dtype=torch.float16)
+    _post_ln_gate_kernel[(rows,)](
+        tri,
+        out_gate,
+        weights["to_out_norm.weight"].contiguous(),
+        weights["to_out_norm.bias"].contiguous(),
+        post,
+        rows,
+        n,
+        hidden_dim,
+        eps,
+        BLOCK_H=triton.next_power_of_2(hidden_dim),
+        num_warps=4,
+    )
+
+    del tri, out_gate
+
+    out = F.linear(post, _half_weight(weights["to_out.weight"]))
+    return out.reshape(bs, n, n, weights["to_out.weight"].shape[0]).float()
+```

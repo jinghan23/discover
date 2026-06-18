@@ -1,0 +1,176 @@
+```python
+"""
+TriMul outgoing forward pass.
+
+Strategy:
+1. Use torch layer_norm and GEMMs for the projection/gate stages, which map the
+   pair representation [B, N, N, D] to hidden channels H=128.
+2. Fuse the expensive outgoing triangle contraction, hidden LayerNorm, output
+   gate, and final projection into one Triton kernel. For each batch and output
+   tile [i, j], the kernel computes all 128 hidden channels by streaming over k,
+   normalizes across hidden channels, applies the output gate, and projects back
+   to D.
+3. The final output is float32.
+"""
+
+import torch
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def _trimul_out_kernel(
+    left_ptr,
+    right_ptr,
+    out_gate_ptr,
+    ln_w_ptr,
+    ln_b_ptr,
+    to_out_w_ptr,
+    out_ptr,
+    total_tiles: tl.constexpr,
+    N: tl.constexpr,
+    DOUT: tl.constexpr,
+    H: tl.constexpr,
+    BLOCK_I: tl.constexpr,
+    BLOCK_J: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    pid = tl.program_id(0)
+
+    num_j_tiles = tl.cdiv(N, BLOCK_J)
+    num_i_tiles = tl.cdiv(N, BLOCK_I)
+    tiles_per_b = num_i_tiles * num_j_tiles
+
+    b = pid // tiles_per_b
+    rem = pid - b * tiles_per_b
+    ti = rem // num_j_tiles
+    tj = rem - ti * num_j_tiles
+
+    offs_i = ti * BLOCK_I + tl.arange(0, BLOCK_I)
+    offs_j = tj * BLOCK_J + tl.arange(0, BLOCK_J)
+    offs_h = tl.arange(0, H)
+
+    mask_ij = (offs_i[:, None] < N) & (offs_j[None, :] < N)
+
+    base_b_h = b * N * N * H
+    acc = tl.zeros((BLOCK_I, BLOCK_J, H), tl.float32)
+
+    for k0 in range(0, N, BLOCK_K):
+        offs_k = k0 + tl.arange(0, BLOCK_K)
+        k_mask = offs_k < N
+
+        l_ptrs = left_ptr + base_b_h + ((offs_i[:, None, None] * N + offs_k[None, :, None]) * H + offs_h[None, None, :])
+        r_ptrs = right_ptr + base_b_h + ((offs_j[None, :, None] * N + offs_k[:, None, None]) * H + offs_h[None, None, :])
+
+        l = tl.load(l_ptrs, mask=(offs_i[:, None, None] < N) & k_mask[None, :, None], other=0.0)
+        r = tl.load(r_ptrs, mask=k_mask[:, None, None] & (offs_j[None, :, None] < N), other=0.0)
+
+        prod = l[:, None, :, :] * r[None, :, :, :]
+        acc += tl.sum(prod, axis=2)
+
+    mean = tl.sum(acc, axis=2) / H
+    centered = acc - mean[:, :, None]
+    var = tl.sum(centered * centered, axis=2) / H
+    inv_std = tl.rsqrt(var + 1.0e-5)
+
+    ln_w = tl.load(ln_w_ptr + offs_h)
+    ln_b = tl.load(ln_b_ptr + offs_h)
+
+    gate = tl.load(
+        out_gate_ptr + base_b_h + ((offs_i[:, None, None] * N + offs_j[None, :, None]) * H + offs_h[None, None, :]),
+        mask=mask_ij[:, :, None],
+        other=0.0,
+    )
+
+    hidden = (centered * inv_std[:, :, None]) * ln_w[None, None, :] + ln_b[None, None, :]
+    hidden = hidden * gate
+
+    offs_d = tl.arange(0, BLOCK_D)
+    for d0 in range(0, DOUT, BLOCK_D):
+        d = d0 + offs_d
+        w = tl.load(
+            to_out_w_ptr + d[:, None] * H + offs_h[None, :],
+            mask=d[:, None] < DOUT,
+            other=0.0,
+        )
+        y = tl.sum(hidden[:, :, None, :] * w[None, None, :, :], axis=3)
+        tl.store(
+            out_ptr + ((b * N * N + offs_i[:, None, None] * N + offs_j[None, :, None]) * DOUT + d[None, None, :]),
+            y,
+            mask=mask_ij[:, :, None] & (d[None, None, :] < DOUT),
+        )
+
+
+def _linear_no_bias(x, w):
+    return torch.matmul(x, w.t())
+
+
+def custom_kernel(data):
+    input_tensor, mask, weights, config = data
+    dim = int(config["dim"])
+    hidden_dim = int(config["hidden_dim"])
+
+    x = input_tensor.contiguous()
+    B, N, _, _ = x.shape
+
+    norm_weight = weights["norm.weight"]
+    norm_bias = weights["norm.bias"]
+    left_proj_weight = weights["left_proj.weight"]
+    right_proj_weight = weights["right_proj.weight"]
+    left_gate_weight = weights["left_gate.weight"]
+    right_gate_weight = weights["right_gate.weight"]
+    out_gate_weight = weights["out_gate.weight"]
+    to_out_norm_weight = weights["to_out_norm.weight"]
+    to_out_norm_bias = weights["to_out_norm.bias"]
+    to_out_weight = weights["to_out.weight"]
+
+    x_norm = torch.nn.functional.layer_norm(
+        x, (dim,), norm_weight, norm_bias, eps=1.0e-5
+    )
+
+    left = _linear_no_bias(x_norm, left_proj_weight)
+    right = _linear_no_bias(x_norm, right_proj_weight)
+
+    if mask is not None:
+        m = mask.to(dtype=left.dtype).unsqueeze(-1)
+        left = left * m
+        right = right * m
+
+    left = left * torch.sigmoid(_linear_no_bias(x_norm, left_gate_weight))
+    right = right * torch.sigmoid(_linear_no_bias(x_norm, right_gate_weight))
+    out_gate = torch.sigmoid(_linear_no_bias(x_norm, out_gate_weight))
+
+    left = left.contiguous()
+    right = right.contiguous()
+    out_gate = out_gate.contiguous()
+    out = torch.empty((B, N, N, dim), device=x.device, dtype=torch.float32)
+
+    block_i = 4
+    block_j = 4
+    block_k = 32
+    block_d = 32
+
+    grid = (B * triton.cdiv(N, block_i) * triton.cdiv(N, block_j),)
+
+    _trimul_out_kernel[grid](
+        left,
+        right,
+        out_gate,
+        to_out_norm_weight,
+        to_out_norm_bias,
+        to_out_weight,
+        out,
+        grid[0],
+        N,
+        dim,
+        hidden_dim,
+        BLOCK_I=block_i,
+        BLOCK_J=block_j,
+        BLOCK_K=block_k,
+        BLOCK_D=block_d,
+        num_warps=8,
+    )
+
+    return out
+```

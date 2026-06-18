@@ -1,0 +1,141 @@
+```python
+"""
+Fused TriMul forward: Triton is used for the two LayerNorm stages and sigmoid-gated
+elementwise products, while large dense projections and the N^3 triangular contraction
+are delegated to cuBLAS/cuBLAS-backed PyTorch matmul paths for strong SM80 performance.
+"""
+
+import torch
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def _ln_kernel(x, w, b, y, M: tl.constexpr, C: tl.constexpr, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    offs = tl.arange(0, BLOCK)
+    mask = offs < C
+
+    vals = tl.load(x + pid * C + offs, mask=mask, other=0.0).to(tl.float32)
+    mean = tl.sum(vals, axis=0) / C
+    diff = vals - mean
+    var = tl.sum(diff * diff, axis=0) / C
+    rstd = tl.rsqrt(var + 1.0e-5)
+
+    ww = tl.load(w + offs, mask=mask, other=0.0).to(tl.float32)
+    bb = tl.load(b + offs, mask=mask, other=0.0).to(tl.float32)
+    out = diff * rstd * ww + bb
+    tl.store(y + pid * C + offs, out, mask=mask)
+
+
+@triton.jit
+def _gate_mask_kernel(
+    left, right, lg, rg, mask_ptr, out_left, out_right,
+    total: tl.constexpr, H: tl.constexpr, HAS_MASK: tl.constexpr, BLOCK: tl.constexpr
+):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    m = offs < total
+
+    lv = tl.load(left + offs, mask=m, other=0.0).to(tl.float32)
+    rv = tl.load(right + offs, mask=m, other=0.0).to(tl.float32)
+    lgv = tl.load(lg + offs, mask=m, other=0.0).to(tl.float32)
+    rgv = tl.load(rg + offs, mask=m, other=0.0).to(tl.float32)
+
+    lgv = 1.0 / (1.0 + tl.exp(-lgv))
+    rgv = 1.0 / (1.0 + tl.exp(-rgv))
+
+    if HAS_MASK:
+        pair = offs // H
+        mv = tl.load(mask_ptr + pair, mask=m, other=0.0).to(tl.float32)
+        lv = lv * mv
+        rv = rv * mv
+
+    tl.store(out_left + offs, lv * lgv, mask=m)
+    tl.store(out_right + offs, rv * rgv, mask=m)
+
+
+@triton.jit
+def _out_gate_kernel(out, og, dst, total: tl.constexpr, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    m = offs < total
+
+    ov = tl.load(out + offs, mask=m, other=0.0).to(tl.float32)
+    gv = tl.load(og + offs, mask=m, other=0.0).to(tl.float32)
+    gv = 1.0 / (1.0 + tl.exp(-gv))
+    tl.store(dst + offs, ov * gv, mask=m)
+
+
+def _layer_norm_triton(x, weight, bias):
+    c = x.shape[-1]
+    y = torch.empty_like(x, dtype=torch.float32)
+    m = x.numel() // c
+    block = triton.next_power_of_2(c)
+    _ln_kernel[(m,)](x, weight, bias, y, m, c, BLOCK=block, num_warps=8)
+    return y
+
+
+def custom_kernel(data):
+    input_tensor, mask, weights, config = data
+    dim = int(config["dim"])
+    hidden_dim = int(config["hidden_dim"])
+
+    norm_weight = weights["norm.weight"]
+    norm_bias = weights["norm.bias"]
+    left_proj_weight = weights["left_proj.weight"]
+    right_proj_weight = weights["right_proj.weight"]
+    left_gate_weight = weights["left_gate.weight"]
+    right_gate_weight = weights["right_gate.weight"]
+    out_gate_weight = weights["out_gate.weight"]
+    to_out_norm_weight = weights["to_out_norm.weight"]
+    to_out_norm_bias = weights["to_out_norm.bias"]
+    to_out_weight = weights["to_out.weight"]
+
+    bs, n, _, _ = input_tensor.shape
+    x = input_tensor.contiguous()
+
+    x_norm = _layer_norm_triton(x, norm_weight, norm_bias)
+    x2 = x_norm.reshape(bs * n * n, dim)
+
+    # One GEMM computes all hidden projections from the normalized pair tensor.
+    proj_w = torch.cat(
+        (left_proj_weight, right_proj_weight, left_gate_weight, right_gate_weight, out_gate_weight),
+        dim=0,
+    ).contiguous()
+    proj = x2.matmul(proj_w.t())
+    left, right, left_gate, right_gate, out_gate = proj.split(hidden_dim, dim=-1)
+
+    total_h = bs * n * n * hidden_dim
+    left_f = torch.empty_like(left, dtype=torch.float32)
+    right_f = torch.empty_like(right, dtype=torch.float32)
+
+    has_mask = mask is not None and (not bool(config.get("nomask", False)))
+    mask_c = mask.contiguous() if has_mask else input_tensor
+
+    _gate_mask_kernel[(triton.cdiv(total_h, 256),)](
+        left, right, left_gate, right_gate, mask_c, left_f, right_f,
+        total_h, hidden_dim, HAS_MASK=has_mask, BLOCK=256, num_warps=4
+    )
+
+    left_f = left_f.reshape(bs, n, n, hidden_dim)
+    right_f = right_f.reshape(bs, n, n, hidden_dim)
+
+    # Outgoing TriMul: out[b, i, j, d] = sum_k left[b, i, k, d] * right[b, j, k, d].
+    # Move hidden to batch dimension so each channel uses a highly optimized batched GEMM.
+    l = left_f.permute(0, 3, 1, 2).reshape(bs * hidden_dim, n, n)
+    r = right_f.permute(0, 3, 1, 2).reshape(bs * hidden_dim, n, n)
+    out_h = torch.bmm(l, r.transpose(1, 2))
+    out_h = out_h.reshape(bs, hidden_dim, n, n).permute(0, 2, 3, 1).contiguous()
+
+    out_h = _layer_norm_triton(out_h, to_out_norm_weight, to_out_norm_bias)
+
+    out_gate = out_gate.reshape(bs, n, n, hidden_dim).contiguous()
+    gated = torch.empty_like(out_h, dtype=torch.float32)
+    _out_gate_kernel[(triton.cdiv(total_h, 256),)](
+        out_h, out_gate, gated, total_h, BLOCK=256, num_warps=4
+    )
+
+    output = gated.reshape(bs * n * n, hidden_dim).matmul(to_out_weight.t())
+    return output.reshape(bs, n, n, dim).to(torch.float32)
+```

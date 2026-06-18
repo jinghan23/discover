@@ -1,0 +1,125 @@
+```python
+"""
+TriMul outgoing forward.  The implementation uses PyTorch GEMMs for the dense
+linear projections and batched per-channel matrix products, then fuses the
+final hidden LayerNorm, output gate multiply, and to_out projection in Triton.
+"""
+
+import torch
+import torch.nn.functional as F
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def _final_norm_gate_out_kernel(
+    y_ptr, gate_ptr, w_norm_ptr, b_norm_ptr, w_out_ptr, out_ptr,
+    rows: tl.constexpr, dim_out: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    BLOCK_O: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offs_d = tl.arange(0, BLOCK_D)
+
+    y = tl.load(y_ptr + pid * BLOCK_D + offs_d).to(tl.float32)
+
+    mean = tl.sum(y, axis=0) / BLOCK_D
+    yc = y - mean
+    var = tl.sum(yc * yc, axis=0) / BLOCK_D
+    rstd = tl.rsqrt(var + 1.0e-5)
+
+    nw = tl.load(w_norm_ptr + offs_d).to(tl.float32)
+    nb = tl.load(b_norm_ptr + offs_d).to(tl.float32)
+    gate = tl.load(gate_ptr + pid * BLOCK_D + offs_d).to(tl.float32)
+
+    h = (yc * rstd * nw + nb) * gate
+
+    offs_o = tl.arange(0, BLOCK_O)
+    for o0 in range(0, dim_out, BLOCK_O):
+        o = o0 + offs_o
+        wo = tl.load(
+            w_out_ptr + o[:, None] * BLOCK_D + offs_d[None, :],
+            mask=o[:, None] < dim_out,
+            other=0.0,
+        ).to(tl.float32)
+        acc = tl.sum(wo * h[None, :], axis=1)
+        tl.store(out_ptr + pid * dim_out + o, acc, mask=o < dim_out)
+
+
+def _sigmoid(x):
+    return torch.sigmoid(x)
+
+
+def custom_kernel(data):
+    input_tensor, mask, weights, config = data
+    dim = int(config["dim"])
+    hidden_dim = int(config["hidden_dim"])
+
+    x = input_tensor
+    bsz, n, _, _ = x.shape
+    rows = bsz * n * n
+
+    norm_weight = weights["norm.weight"]
+    norm_bias = weights["norm.bias"]
+    left_proj_weight = weights["left_proj.weight"]
+    right_proj_weight = weights["right_proj.weight"]
+    left_gate_weight = weights["left_gate.weight"]
+    right_gate_weight = weights["right_gate.weight"]
+    out_gate_weight = weights["out_gate.weight"]
+    to_out_norm_weight = weights["to_out_norm.weight"]
+    to_out_norm_bias = weights["to_out_norm.bias"]
+    to_out_weight = weights["to_out.weight"]
+
+    x_flat = x.reshape(rows, dim)
+    x_norm = F.layer_norm(x_flat, (dim,), norm_weight, norm_bias, eps=1.0e-5)
+
+    # One GEMM for all five hidden projections.
+    proj_w = torch.cat(
+        (
+            left_proj_weight,
+            right_proj_weight,
+            left_gate_weight,
+            right_gate_weight,
+            out_gate_weight,
+        ),
+        dim=0,
+    )
+    proj = F.linear(x_norm, proj_w)
+
+    left, right, left_gate, right_gate, out_gate = proj.split(hidden_dim, dim=-1)
+    left_gate = _sigmoid(left_gate)
+    right_gate = _sigmoid(right_gate)
+    out_gate = _sigmoid(out_gate).contiguous()
+
+    if mask is not None:
+        m = mask.reshape(rows, 1).to(left.dtype)
+        left = left * m
+        right = right * m
+
+    left = (left * left_gate).reshape(bsz, n, n, hidden_dim)
+    right = (right * right_gate).reshape(bsz, n, n, hidden_dim)
+
+    # outgoing: out[b, i, j, d] = sum_k left[b, i, k, d] * right[b, j, k, d]
+    left_bdh = left.permute(0, 3, 1, 2).reshape(bsz * hidden_dim, n, n).contiguous()
+    right_bdh = right.permute(0, 3, 1, 2).reshape(bsz * hidden_dim, n, n).contiguous()
+    y = torch.bmm(left_bdh, right_bdh.transpose(1, 2))
+    y = y.reshape(bsz, hidden_dim, n, n).permute(0, 2, 3, 1).contiguous()
+
+    out = torch.empty((rows, dim), device=x.device, dtype=torch.float32)
+    grid = (rows,)
+    _final_norm_gate_out_kernel[grid](
+        y,
+        out_gate,
+        to_out_norm_weight,
+        to_out_norm_bias,
+        to_out_weight,
+        out,
+        rows,
+        dim,
+        BLOCK_D=hidden_dim,
+        BLOCK_O=32,
+        num_warps=4,
+    )
+
+    return out.reshape(bsz, n, n, dim)
+```

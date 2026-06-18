@@ -1,0 +1,161 @@
+```python
+"""
+TriMul outgoing forward: normalize pair activations, compute the five linear
+projections with fused PyTorch GEMMs where profitable, apply mask/sigmoid gates
+in Triton, perform the per-hidden-channel outgoing contraction as grouped
+batched GEMMs, then normalize, gate, and project back to the input dimension.
+"""
+
+import torch
+import triton
+import triton.language as tl
+import torch.nn.functional as F
+
+
+@triton.jit
+def _mul_sigmoid_gate_kernel(
+    a_ptr,
+    gate_ptr,
+    mask_ptr,
+    out_ptr,
+    total: tl.constexpr,
+    hdim: tl.constexpr,
+    has_mask: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    valid = offs < total
+
+    a = tl.load(a_ptr + offs, mask=valid, other=0.0).to(tl.float32)
+    g = tl.load(gate_ptr + offs, mask=valid, other=0.0).to(tl.float32)
+    sig = 1.0 / (1.0 + tl.exp(-g))
+
+    if has_mask:
+        pair = offs // hdim
+        m = tl.load(mask_ptr + pair, mask=valid, other=0.0).to(tl.float32)
+        a = a * m
+
+    tl.store(out_ptr + offs, a * sig, mask=valid)
+
+
+@triton.jit
+def _mul_gate_kernel(
+    a_ptr,
+    gate_ptr,
+    out_ptr,
+    total: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    valid = offs < total
+
+    a = tl.load(a_ptr + offs, mask=valid, other=0.0).to(tl.float32)
+    g = tl.load(gate_ptr + offs, mask=valid, other=0.0).to(tl.float32)
+    sig = 1.0 / (1.0 + tl.exp(-g))
+
+    tl.store(out_ptr + offs, a * sig, mask=valid)
+
+
+_WEIGHT_CACHE = {}
+
+
+def _has_real_mask(mask, config):
+    return mask is not None and not bool(config.get("nomask", False))
+
+
+def _stack_projection_weights(weights):
+    keys = (
+        "left_proj.weight",
+        "right_proj.weight",
+        "left_gate.weight",
+        "right_gate.weight",
+        "out_gate.weight",
+    )
+    sig = tuple((weights[k].data_ptr(), weights[k]._version) for k in keys)
+    cached = _WEIGHT_CACHE.get(sig)
+    if cached is None:
+        cached = torch.cat([weights[k] for k in keys], dim=0).contiguous()
+        _WEIGHT_CACHE.clear()
+        _WEIGHT_CACHE[sig] = cached
+    return cached
+
+
+def custom_kernel(data):
+    input_tensor, mask, weights, config = data
+
+    dim = int(config["dim"])
+    hidden_dim = int(config["hidden_dim"])
+    bsz, n, _, _ = input_tensor.shape
+
+    norm_weight = weights["norm.weight"]
+    norm_bias = weights["norm.bias"]
+    to_out_norm_weight = weights["to_out_norm.weight"]
+    to_out_norm_bias = weights["to_out_norm.bias"]
+    to_out_weight = weights["to_out.weight"]
+
+    x = input_tensor.contiguous()
+    x_norm = F.layer_norm(x, (dim,), norm_weight, norm_bias)
+    flat = x_norm.reshape(-1, dim)
+
+    proj_w = _stack_projection_weights(weights)
+    proj = F.linear(flat, proj_w).contiguous()
+
+    left_raw, right_raw, left_gate_raw, right_gate_raw, out_gate_raw = proj.split(hidden_dim, dim=1)
+
+    total_hidden = left_raw.numel()
+    left = torch.empty_like(left_raw)
+    right = torch.empty_like(right_raw)
+
+    has_mask = _has_real_mask(mask, config)
+    mask_flat = mask.contiguous().reshape(-1) if has_mask else left_raw
+
+    block = 256
+    grid = (triton.cdiv(total_hidden, block),)
+
+    _mul_sigmoid_gate_kernel[grid](
+        left_raw,
+        left_gate_raw,
+        mask_flat,
+        left,
+        total_hidden,
+        hidden_dim,
+        has_mask,
+        BLOCK=block,
+        num_warps=8,
+    )
+    _mul_sigmoid_gate_kernel[grid](
+        right_raw,
+        right_gate_raw,
+        mask_flat,
+        right,
+        total_hidden,
+        hidden_dim,
+        has_mask,
+        BLOCK=block,
+        num_warps=8,
+    )
+
+    left = left.reshape(bsz, n, n, hidden_dim).permute(0, 3, 1, 2).contiguous()
+    right = right.reshape(bsz, n, n, hidden_dim).permute(0, 3, 1, 2).contiguous()
+
+    out = torch.matmul(
+        left.reshape(bsz * hidden_dim, n, n),
+        right.reshape(bsz * hidden_dim, n, n).transpose(1, 2),
+    )
+    out = out.reshape(bsz, hidden_dim, n, n).permute(0, 2, 3, 1).contiguous()
+
+    out = F.layer_norm(out, (hidden_dim,), to_out_norm_weight, to_out_norm_bias)
+
+    out_flat = out.reshape(-1, hidden_dim)
+    gated = torch.empty_like(out_flat)
+    _mul_gate_kernel[grid](
+        out_flat,
+        out_gate_raw,
+        gated,
+        total_hidden,
+        BLOCK=block,
+        num_warps=8,
+    )
+
+    return F.linear(gated, to_out_weight).reshape(bsz, n, n, dim).to(torch.float32)
+```

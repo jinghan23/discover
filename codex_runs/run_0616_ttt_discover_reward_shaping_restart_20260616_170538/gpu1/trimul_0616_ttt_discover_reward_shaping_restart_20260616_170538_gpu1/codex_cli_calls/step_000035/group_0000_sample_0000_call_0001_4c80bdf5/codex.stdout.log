@@ -1,0 +1,216 @@
+```python
+"""
+TriMul outgoing forward pass.
+
+The implementation uses PyTorch for the two dense projection stages and custom
+Triton kernels for gate application and the N^3 outgoing triangular
+multiplication. Projections are concatenated into one GEMM, gates are applied
+in-place, and the outgoing contraction writes [B, N, N, hidden_dim] directly in
+the layout needed by the final LayerNorm and output projection.
+"""
+
+import torch
+import torch.nn.functional as F
+import triton
+import triton.language as tl
+
+
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+
+_WEIGHT_CAT_CACHE = {}
+
+
+@triton.jit
+def _apply_gates_kernel(
+    proj,
+    mask,
+    M: tl.constexpr,
+    H: tl.constexpr,
+    HAS_MASK: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_h = tl.program_id(1)
+
+    rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    hs = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
+
+    valid = (rows[:, None] < M) & (hs[None, :] < H)
+    base = rows[:, None] * (5 * H) + hs[None, :]
+
+    left = tl.load(proj + base, mask=valid, other=0.0).to(tl.float32)
+    right = tl.load(proj + base + H, mask=valid, other=0.0).to(tl.float32)
+    left_gate = tl.load(proj + base + 2 * H, mask=valid, other=0.0).to(tl.float32)
+    right_gate = tl.load(proj + base + 3 * H, mask=valid, other=0.0).to(tl.float32)
+    out_gate = tl.load(proj + base + 4 * H, mask=valid, other=0.0).to(tl.float32)
+
+    left = left * tl.sigmoid(left_gate)
+    right = right * tl.sigmoid(right_gate)
+    out_gate = tl.sigmoid(out_gate)
+
+    if HAS_MASK:
+        m = tl.load(mask + rows, mask=rows < M, other=0.0).to(tl.float32)
+        left = left * m[:, None]
+        right = right * m[:, None]
+
+    tl.store(proj + base, left, mask=valid)
+    tl.store(proj + base + H, right, mask=valid)
+    tl.store(proj + base + 4 * H, out_gate, mask=valid)
+
+
+@triton.jit
+def _tri_mul_outgoing_kernel(
+    left,
+    right,
+    out,
+    N: tl.constexpr,
+    H: tl.constexpr,
+    LS_B: tl.constexpr,
+    LS_I: tl.constexpr,
+    LS_K: tl.constexpr,
+    LS_D: tl.constexpr,
+    RS_B: tl.constexpr,
+    RS_J: tl.constexpr,
+    RS_K: tl.constexpr,
+    RS_D: tl.constexpr,
+    OS_B: tl.constexpr,
+    OS_I: tl.constexpr,
+    OS_J: tl.constexpr,
+    OS_D: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    pid_tile = tl.program_id(0)
+    pid_bd = tl.program_id(1)
+
+    num_j = tl.cdiv(N, BLOCK_N)
+    pid_i = pid_tile // num_j
+    pid_j = pid_tile - pid_i * num_j
+
+    b = pid_bd // H
+    d = pid_bd - b * H
+
+    offs_i = pid_i * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_j = pid_j * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    for k0 in range(0, N, BLOCK_K):
+        ks = k0 + offs_k
+
+        a = tl.load(
+            left + b * LS_B + offs_i[:, None] * LS_I + ks[None, :] * LS_K + d * LS_D,
+            mask=(offs_i[:, None] < N) & (ks[None, :] < N),
+            other=0.0,
+        )
+        rb = tl.load(
+            right + b * RS_B + offs_j[None, :] * RS_J + ks[:, None] * RS_K + d * RS_D,
+            mask=(ks[:, None] < N) & (offs_j[None, :] < N),
+            other=0.0,
+        )
+
+        acc += tl.dot(a.to(tl.float16), rb.to(tl.float16), out_dtype=tl.float32)
+
+    tl.store(
+        out + b * OS_B + offs_i[:, None] * OS_I + offs_j[None, :] * OS_J + d * OS_D,
+        acc,
+        mask=(offs_i[:, None] < N) & (offs_j[None, :] < N),
+    )
+
+
+def _cat_projection_weights(weights):
+    names = (
+        "left_proj.weight",
+        "right_proj.weight",
+        "left_gate.weight",
+        "right_gate.weight",
+        "out_gate.weight",
+    )
+    tensors = tuple(weights[name] for name in names)
+    key = tuple((id(t), t.data_ptr(), t._version, tuple(t.shape), t.dtype) for t in tensors)
+
+    cached = _WEIGHT_CAT_CACHE.get(key)
+    if cached is None:
+        if len(_WEIGHT_CAT_CACHE) > 8:
+            _WEIGHT_CAT_CACHE.clear()
+        cached = torch.cat(tensors, dim=0).contiguous()
+        _WEIGHT_CAT_CACHE[key] = cached
+    return cached
+
+
+def custom_kernel(data):
+    input_tensor, mask, weights, config = data
+
+    with torch.no_grad():
+        B, N, _, dim = input_tensor.shape
+        H = int(config["hidden_dim"])
+
+        norm_weight = weights["norm.weight"]
+        norm_bias = weights["norm.bias"]
+        to_out_norm_weight = weights["to_out_norm.weight"]
+        to_out_norm_bias = weights["to_out_norm.bias"]
+        to_out_weight = weights["to_out.weight"]
+
+        x = F.layer_norm(input_tensor, (dim,), norm_weight, norm_bias, 1e-5)
+
+        proj_weight = _cat_projection_weights(weights)
+        proj = F.linear(x, proj_weight)
+        del x
+
+        has_mask = (mask is not None) and (not bool(config.get("nomask", False)))
+        mask_flat = mask.contiguous().view(-1) if has_mask else input_tensor
+
+        M = B * N * N
+        _apply_gates_kernel[(triton.cdiv(M, 16), triton.cdiv(H, 64))](
+            proj,
+            mask_flat,
+            M,
+            H,
+            has_mask,
+            BLOCK_M=16,
+            BLOCK_H=64,
+            num_warps=4,
+        )
+
+        left = proj[..., :H]
+        right = proj[..., H : 2 * H]
+        out_gate = proj[..., 4 * H : 5 * H]
+
+        tri = torch.empty((B, N, N, H), device=input_tensor.device, dtype=torch.float32)
+
+        bm, bn, bk = 16, 32, 64
+        grid = (triton.cdiv(N, bm) * triton.cdiv(N, bn), B * H)
+
+        _tri_mul_outgoing_kernel[grid](
+            left,
+            right,
+            tri,
+            N,
+            H,
+            left.stride(0),
+            left.stride(1),
+            left.stride(2),
+            left.stride(3),
+            right.stride(0),
+            right.stride(1),
+            right.stride(2),
+            right.stride(3),
+            tri.stride(0),
+            tri.stride(1),
+            tri.stride(2),
+            tri.stride(3),
+            BLOCK_M=bm,
+            BLOCK_N=bn,
+            BLOCK_K=bk,
+            num_warps=4,
+            num_stages=4,
+        )
+
+        tri = F.layer_norm(tri, (H,), to_out_norm_weight, to_out_norm_bias, 1e-5)
+        tri.mul_(out_gate)
+        return F.linear(tri, to_out_weight).float()
+```

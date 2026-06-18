@@ -1,0 +1,109 @@
+```python
+"""
+Fused outgoing Triangle Multiplicative Update.
+
+Uses PyTorch's optimized layer_norm and GEMM paths for the channel projections,
+folds batch and hidden dimensions so the triangle contraction becomes B*H
+batched N x N GEMMs, and applies the output hidden LayerNorm plus output gate in
+a small Triton row kernel before the final projection. Final output is float32.
+"""
+
+import torch
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def _out_norm_gate_kernel(
+    y_ptr,
+    gate_ptr,
+    norm_w_ptr,
+    norm_b_ptr,
+    out_ptr,
+    H: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offs = tl.arange(0, BLOCK_H)
+    mask = offs < H
+
+    vals = tl.load(y_ptr + pid * H + offs, mask=mask, other=0.0).to(tl.float32)
+
+    mean = tl.sum(vals, axis=0) / H
+    centered = vals - mean
+    var = tl.sum(centered * centered, axis=0) / H
+    inv_std = tl.rsqrt(var + 1.0e-5)
+
+    w = tl.load(norm_w_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+    b = tl.load(norm_b_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+    g = tl.load(gate_ptr + pid * H + offs, mask=mask, other=0.0).to(tl.float32)
+
+    res = (centered * inv_std * w + b) * g
+    tl.store(out_ptr + pid * H + offs, res, mask=mask)
+
+
+def _project_all(x_norm, weights):
+    w = torch.cat(
+        (
+            weights["left_proj.weight"],
+            weights["right_proj.weight"],
+            weights["left_gate.weight"],
+            weights["right_gate.weight"],
+            weights["out_gate.weight"],
+        ),
+        dim=0,
+    )
+    return torch.matmul(x_norm, w.t())
+
+
+def custom_kernel(data):
+    input_tensor, mask, weights, config = data
+    dim = int(config["dim"])
+    hidden_dim = int(config["hidden_dim"])
+
+    x = input_tensor.contiguous()
+    bsz, n, _, _ = x.shape
+
+    x_norm = torch.nn.functional.layer_norm(
+        x,
+        (dim,),
+        weights["norm.weight"],
+        weights["norm.bias"],
+        1.0e-5,
+    )
+
+    proj = _project_all(x_norm, weights)
+    left, right, left_gate, right_gate, out_gate = proj.split(hidden_dim, dim=-1)
+
+    left = left * torch.sigmoid(left_gate)
+    right = right * torch.sigmoid(right_gate)
+    out_gate = torch.sigmoid(out_gate).contiguous()
+
+    if not bool(config.get("nomask", False)):
+        m = mask.to(dtype=left.dtype).unsqueeze(-1)
+        left = left * m
+        right = right * m
+
+    left_h = left.permute(0, 3, 1, 2).contiguous().reshape(bsz * hidden_dim, n, n)
+    right_h = right.permute(0, 3, 1, 2).contiguous().reshape(bsz * hidden_dim, n, n)
+
+    tri = torch.bmm(left_h, right_h.transpose(1, 2))
+    tri = tri.reshape(bsz, hidden_dim, n, n).permute(0, 2, 3, 1).contiguous()
+
+    gated_hidden = torch.empty_like(tri, dtype=torch.float32)
+    rows = bsz * n * n
+
+    _out_norm_gate_kernel[(rows,)](
+        tri,
+        out_gate,
+        weights["to_out_norm.weight"],
+        weights["to_out_norm.bias"],
+        gated_hidden,
+        hidden_dim,
+        triton.next_power_of_2(hidden_dim),
+        num_warps=4,
+    )
+
+    out = torch.matmul(gated_hidden, weights["to_out.weight"].t())
+    return out.to(torch.float32)
+```

@@ -1,0 +1,152 @@
+```python
+"""
+TriMul outgoing forward pass.
+
+The implementation keeps projection and layer-normalization on optimized PyTorch
+paths, uses Triton kernels for fused sigmoid gating/mask application, and maps
+the outgoing triangle contraction to grouped batched GEMMs:
+for every batch b and hidden channel h, compute L[b, h] @ R[b, h].T.
+"""
+
+import torch
+import torch.nn.functional as F
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def _mul_sigmoid_gate_kernel(
+    a_ptr,
+    gate_ptr,
+    mask_ptr,
+    out_ptr,
+    total: tl.constexpr,
+    hdim: tl.constexpr,
+    has_mask: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    valid = offs < total
+
+    a = tl.load(a_ptr + offs, mask=valid, other=0.0).to(tl.float32)
+    g = tl.load(gate_ptr + offs, mask=valid, other=0.0).to(tl.float32)
+    y = a * (1.0 / (1.0 + tl.exp(-g)))
+
+    if has_mask:
+        pair = offs // hdim
+        m = tl.load(mask_ptr + pair, mask=valid, other=0.0).to(tl.float32)
+        y = y * m
+
+    tl.store(out_ptr + offs, y, mask=valid)
+
+
+@triton.jit
+def _mul_gate_kernel(
+    a_ptr,
+    gate_ptr,
+    out_ptr,
+    total: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    valid = offs < total
+
+    a = tl.load(a_ptr + offs, mask=valid, other=0.0).to(tl.float32)
+    g = tl.load(gate_ptr + offs, mask=valid, other=0.0).to(tl.float32)
+    y = a * (1.0 / (1.0 + tl.exp(-g)))
+
+    tl.store(out_ptr + offs, y, mask=valid)
+
+
+def _has_real_mask(mask, config):
+    return mask is not None and not bool(config.get("nomask", False))
+
+
+def custom_kernel(data):
+    input_tensor, mask, weights, config = data
+
+    dim = int(config["dim"])
+    hidden_dim = int(config["hidden_dim"])
+    bsz, n, _, _ = input_tensor.shape
+
+    x = input_tensor.contiguous()
+
+    x_norm = F.layer_norm(
+        x,
+        (dim,),
+        weights["norm.weight"],
+        weights["norm.bias"],
+    )
+
+    flat = x_norm.reshape(-1, dim)
+
+    left_raw = F.linear(flat, weights["left_proj.weight"]).contiguous()
+    right_raw = F.linear(flat, weights["right_proj.weight"]).contiguous()
+    left_gate_raw = F.linear(flat, weights["left_gate.weight"]).contiguous()
+    right_gate_raw = F.linear(flat, weights["right_gate.weight"]).contiguous()
+    out_gate_raw = F.linear(flat, weights["out_gate.weight"]).contiguous()
+
+    total_hidden = left_raw.numel()
+    left = torch.empty_like(left_raw)
+    right = torch.empty_like(right_raw)
+
+    has_mask = _has_real_mask(mask, config)
+    mask_flat = mask.contiguous().reshape(-1) if has_mask else left_raw
+
+    block = 256
+    grid = (triton.cdiv(total_hidden, block),)
+
+    _mul_sigmoid_gate_kernel[grid](
+        left_raw,
+        left_gate_raw,
+        mask_flat,
+        left,
+        total_hidden,
+        hidden_dim,
+        has_mask,
+        BLOCK=block,
+        num_warps=8,
+    )
+
+    _mul_sigmoid_gate_kernel[grid](
+        right_raw,
+        right_gate_raw,
+        mask_flat,
+        right,
+        total_hidden,
+        hidden_dim,
+        has_mask,
+        BLOCK=block,
+        num_warps=8,
+    )
+
+    left = left.reshape(bsz, n, n, hidden_dim).permute(0, 3, 1, 2).contiguous()
+    right = right.reshape(bsz, n, n, hidden_dim).permute(0, 3, 1, 2).contiguous()
+
+    out = torch.matmul(
+        left.reshape(bsz * hidden_dim, n, n),
+        right.reshape(bsz * hidden_dim, n, n).transpose(1, 2),
+    )
+
+    out = out.reshape(bsz, hidden_dim, n, n).permute(0, 2, 3, 1).contiguous()
+
+    out = F.layer_norm(
+        out,
+        (hidden_dim,),
+        weights["to_out_norm.weight"],
+        weights["to_out_norm.bias"],
+    )
+
+    gated = torch.empty_like(out.reshape(-1, hidden_dim))
+    _mul_gate_kernel[grid](
+        out.reshape(-1, hidden_dim),
+        out_gate_raw,
+        gated,
+        total_hidden,
+        BLOCK=block,
+        num_warps=8,
+    )
+
+    result = F.linear(gated, weights["to_out.weight"]).reshape(bsz, n, n, dim)
+    return result.to(torch.float32)
+```

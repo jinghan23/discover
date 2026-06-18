@@ -1,0 +1,205 @@
+```python
+"""
+TriMul outgoing forward pass.
+
+Algorithm:
+1. Use fused Triton kernels to layer-normalize each [D] pair feature row and compute
+   left/right/out gates and projections into hidden_dim=128.
+2. Store left/right/out_gate in fp32 work buffers.
+3. Compute outgoing triangle multiplication per hidden channel as batched grouped
+   GEMMs: out[b, :, :, h] = left[b, :, :, h] @ right[b, :, :, h].T.
+4. Use a fused Triton kernel for output LayerNorm, out_gate multiplication, and
+   final projection back to dim.
+"""
+
+import torch
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def _sigmoid(x):
+    return 1.0 / (1.0 + tl.exp(-x))
+
+
+@triton.jit
+def _prep_kernel(
+    x, mask,
+    norm_w, norm_b,
+    lw, rw, lgw, rgw, ogw,
+    left, right, out_gate,
+    rows: tl.constexpr, D: tl.constexpr, H: tl.constexpr,
+    has_mask: tl.constexpr,
+    BLOCK_D: tl.constexpr, BLOCK_H: tl.constexpr,
+):
+    pid = tl.program_id(0)
+
+    od = tl.arange(0, BLOCK_D)
+    oh = tl.arange(0, BLOCK_H)
+
+    x_vals = tl.load(x + pid * D + od, mask=od < D, other=0.0).to(tl.float32)
+    s = tl.sum(tl.where(od < D, x_vals, 0.0), axis=0)
+    mean = s / D
+    diff = tl.where(od < D, x_vals - mean, 0.0)
+    var = tl.sum(diff * diff, axis=0) / D
+    inv = tl.rsqrt(var + 1.0e-5)
+
+    nw = tl.load(norm_w + od, mask=od < D, other=0.0).to(tl.float32)
+    nb = tl.load(norm_b + od, mask=od < D, other=0.0).to(tl.float32)
+    xn = (x_vals - mean) * inv * nw + nb
+    xn = tl.where(od < D, xn, 0.0)
+
+    acc_l = tl.zeros((BLOCK_H,), dtype=tl.float32)
+    acc_r = tl.zeros((BLOCK_H,), dtype=tl.float32)
+    acc_lg = tl.zeros((BLOCK_H,), dtype=tl.float32)
+    acc_rg = tl.zeros((BLOCK_H,), dtype=tl.float32)
+    acc_og = tl.zeros((BLOCK_H,), dtype=tl.float32)
+
+    for d0 in range(0, BLOCK_D):
+        xv = tl.load(x + pid * D + d0).to(tl.float32)
+        # Recompute normalized scalar from vector registers. D <= BLOCK_D.
+        xd = tl.sum(tl.where(od == d0, xn, 0.0), axis=0)
+        woffs = oh * D + d0
+        acc_l += xd * tl.load(lw + woffs, mask=oh < H, other=0.0).to(tl.float32)
+        acc_r += xd * tl.load(rw + woffs, mask=oh < H, other=0.0).to(tl.float32)
+        acc_lg += xd * tl.load(lgw + woffs, mask=oh < H, other=0.0).to(tl.float32)
+        acc_rg += xd * tl.load(rgw + woffs, mask=oh < H, other=0.0).to(tl.float32)
+        acc_og += xd * tl.load(ogw + woffs, mask=oh < H, other=0.0).to(tl.float32)
+
+    m = 1.0
+    if has_mask:
+        m = tl.load(mask + pid).to(tl.float32)
+
+    lv = acc_l * _sigmoid(acc_lg) * m
+    rv = acc_r * _sigmoid(acc_rg) * m
+    ogv = _sigmoid(acc_og)
+
+    tl.store(left + pid * H + oh, lv, mask=oh < H)
+    tl.store(right + pid * H + oh, rv, mask=oh < H)
+    tl.store(out_gate + pid * H + oh, ogv, mask=oh < H)
+
+
+@triton.jit
+def _tri_kernel(
+    left, right, tri,
+    N: tl.constexpr, H: tl.constexpr,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    pid_m = tl.program_id(1)
+    pid_bh = tl.program_id(2)
+
+    h = pid_bh % H
+    b = pid_bh // H
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    for k0 in range(0, N, BLOCK_K):
+        k = k0 + offs_k
+        lptr = left + (((b * N + offs_m[:, None]) * N + k[None, :]) * H + h)
+        rptr = right + (((b * N + offs_n[None, :]) * N + k[:, None]) * H + h)
+        l = tl.load(lptr, mask=(offs_m[:, None] < N) & (k[None, :] < N), other=0.0)
+        r = tl.load(rptr, mask=(offs_n[None, :] < N) & (k[:, None] < N), other=0.0)
+        acc += tl.dot(l, r, input_precision="tf32")
+
+    tptr = tri + (((b * N + offs_m[:, None]) * N + offs_n[None, :]) * H + h)
+    tl.store(tptr, acc, mask=(offs_m[:, None] < N) & (offs_n[None, :] < N))
+
+
+@triton.jit
+def _finish_kernel(
+    tri, out_gate, out,
+    onw, onb, tow,
+    rows: tl.constexpr, H: tl.constexpr, D: tl.constexpr,
+    BLOCK_H: tl.constexpr, BLOCK_D: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    od = tl.arange(0, BLOCK_D)
+    oh = tl.arange(0, BLOCK_H)
+
+    v = tl.load(tri + pid * H + oh, mask=oh < H, other=0.0).to(tl.float32)
+    mean = tl.sum(v, axis=0) / H
+    dv = v - mean
+    var = tl.sum(dv * dv, axis=0) / H
+    inv = tl.rsqrt(var + 1.0e-5)
+
+    nw = tl.load(onw + oh, mask=oh < H, other=0.0).to(tl.float32)
+    nb = tl.load(onb + oh, mask=oh < H, other=0.0).to(tl.float32)
+    gate = tl.load(out_gate + pid * H + oh, mask=oh < H, other=0.0).to(tl.float32)
+    z = ((v - mean) * inv * nw + nb) * gate
+    z = tl.where(oh < H, z, 0.0)
+
+    for d0 in range(0, BLOCK_D):
+        w = tl.load(tow + d0 * H + oh, mask=(d0 < D) & (oh < H), other=0.0).to(tl.float32)
+        acc = tl.sum(z * w, axis=0)
+        tl.store(out + pid * D + d0, acc, mask=d0 < D)
+
+
+def custom_kernel(data):
+    input_tensor, mask, weights, config = data
+    B, N, _, D = input_tensor.shape
+    H = config["hidden_dim"]
+
+    norm_weight = weights["norm.weight"]
+    norm_bias = weights["norm.bias"]
+    left_proj_weight = weights["left_proj.weight"]
+    right_proj_weight = weights["right_proj.weight"]
+    left_gate_weight = weights["left_gate.weight"]
+    right_gate_weight = weights["right_gate.weight"]
+    out_gate_weight = weights["out_gate.weight"]
+    to_out_norm_weight = weights["to_out_norm.weight"]
+    to_out_norm_bias = weights["to_out_norm.bias"]
+    to_out_weight = weights["to_out.weight"]
+
+    x = input_tensor.contiguous()
+    if mask is not None:
+        mask = mask.contiguous()
+
+    rows = B * N * N
+    left = torch.empty((B, N, N, H), device=x.device, dtype=torch.float32)
+    right = torch.empty((B, N, N, H), device=x.device, dtype=torch.float32)
+    out_gate = torch.empty((B, N, N, H), device=x.device, dtype=torch.float32)
+    tri = torch.empty((B, N, N, H), device=x.device, dtype=torch.float32)
+    out = torch.empty((B, N, N, D), device=x.device, dtype=torch.float32)
+
+    has_mask = bool(mask is not None and not config.get("nomask", False))
+
+    _prep_kernel[(rows,)](
+        x, mask if mask is not None else x,
+        norm_weight, norm_bias,
+        left_proj_weight, right_proj_weight,
+        left_gate_weight, right_gate_weight, out_gate_weight,
+        left, right, out_gate,
+        rows, D, H,
+        has_mask,
+        triton.next_power_of_2(D), triton.next_power_of_2(H),
+        num_warps=8,
+    )
+
+    # One grouped GEMM per (batch, hidden channel). This layout keeps the reduction
+    # contiguous in memory for both operands after fixing the hidden channel.
+    BM = 16
+    BN = 16
+    BK = 64
+    _tri_kernel[(triton.cdiv(N, BN), triton.cdiv(N, BM), B * H)](
+        left, right, tri,
+        N, H,
+        BM, BN, BK,
+        num_warps=4,
+        num_stages=3,
+    )
+
+    _finish_kernel[(rows,)](
+        tri, out_gate, out,
+        to_out_norm_weight, to_out_norm_bias, to_out_weight,
+        rows, H, D,
+        triton.next_power_of_2(H), triton.next_power_of_2(D),
+        num_warps=8,
+    )
+
+    return out
+```

@@ -1,0 +1,230 @@
+```python
+"""
+TriMul outgoing forward pass.
+
+The implementation keeps the large dense contractions on cuBLAS-backed PyTorch
+GEMMs/BMMs and uses Triton for the bandwidth-heavy fused pieces:
+projection splitting, sigmoid gates, optional mask application, channel-major
+packing for the outgoing triangle product, and output LayerNorm plus output gate.
+"""
+
+import torch
+import torch.nn.functional as F
+import triton
+import triton.language as tl
+
+
+_WEIGHT_CACHE = {}
+
+
+@triton.jit
+def _prep_trimul_kernel(
+    proj, mask, left, right, out_gate,
+    M: tl.constexpr, N: tl.constexpr, H: tl.constexpr,
+    NOMASK: tl.constexpr,
+    BLOCK_M: tl.constexpr, BLOCK_H: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_h = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_h = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
+
+    n2: tl.constexpr = N * N
+    b = offs_m // n2
+    rem = offs_m - b * n2
+
+    valid = (offs_m[:, None] < M) & (offs_h[None, :] < H)
+    base = offs_m[:, None] * (5 * H) + offs_h[None, :]
+
+    l = tl.load(proj + base, mask=valid, other=0.0).to(tl.float32)
+    r = tl.load(proj + base + H, mask=valid, other=0.0).to(tl.float32)
+    lg = tl.load(proj + base + 2 * H, mask=valid, other=0.0).to(tl.float32)
+    rg = tl.load(proj + base + 3 * H, mask=valid, other=0.0).to(tl.float32)
+    og = tl.load(proj + base + 4 * H, mask=valid, other=0.0).to(tl.float32)
+
+    l = l * tl.sigmoid(lg)
+    r = r * tl.sigmoid(rg)
+
+    if not NOMASK:
+        mval = tl.load(mask + offs_m, mask=offs_m < M, other=0.0).to(tl.float32)
+        l = l * mval[:, None]
+        r = r * mval[:, None]
+
+    packed = (b[:, None] * H + offs_h[None, :]) * n2 + rem[:, None]
+    row_major = offs_m[:, None] * H + offs_h[None, :]
+
+    tl.store(left + packed, l.to(tl.float16), mask=valid)
+    tl.store(right + packed, r.to(tl.float16), mask=valid)
+    tl.store(out_gate + row_major, tl.sigmoid(og).to(tl.float16), mask=valid)
+
+
+@triton.jit
+def _out_norm_gate_kernel(
+    tri_out, out_gate, norm_w, norm_b, normed,
+    M: tl.constexpr, N2: tl.constexpr, H: tl.constexpr,
+    BLOCK_M: tl.constexpr, BLOCK_H: tl.constexpr,
+):
+    pid = tl.program_id(0)
+
+    offs_m = pid * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_h = tl.arange(0, BLOCK_H)
+
+    b = offs_m // N2
+    rem = offs_m - b * N2
+
+    valid = (offs_m[:, None] < M) & (offs_h[None, :] < H)
+    tri_ptrs = tri_out + (b[:, None] * H + offs_h[None, :]) * N2 + rem[:, None]
+
+    x = tl.load(tri_ptrs, mask=valid, other=0.0).to(tl.float32)
+
+    mean = tl.sum(x, axis=1) / H
+    centered = x - mean[:, None]
+    var = tl.sum(centered * centered, axis=1) / H
+    xhat = centered * tl.rsqrt(var[:, None] + 1.0e-5)
+
+    w = tl.load(norm_w + offs_h, mask=offs_h < H, other=0.0).to(tl.float32)
+    beta = tl.load(norm_b + offs_h, mask=offs_h < H, other=0.0).to(tl.float32)
+    gate = tl.load(
+        out_gate + offs_m[:, None] * H + offs_h[None, :],
+        mask=valid,
+        other=0.0,
+    ).to(tl.float32)
+
+    y = (xhat * w[None, :] + beta[None, :]) * gate
+    tl.store(normed + offs_m[:, None] * H + offs_h[None, :], y.to(tl.float16), mask=valid)
+
+
+def _tensor_key(t):
+    return (
+        id(t),
+        t.data_ptr(),
+        tuple(t.shape),
+        tuple(t.stride()),
+        str(t.dtype),
+        t.device.type,
+        t.device.index,
+        getattr(t, "_version", 0),
+    )
+
+
+def _cached_proj_weight(weights):
+    names = (
+        "left_proj.weight",
+        "right_proj.weight",
+        "left_gate.weight",
+        "right_gate.weight",
+        "out_gate.weight",
+    )
+    tensors = tuple(weights[name] for name in names)
+    key = ("proj",) + tuple(_tensor_key(t) for t in tensors)
+
+    item = _WEIGHT_CACHE.get(key)
+    if item is None:
+        if len(_WEIGHT_CACHE) > 32:
+            _WEIGHT_CACHE.clear()
+        item = (torch.cat(tensors, dim=0).contiguous().to(torch.float16), tensors)
+        _WEIGHT_CACHE[key] = item
+
+    return item[0]
+
+
+def _cached_half_weight(name, tensor):
+    key = (name, _tensor_key(tensor))
+
+    item = _WEIGHT_CACHE.get(key)
+    if item is None:
+        if len(_WEIGHT_CACHE) > 32:
+            _WEIGHT_CACHE.clear()
+        item = (tensor.contiguous().to(torch.float16), tensor)
+        _WEIGHT_CACHE[key] = item
+
+    return item[0]
+
+
+def _bmm_fp32(a, b):
+    try:
+        return torch.bmm(a, b, out_dtype=torch.float32)
+    except TypeError:
+        return torch.bmm(a, b).float()
+
+
+def _mm_fp32(a, b):
+    try:
+        return torch.mm(a, b, out_dtype=torch.float32)
+    except TypeError:
+        return torch.mm(a, b).float()
+
+
+def custom_kernel(data):
+    with torch.no_grad():
+        input_tensor, mask, weights, config = data
+
+        dim = int(config["dim"])
+        hidden_dim = int(config["hidden_dim"])
+        bs, seq_len, _, _ = input_tensor.shape
+
+        M = bs * seq_len * seq_len
+        n2 = seq_len * seq_len
+        device = input_tensor.device
+
+        torch.backends.cuda.matmul.allow_tf32 = True
+
+        x = F.layer_norm(
+            input_tensor,
+            (dim,),
+            weights["norm.weight"],
+            weights["norm.bias"],
+            eps=1.0e-5,
+        ).to(torch.float16)
+
+        w_cat = _cached_proj_weight(weights)
+        proj = torch.mm(x.reshape(M, dim), w_cat.t())
+        del x
+
+        left = torch.empty((bs * hidden_dim, seq_len, seq_len), device=device, dtype=torch.float16)
+        right = torch.empty_like(left)
+        out_gate = torch.empty((M, hidden_dim), device=device, dtype=torch.float16)
+
+        nomask = bool(config.get("nomask", False)) or mask is None
+        mask_arg = input_tensor if mask is None else mask.contiguous()
+
+        _prep_trimul_kernel[
+            ((M + 127) // 128, (hidden_dim + 31) // 32)
+        ](
+            proj, mask_arg, left, right, out_gate,
+            M, seq_len, hidden_dim, nomask,
+            BLOCK_M=128,
+            BLOCK_H=32,
+            num_warps=4,
+        )
+        del proj
+
+        tri = _bmm_fp32(left, right.transpose(1, 2))
+        del left, right
+
+        normed = torch.empty((M, hidden_dim), device=device, dtype=torch.float16)
+        block_h = 1 << (hidden_dim - 1).bit_length()
+
+        _out_norm_gate_kernel[
+            ((M + 15) // 16,)
+        ](
+            tri,
+            out_gate,
+            weights["to_out_norm.weight"],
+            weights["to_out_norm.bias"],
+            normed,
+            M,
+            n2,
+            hidden_dim,
+            BLOCK_M=16,
+            BLOCK_H=block_h,
+            num_warps=8,
+        )
+        del tri, out_gate
+
+        to_out_w = _cached_half_weight("to_out", weights["to_out.weight"])
+        out = _mm_fp32(normed, to_out_w.t())
+
+        return out.reshape(bs, seq_len, seq_len, dim).float()
+```

@@ -1,0 +1,197 @@
+```python
+"""
+TriMul outgoing forward pass.
+
+Algorithm:
+1. Normalize the pair representation with PyTorch layer_norm.
+2. Compute all five input projections in one large cuBLAS linear by concatenating
+   the projection weights.
+3. Use Triton to split projections, apply sigmoid gates, and apply the optional
+   pair mask while materializing only gated left/right tensors.
+4. Compute the outgoing triangle multiplication as 128 independent batched GEMMs:
+      out[..., h] = left[..., h] @ right[..., h].T
+5. Use Triton to fuse output LayerNorm, output gate sigmoid, and final projection,
+   returning a float32 tensor.
+"""
+
+import torch
+import triton
+import triton.language as tl
+import torch.nn.functional as F
+
+
+@triton.jit
+def _split_gate_mask_kernel(
+    proj,
+    left,
+    right,
+    mask,
+    n_elem: tl.constexpr,
+    H: tl.constexpr,
+    has_mask: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    valid = offs < n_elem
+
+    row = offs // H
+    h = offs - row * H
+    base = row * (5 * H) + h
+
+    lv = tl.load(proj + base, mask=valid, other=0.0).to(tl.float32)
+    rv = tl.load(proj + base + H, mask=valid, other=0.0).to(tl.float32)
+    lgv = tl.load(proj + base + 2 * H, mask=valid, other=0.0).to(tl.float32)
+    rgv = tl.load(proj + base + 3 * H, mask=valid, other=0.0).to(tl.float32)
+
+    lgv = 1.0 / (1.0 + tl.exp(-lgv))
+    rgv = 1.0 / (1.0 + tl.exp(-rgv))
+
+    if has_mask:
+        mv = tl.load(mask + row, mask=valid, other=0.0).to(tl.float32)
+        lgv *= mv
+        rgv *= mv
+
+    tl.store(left + offs, lv * lgv, mask=valid)
+    tl.store(right + offs, rv * rgv, mask=valid)
+
+
+@triton.jit
+def _out_norm_gate_proj_kernel(
+    tri,
+    proj,
+    w_norm,
+    b_norm,
+    w_out,
+    y,
+    M: tl.constexpr,
+    D: tl.constexpr,
+    H: tl.constexpr,
+    EPS: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_d = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_h = tl.arange(0, BLOCK_H)
+    hmask = offs_h < H
+    mmask = offs_m < M
+
+    tri_vals = tl.load(
+        tri + offs_m[:, None] * H + offs_h[None, :],
+        mask=mmask[:, None] & hmask[None, :],
+        other=0.0,
+    ).to(tl.float32)
+
+    mean = tl.sum(tri_vals, axis=1) / H
+    centered = tri_vals - mean[:, None]
+    var = tl.sum(centered * centered, axis=1) / H
+    inv = tl.rsqrt(var + EPS)
+
+    nw = tl.load(w_norm + offs_h, mask=hmask, other=0.0).to(tl.float32)
+    nb = tl.load(b_norm + offs_h, mask=hmask, other=0.0).to(tl.float32)
+
+    gate = tl.load(
+        proj + offs_m[:, None] * (5 * H) + 4 * H + offs_h[None, :],
+        mask=mmask[:, None] & hmask[None, :],
+        other=0.0,
+    ).to(tl.float32)
+    gate = 1.0 / (1.0 + tl.exp(-gate))
+
+    v = ((centered * inv[:, None]) * nw[None, :] + nb[None, :]) * gate
+
+    offs_d = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
+    acc = tl.zeros((BLOCK_M, BLOCK_D), dtype=tl.float32)
+
+    w = tl.load(
+        w_out + offs_d[:, None] * H + offs_h[None, :],
+        mask=(offs_d[:, None] < D) & hmask[None, :],
+        other=0.0,
+    ).to(tl.float32)
+    acc += tl.dot(v, tl.trans(w), input_precision="tf32")
+
+    tl.store(
+        y + offs_m[:, None] * D + offs_d[None, :],
+        acc,
+        mask=mmask[:, None] & (offs_d[None, :] < D),
+    )
+
+
+def custom_kernel(data):
+    input_tensor, mask, weights, config = data
+    dim = int(config["dim"])
+    hidden_dim = int(config["hidden_dim"])
+
+    x = input_tensor
+    B, N, _, D = x.shape
+    M = B * N * N
+    H = hidden_dim
+
+    norm_weight = weights["norm.weight"]
+    norm_bias = weights["norm.bias"]
+
+    proj_weight = torch.cat(
+        (
+            weights["left_proj.weight"],
+            weights["right_proj.weight"],
+            weights["left_gate.weight"],
+            weights["right_gate.weight"],
+            weights["out_gate.weight"],
+        ),
+        dim=0,
+    )
+
+    x2 = x.reshape(M, D)
+    xn = F.layer_norm(x2, (D,), norm_weight, norm_bias, eps=1e-5)
+
+    proj = F.linear(xn, proj_weight).contiguous()
+
+    left = torch.empty((M, H), device=x.device, dtype=torch.float32)
+    right = torch.empty((M, H), device=x.device, dtype=torch.float32)
+
+    has_mask = mask is not None and not bool(config.get("nomask", False))
+    n_elem = M * H
+    _split_gate_mask_kernel[(triton.cdiv(n_elem, 256),)](
+        proj,
+        left,
+        right,
+        mask if mask is not None else left,
+        n_elem,
+        H,
+        has_mask,
+        BLOCK=256,
+        num_warps=4,
+    )
+
+    left4 = left.view(B, N, N, H)
+    right4 = right.view(B, N, N, H)
+
+    a = left4.permute(0, 3, 1, 2).reshape(B * H, N, N)
+    b = right4.permute(0, 3, 2, 1).reshape(B * H, N, N)
+
+    tri = torch.bmm(a, b)
+    tri = tri.view(B, H, N, N).permute(0, 2, 3, 1).contiguous().view(M, H)
+
+    out = torch.empty((M, dim), device=x.device, dtype=torch.float32)
+
+    _out_norm_gate_proj_kernel[(triton.cdiv(M, 16), triton.cdiv(dim, 64))](
+        tri,
+        proj,
+        weights["to_out_norm.weight"],
+        weights["to_out_norm.bias"],
+        weights["to_out.weight"],
+        out,
+        M,
+        dim,
+        H,
+        1e-5,
+        BLOCK_M=16,
+        BLOCK_D=64,
+        BLOCK_H=128,
+        num_warps=4,
+    )
+
+    return out.view(B, N, N, dim)
+```

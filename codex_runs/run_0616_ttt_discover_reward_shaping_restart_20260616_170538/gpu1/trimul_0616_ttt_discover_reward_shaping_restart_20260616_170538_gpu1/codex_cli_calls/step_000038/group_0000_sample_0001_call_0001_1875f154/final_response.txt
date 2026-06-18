@@ -1,0 +1,100 @@
+```python
+"""
+TriMul outgoing forward pass.
+
+The implementation uses PyTorch/cuBLAS for the large grouped GEMM and Triton for
+the layout-critical fused gate/mask/transpose step.  It computes all LayerNorms
+and linear projections normally, stores left/right factors as contiguous
+[B * H, N, N] matrices, performs H independent N x N products with torch.bmm,
+then applies the output LayerNorm, output gate, and final projection.  The
+matrix product is done in fp16 inputs with fp32 output returned.
+"""
+
+import torch
+import torch.nn.functional as F
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def _pack_lr_kernel(
+    left_p, right_p, lg_p, rg_p, mask_p, out_left_p, out_right_p,
+    total: tl.constexpr, N: tl.constexpr, H: tl.constexpr,
+    use_mask: tl.constexpr, BLOCK: tl.constexpr
+):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    m = offs < total
+
+    vals_l = tl.load(left_p + offs, mask=m, other=0.0)
+    vals_r = tl.load(right_p + offs, mask=m, other=0.0)
+    vals_lg = tl.load(lg_p + offs, mask=m, other=0.0)
+    vals_rg = tl.load(rg_p + offs, mask=m, other=0.0)
+
+    gate_l = 1.0 / (1.0 + tl.exp(-vals_lg))
+    gate_r = 1.0 / (1.0 + tl.exp(-vals_rg))
+
+    idx = offs
+    h = idx % H
+    t = idx // H
+    k = t % N
+    i = (t // N) % N
+    b = t // (N * N)
+
+    scale = 1.0
+    if use_mask:
+        scale = tl.load(mask_p + b * N * N + i * N + k, mask=m, other=0.0)
+
+    dst = (b * H + h) * N * N + i * N + k
+    dst_r = (b * H + h) * N * N + i * N + k
+
+    tl.store(out_left_p + dst, (vals_l * gate_l * scale).to(tl.float32), mask=m)
+    tl.store(out_right_p + dst_r, (vals_r * gate_r * scale).to(tl.float32), mask=m)
+
+
+def custom_kernel(data):
+    input_tensor, mask, weights, config = data
+    x = input_tensor
+    B, N, _, D = x.shape
+    H = int(config["hidden_dim"])
+
+    norm_weight = weights["norm.weight"]
+    norm_bias = weights["norm.bias"]
+    left_proj_weight = weights["left_proj.weight"]
+    right_proj_weight = weights["right_proj.weight"]
+    left_gate_weight = weights["left_gate.weight"]
+    right_gate_weight = weights["right_gate.weight"]
+    out_gate_weight = weights["out_gate.weight"]
+    to_out_norm_weight = weights["to_out_norm.weight"]
+    to_out_norm_bias = weights["to_out_norm.bias"]
+    to_out_weight = weights["to_out.weight"]
+
+    x_norm = F.layer_norm(x, (D,), norm_weight, norm_bias, 1e-5)
+
+    left = F.linear(x_norm, left_proj_weight)
+    right = F.linear(x_norm, right_proj_weight)
+    left_g = F.linear(x_norm, left_gate_weight)
+    right_g = F.linear(x_norm, right_gate_weight)
+    out_gate = torch.sigmoid(F.linear(x_norm, out_gate_weight))
+
+    left_m = torch.empty((B * H, N, N), device=x.device, dtype=torch.float16)
+    right_m = torch.empty((B * H, N, N), device=x.device, dtype=torch.float16)
+
+    use_mask = (mask is not None) and (not bool(config.get("nomask", False)))
+    total = B * N * N * H
+    block = 256
+    grid = (triton.cdiv(total, block),)
+
+    _pack_lr_kernel[grid](
+        left, right, left_g, right_g, mask, left_m, right_m,
+        total, N, H, use_mask, BLOCK=block,
+        num_warps=4,
+    )
+
+    prod = torch.bmm(left_m, right_m.transpose(1, 2))
+    prod = prod.reshape(B, H, N, N).permute(0, 2, 3, 1).contiguous().float()
+
+    prod = F.layer_norm(prod, (H,), to_out_norm_weight, to_out_norm_bias, 1e-5)
+    prod = prod * out_gate
+    return F.linear(prod, to_out_weight).float()
+```

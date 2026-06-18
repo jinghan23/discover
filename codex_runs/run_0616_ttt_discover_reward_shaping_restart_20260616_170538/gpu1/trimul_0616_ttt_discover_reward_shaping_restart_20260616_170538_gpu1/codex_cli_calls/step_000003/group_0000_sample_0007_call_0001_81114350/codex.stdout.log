@@ -1,0 +1,163 @@
+```python
+"""
+TriMul outgoing forward using Triton for the rowwise LayerNorm/projection/gating
+stages and cuBLAS batched GEMM for the N x N outgoing triangle contraction.
+All intermediate contractions are accumulated in fp32 and the returned tensor is fp32.
+"""
+
+import torch
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def _prep_kernel(
+    x, mask,
+    norm_w, norm_b,
+    wl, wr, wlg, wrg, wog,
+    left, right, ogate,
+    D: tl.constexpr,
+    H: tl.constexpr,
+    HAS_MASK: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    oh = tl.program_id(1)
+
+    offs_d = tl.arange(0, BLOCK_D)
+    offs_h = oh * BLOCK_H + tl.arange(0, BLOCK_H)
+
+    md = offs_d < D
+    mh = offs_h < H
+
+    xv = tl.load(x + pid * D + offs_d, mask=md, other=0.0).to(tl.float32)
+
+    mean = tl.sum(xv, axis=0) / D
+    xc = tl.where(md, xv - mean, 0.0)
+    var = tl.sum(xc * xc, axis=0) / D
+    rstd = tl.rsqrt(var + 1.0e-5)
+
+    nw = tl.load(norm_w + offs_d, mask=md, other=0.0).to(tl.float32)
+    nb = tl.load(norm_b + offs_d, mask=md, other=0.0).to(tl.float32)
+    xn = tl.where(md, xc * rstd * nw + nb, 0.0)
+
+    wd = offs_d[:, None]
+    hh = offs_h[None, :]
+    wm = md[:, None] & mh[None, :]
+
+    lw = tl.load(wl + hh * D + wd, mask=wm, other=0.0).to(tl.float32)
+    rw = tl.load(wr + hh * D + wd, mask=wm, other=0.0).to(tl.float32)
+    lgw = tl.load(wlg + hh * D + wd, mask=wm, other=0.0).to(tl.float32)
+    rgw = tl.load(wrg + hh * D + wd, mask=wm, other=0.0).to(tl.float32)
+    ogw = tl.load(wog + hh * D + wd, mask=wm, other=0.0).to(tl.float32)
+
+    lp = tl.sum(xn[:, None] * lw, axis=0)
+    rp = tl.sum(xn[:, None] * rw, axis=0)
+    lg = tl.sigmoid(tl.sum(xn[:, None] * lgw, axis=0))
+    rg = tl.sigmoid(tl.sum(xn[:, None] * rgw, axis=0))
+    og = tl.sigmoid(tl.sum(xn[:, None] * ogw, axis=0))
+
+    mv = 1.0
+    if HAS_MASK:
+        mv = tl.load(mask + pid).to(tl.float32)
+
+    out_off = pid * H + offs_h
+    tl.store(left + out_off, (lp * lg * mv).to(tl.float32), mask=mh)
+    tl.store(right + out_off, (rp * rg * mv).to(tl.float32), mask=mh)
+    tl.store(ogate + out_off, og.to(tl.float32), mask=mh)
+
+
+@triton.jit
+def _final_kernel(
+    tri, ogate,
+    ton_w, ton_b, to_w,
+    out,
+    D: tl.constexpr,
+    H: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    od = tl.program_id(1)
+
+    offs_h = tl.arange(0, BLOCK_H)
+    offs_d = od * BLOCK_D + tl.arange(0, BLOCK_D)
+
+    mh = offs_h < H
+    md = offs_d < D
+
+    v = tl.load(tri + pid * H + offs_h, mask=mh, other=0.0).to(tl.float32)
+    mean = tl.sum(v, axis=0) / H
+    vc = tl.where(mh, v - mean, 0.0)
+    var = tl.sum(vc * vc, axis=0) / H
+    rstd = tl.rsqrt(var + 1.0e-5)
+
+    nw = tl.load(ton_w + offs_h, mask=mh, other=0.0).to(tl.float32)
+    nb = tl.load(ton_b + offs_h, mask=mh, other=0.0).to(tl.float32)
+    gate = tl.load(ogate + pid * H + offs_h, mask=mh, other=0.0).to(tl.float32)
+
+    y = (vc * rstd * nw + nb) * gate
+
+    tw = tl.load(
+        to_w + offs_d[:, None] * H + offs_h[None, :],
+        mask=md[:, None] & mh[None, :],
+        other=0.0,
+    ).to(tl.float32)
+
+    res = tl.sum(tw * y[None, :], axis=1)
+    tl.store(out + pid * D + offs_d, res.to(tl.float32), mask=md)
+
+
+def custom_kernel(data):
+    input_tensor, mask, weights, config = data
+    B, N, _, D = input_tensor.shape
+    H = int(config["hidden_dim"])
+
+    x = input_tensor.contiguous()
+    total = B * N * N
+
+    has_mask = mask is not None and not bool(config.get("nomask", False))
+    if has_mask:
+        mask_c = mask.contiguous()
+    else:
+        mask_c = torch.empty((1,), device=x.device, dtype=torch.float32)
+
+    left = torch.empty((B, N, N, H), device=x.device, dtype=torch.float32)
+    right = torch.empty((B, N, N, H), device=x.device, dtype=torch.float32)
+    ogate = torch.empty((B, N, N, H), device=x.device, dtype=torch.float32)
+
+    block_d = triton.next_power_of_2(D)
+    block_h = 32
+
+    _prep_kernel[(total, triton.cdiv(H, block_h))](
+        x, mask_c,
+        weights["norm.weight"], weights["norm.bias"],
+        weights["left_proj.weight"], weights["right_proj.weight"],
+        weights["left_gate.weight"], weights["right_gate.weight"], weights["out_gate.weight"],
+        left, right, ogate,
+        D, H, has_mask,
+        BLOCK_D=block_d,
+        BLOCK_H=block_h,
+        num_warps=8,
+    )
+
+    l = left.permute(0, 3, 1, 2).reshape(B * H, N, N)
+    r = right.permute(0, 3, 1, 2).reshape(B * H, N, N)
+    tri = torch.bmm(l, r.transpose(1, 2)).reshape(B, H, N, N).permute(0, 2, 3, 1).contiguous()
+
+    out = torch.empty((B, N, N, D), device=x.device, dtype=torch.float32)
+    block_out_d = 32
+
+    _final_kernel[(total, triton.cdiv(D, block_out_d))](
+        tri, ogate,
+        weights["to_out_norm.weight"], weights["to_out_norm.bias"], weights["to_out.weight"],
+        out,
+        D, H,
+        BLOCK_H=triton.next_power_of_2(H),
+        BLOCK_D=block_out_d,
+        num_warps=8,
+    )
+
+    return out
+```

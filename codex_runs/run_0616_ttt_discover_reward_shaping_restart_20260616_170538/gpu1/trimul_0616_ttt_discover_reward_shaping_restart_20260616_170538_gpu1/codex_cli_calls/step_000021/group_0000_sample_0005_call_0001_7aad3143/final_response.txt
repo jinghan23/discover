@@ -1,0 +1,143 @@
+```python
+"""
+Outgoing TriMul forward for AlphaFold-style pair updates.
+
+The implementation keeps the expensive dense pieces on cuBLAS: one packed GEMM
+for all five input projections, batched per-channel BMMs for the N^3 outgoing
+update, and a final GEMM for to_out. A Triton kernel fuses the hidden-dimension
+LayerNorm and output gate multiply before the final projection.
+"""
+
+import torch
+import torch.nn.functional as F
+import triton
+import triton.language as tl
+
+
+_PROJ_WEIGHT_CACHE = {}
+
+
+@triton.jit
+def _final_norm_gate_kernel(
+    y_ptr,
+    gate_ptr,
+    w_norm_ptr,
+    b_norm_ptr,
+    h_ptr,
+    BLOCK_D: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offs = tl.arange(0, BLOCK_D)
+
+    y = tl.load(y_ptr + pid * BLOCK_D + offs).to(tl.float32)
+
+    mean = tl.sum(y, axis=0) / BLOCK_D
+    yc = y - mean
+    var = tl.sum(yc * yc, axis=0) / BLOCK_D
+    rstd = tl.rsqrt(var + 1.0e-5)
+
+    nw = tl.load(w_norm_ptr + offs).to(tl.float32)
+    nb = tl.load(b_norm_ptr + offs).to(tl.float32)
+    gate = tl.load(gate_ptr + pid * BLOCK_D + offs).to(tl.float32)
+
+    h = (yc * rstd * nw + nb) * gate
+    tl.store(h_ptr + pid * BLOCK_D + offs, h)
+
+
+def _packed_projection_weight(
+    left_proj_weight,
+    right_proj_weight,
+    left_gate_weight,
+    right_gate_weight,
+    out_gate_weight,
+):
+    tensors = (
+        left_proj_weight,
+        right_proj_weight,
+        left_gate_weight,
+        right_gate_weight,
+        out_gate_weight,
+    )
+
+    key = tuple((id(t), int(t._version)) for t in tensors)
+    cached = _PROJ_WEIGHT_CACHE.get(key)
+    if cached is not None:
+        return cached[1]
+
+    if len(_PROJ_WEIGHT_CACHE) >= 8:
+        _PROJ_WEIGHT_CACHE.clear()
+
+    packed = torch.cat(tensors, dim=0).contiguous()
+    _PROJ_WEIGHT_CACHE[key] = (tensors, packed)
+    return packed
+
+
+@torch.no_grad()
+def custom_kernel(data):
+    input_tensor, mask, weights, config = data
+    dim = int(config["dim"])
+    hidden_dim = int(config["hidden_dim"])
+
+    x = input_tensor
+    bsz, n, _, _ = x.shape
+    rows = bsz * n * n
+
+    norm_weight = weights["norm.weight"]
+    norm_bias = weights["norm.bias"]
+    left_proj_weight = weights["left_proj.weight"]
+    right_proj_weight = weights["right_proj.weight"]
+    left_gate_weight = weights["left_gate.weight"]
+    right_gate_weight = weights["right_gate.weight"]
+    out_gate_weight = weights["out_gate.weight"]
+    to_out_norm_weight = weights["to_out_norm.weight"]
+    to_out_norm_bias = weights["to_out_norm.bias"]
+    to_out_weight = weights["to_out.weight"]
+
+    x_flat = x.reshape(rows, dim)
+    x_norm = F.layer_norm(x_flat, (dim,), norm_weight, norm_bias, eps=1.0e-5)
+
+    proj_w = _packed_projection_weight(
+        left_proj_weight,
+        right_proj_weight,
+        left_gate_weight,
+        right_gate_weight,
+        out_gate_weight,
+    )
+    proj = F.linear(x_norm, proj_w)
+
+    left, right, left_gate, right_gate, out_gate = proj.split(hidden_dim, dim=-1)
+
+    left_gate = torch.sigmoid(left_gate)
+    right_gate = torch.sigmoid(right_gate)
+    out_gate = torch.sigmoid(out_gate).contiguous()
+
+    if mask is not None and not bool(config.get("nomask", False)):
+        m = mask.reshape(rows, 1).to(dtype=left.dtype)
+        left = left * m
+        right = right * m
+
+    left = (left * left_gate).reshape(bsz, n, n, hidden_dim)
+    right = (right * right_gate).reshape(bsz, n, n, hidden_dim)
+
+    left_bdh = left.permute(0, 3, 1, 2).reshape(bsz * hidden_dim, n, n).contiguous()
+    right_bdh = right.permute(0, 3, 1, 2).reshape(bsz * hidden_dim, n, n).contiguous()
+
+    y = torch.bmm(left_bdh, right_bdh.transpose(1, 2))
+    y = y.reshape(bsz, hidden_dim, n, n).permute(0, 2, 3, 1).contiguous()
+    y = y.reshape(rows, hidden_dim)
+
+    h = torch.empty((rows, hidden_dim), device=x.device, dtype=torch.float32)
+    _final_norm_gate_kernel[(rows,)](
+        y,
+        out_gate,
+        to_out_norm_weight,
+        to_out_norm_bias,
+        h,
+        BLOCK_D=hidden_dim,
+        num_warps=4,
+    )
+
+    out_w = to_out_weight if to_out_weight.dtype == h.dtype else to_out_weight.to(h.dtype)
+    out = F.linear(h, out_w).to(torch.float32)
+    return out.reshape(bsz, n, n, dim)
+```

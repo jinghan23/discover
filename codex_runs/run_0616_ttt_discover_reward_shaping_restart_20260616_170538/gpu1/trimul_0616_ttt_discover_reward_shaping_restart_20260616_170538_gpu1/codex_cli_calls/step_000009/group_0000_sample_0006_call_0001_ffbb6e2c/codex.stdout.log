@@ -1,0 +1,168 @@
+```python
+"""
+Fused TriMul forward: Triton fuses input LayerNorm with all five projections,
+applies mask and gates, uses batched torch.bmm for the N^3 outgoing contraction,
+then Triton fuses hidden LayerNorm, output gate, and final projection.
+"""
+
+import torch
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def _norm_proj_kernel(
+    x, mask, nw, nb,
+    lw, rw, lgw, rgw, ogw,
+    left, right, out_gate,
+    total_rows: tl.constexpr,
+    D: tl.constexpr,
+    H: tl.constexpr,
+    HAS_MASK: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    oh = tl.program_id(1)
+
+    offs_d = tl.arange(0, BLOCK_D)
+    m_d = offs_d < D
+
+    vals = tl.load(x + pid * D + offs_d, mask=m_d, other=0.0).to(tl.float32)
+    mean = tl.sum(vals, axis=0) / D
+    centered = tl.where(m_d, vals - mean, 0.0)
+    var = tl.sum(centered * centered, axis=0) / D
+    inv = tl.rsqrt(var + 1.0e-5)
+
+    gamma = tl.load(nw + offs_d, mask=m_d, other=0.0).to(tl.float32)
+    beta = tl.load(nb + offs_d, mask=m_d, other=0.0).to(tl.float32)
+    xn = (vals - mean) * inv * gamma + beta
+    xn = tl.where(m_d, xn, 0.0)
+
+    offs_h = oh * BLOCK_H + tl.arange(0, BLOCK_H)
+    m_h = offs_h < H
+    wptr = offs_h[:, None] * D + offs_d[None, :]
+
+    lacc = tl.sum(xn[None, :] * tl.load(lw + wptr, mask=m_h[:, None] & m_d[None, :], other=0.0), axis=1)
+    racc = tl.sum(xn[None, :] * tl.load(rw + wptr, mask=m_h[:, None] & m_d[None, :], other=0.0), axis=1)
+    lgacc = tl.sum(xn[None, :] * tl.load(lgw + wptr, mask=m_h[:, None] & m_d[None, :], other=0.0), axis=1)
+    rgacc = tl.sum(xn[None, :] * tl.load(rgw + wptr, mask=m_h[:, None] & m_d[None, :], other=0.0), axis=1)
+    ogacc = tl.sum(xn[None, :] * tl.load(ogw + wptr, mask=m_h[:, None] & m_d[None, :], other=0.0), axis=1)
+
+    lg = 1.0 / (1.0 + tl.exp(-lgacc))
+    rg = 1.0 / (1.0 + tl.exp(-rgacc))
+    og = 1.0 / (1.0 + tl.exp(-ogacc))
+
+    mul_mask = tl.full((BLOCK_H,), 1.0, tl.float32)
+    if HAS_MASK:
+        mv = tl.load(mask + pid).to(tl.float32)
+        mul_mask = mv + tl.zeros((BLOCK_H,), tl.float32)
+
+    out_off = pid * H + offs_h
+    tl.store(left + out_off, (lacc * lg * mul_mask).to(tl.float32), mask=m_h)
+    tl.store(right + out_off, (racc * rg * mul_mask).to(tl.float32), mask=m_h)
+    tl.store(out_gate + out_off, og.to(tl.float32), mask=m_h)
+
+
+@triton.jit
+def _out_norm_proj_kernel(
+    tri, out_gate, nw, nb, ow, y,
+    total_rows: tl.constexpr,
+    D: tl.constexpr,
+    H: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    od_block = tl.program_id(1)
+
+    offs_h = tl.arange(0, BLOCK_H)
+    m_h = offs_h < H
+
+    v = tl.load(tri + pid * H + offs_h, mask=m_h, other=0.0).to(tl.float32)
+    mean = tl.sum(v, axis=0) / H
+    c = tl.where(m_h, v - mean, 0.0)
+    var = tl.sum(c * c, axis=0) / H
+    inv = tl.rsqrt(var + 1.0e-5)
+
+    gamma = tl.load(nw + offs_h, mask=m_h, other=0.0).to(tl.float32)
+    beta = tl.load(nb + offs_h, mask=m_h, other=0.0).to(tl.float32)
+    gate = tl.load(out_gate + pid * H + offs_h, mask=m_h, other=0.0).to(tl.float32)
+
+    z = ((v - mean) * inv * gamma + beta) * gate
+    z = tl.where(m_h, z, 0.0)
+
+    offs_d = od_block * BLOCK_D + tl.arange(0, BLOCK_D)
+    m_d = offs_d < D
+
+    w = tl.load(ow + offs_d[:, None] * H + offs_h[None, :], mask=m_d[:, None] & m_h[None, :], other=0.0)
+    acc = tl.sum(w.to(tl.float32) * z[None, :], axis=1)
+    tl.store(y + pid * D + offs_d, acc, mask=m_d)
+
+
+def _ceil_pow2(x):
+    return 1 << ((int(x) - 1).bit_length())
+
+
+def custom_kernel(data):
+    input_tensor, mask, weights, config = data
+    dim = int(config["dim"])
+    hidden_dim = int(config["hidden_dim"])
+
+    x = input_tensor.contiguous()
+    bs, n, _, _ = x.shape
+    total = bs * n * n
+
+    norm_weight = weights["norm.weight"].contiguous()
+    norm_bias = weights["norm.bias"].contiguous()
+    left_proj_weight = weights["left_proj.weight"].contiguous()
+    right_proj_weight = weights["right_proj.weight"].contiguous()
+    left_gate_weight = weights["left_gate.weight"].contiguous()
+    right_gate_weight = weights["right_gate.weight"].contiguous()
+    out_gate_weight = weights["out_gate.weight"].contiguous()
+    to_out_norm_weight = weights["to_out_norm.weight"].contiguous()
+    to_out_norm_bias = weights["to_out_norm.bias"].contiguous()
+    to_out_weight = weights["to_out.weight"].contiguous()
+
+    left = torch.empty((total, hidden_dim), device=x.device, dtype=torch.float32)
+    right = torch.empty((total, hidden_dim), device=x.device, dtype=torch.float32)
+    out_gate = torch.empty((total, hidden_dim), device=x.device, dtype=torch.float32)
+
+    has_mask = mask is not None
+    if has_mask:
+        mask_flat = mask.contiguous().view(total)
+    else:
+        mask_flat = x.new_empty((1,), dtype=torch.float32)
+
+    block_d = _ceil_pow2(dim)
+    block_h = 16
+
+    _norm_proj_kernel[(total, triton.cdiv(hidden_dim, block_h))](
+        x, mask_flat, norm_weight, norm_bias,
+        left_proj_weight, right_proj_weight, left_gate_weight, right_gate_weight, out_gate_weight,
+        left, right, out_gate,
+        total, dim, hidden_dim, has_mask,
+        BLOCK_D=block_d, BLOCK_H=block_h,
+        num_warps=8,
+    )
+
+    left4 = left.view(bs, n, n, hidden_dim).permute(0, 3, 1, 2).contiguous()
+    right4 = right.view(bs, n, n, hidden_dim).permute(0, 3, 1, 2).contiguous()
+
+    a = left4.reshape(bs * hidden_dim, n, n)
+    b = right4.reshape(bs * hidden_dim, n, n)
+    tri = torch.bmm(a, b.transpose(1, 2))
+    tri = tri.reshape(bs, hidden_dim, n, n).permute(0, 2, 3, 1).contiguous()
+
+    y = torch.empty((total, dim), device=x.device, dtype=torch.float32)
+
+    block_out_d = 16 if dim >= 384 else 32
+    _out_norm_proj_kernel[(total, triton.cdiv(dim, block_out_d))](
+        tri, out_gate, to_out_norm_weight, to_out_norm_bias, to_out_weight, y,
+        total, dim, hidden_dim,
+        BLOCK_H=_ceil_pow2(hidden_dim), BLOCK_D=block_out_d,
+        num_warps=4,
+    )
+
+    return y.view(bs, n, n, dim)
+```

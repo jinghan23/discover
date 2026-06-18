@@ -1,0 +1,210 @@
+```python
+"""
+Outgoing Triangle Multiplicative Update forward pass.
+
+Dense projections and the two large matrix multiplications are delegated to
+PyTorch/cuBLAS. Triton is used to fuse sigmoid gates, optional mask application,
+and layout conversion into the per-channel batched-matmul format, then to fuse
+the hidden LayerNorm and output-gate multiply before the final cuBLAS projection.
+"""
+
+import torch
+import torch.nn.functional as F
+import triton
+import triton.language as tl
+
+
+_PROJ_CACHE = {}
+
+
+@triton.jit
+def _gate_store_bdh_kernel(
+    proj_ptr,
+    mask_ptr,
+    left_ptr,
+    right_ptr,
+    out_gate_ptr,
+    total_rows: tl.constexpr,
+    n: tl.constexpr,
+    hidden: tl.constexpr,
+    use_mask: tl.constexpr,
+    BLOCK_R: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    pid_r = tl.program_id(0)
+    pid_h = tl.program_id(1)
+
+    r = pid_r * BLOCK_R + tl.arange(0, BLOCK_R)
+    h = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
+
+    valid = (r[:, None] < total_rows) & (h[None, :] < hidden)
+    proj_stride = hidden * 5
+    base = r[:, None] * proj_stride + h[None, :]
+
+    lp = tl.load(proj_ptr + base, mask=valid, other=0.0).to(tl.float32)
+    rp = tl.load(proj_ptr + base + hidden, mask=valid, other=0.0).to(tl.float32)
+    lg = tl.load(proj_ptr + base + hidden * 2, mask=valid, other=0.0).to(tl.float32)
+    rg = tl.load(proj_ptr + base + hidden * 3, mask=valid, other=0.0).to(tl.float32)
+    og = tl.load(proj_ptr + base + hidden * 4, mask=valid, other=0.0).to(tl.float32)
+
+    lg = 1.0 / (1.0 + tl.exp(-lg))
+    rg = 1.0 / (1.0 + tl.exp(-rg))
+    og = 1.0 / (1.0 + tl.exp(-og))
+
+    m = 1.0
+    if use_mask:
+        m = tl.load(mask_ptr + r, mask=r < total_rows, other=0.0).to(tl.float32)[:, None]
+
+    lval = lp * lg * m
+    rval = rp * rg * m
+
+    nn = n * n
+    b = r // nn
+    pos = r - b * nn
+    bdh_base = (b[:, None] * hidden + h[None, :]) * nn + pos[:, None]
+
+    tl.store(left_ptr + bdh_base, lval, mask=valid)
+    tl.store(right_ptr + bdh_base, rval, mask=valid)
+    tl.store(out_gate_ptr + r[:, None] * hidden + h[None, :], og, mask=valid)
+
+
+@triton.jit
+def _norm_gate_bdh_kernel(
+    y_ptr,
+    gate_ptr,
+    norm_w_ptr,
+    norm_b_ptr,
+    h_ptr,
+    total_rows: tl.constexpr,
+    n: tl.constexpr,
+    hidden: tl.constexpr,
+    BLOCK_R: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    pid = tl.program_id(0)
+
+    r = pid * BLOCK_R + tl.arange(0, BLOCK_R)
+    h = tl.arange(0, BLOCK_H)
+
+    nn = n * n
+    b = r // nn
+    pos = r - b * nn
+
+    valid_r = r < total_rows
+    valid = valid_r[None, :] & (h[:, None] < hidden)
+
+    y_offs = (b[None, :] * hidden + h[:, None]) * nn + pos[None, :]
+    y = tl.load(y_ptr + y_offs, mask=valid, other=0.0).to(tl.float32)
+
+    mean = tl.sum(y, axis=0) / hidden
+    yc = y - mean[None, :]
+    var = tl.sum(yc * yc, axis=0) / hidden
+    rstd = tl.rsqrt(var + 1.0e-5)
+
+    nw = tl.load(norm_w_ptr + h, mask=h < hidden, other=0.0).to(tl.float32)[:, None]
+    nb = tl.load(norm_b_ptr + h, mask=h < hidden, other=0.0).to(tl.float32)[:, None]
+    gate = tl.load(
+        gate_ptr + r[None, :] * hidden + h[:, None],
+        mask=valid,
+        other=0.0,
+    ).to(tl.float32)
+
+    out = (yc * rstd[None, :] * nw + nb) * gate
+    tl.store(h_ptr + r[None, :] * hidden + h[:, None], out, mask=valid)
+
+
+def _projection_weight(weights):
+    parts = (
+        weights["left_proj.weight"],
+        weights["right_proj.weight"],
+        weights["left_gate.weight"],
+        weights["right_gate.weight"],
+        weights["out_gate.weight"],
+    )
+    key = tuple(
+        (
+            p.data_ptr(),
+            tuple(p.shape),
+            str(p.dtype),
+            str(p.device),
+            getattr(p, "_version", 0),
+        )
+        for p in parts
+    )
+
+    cached = _PROJ_CACHE.get(key)
+    if cached is None:
+        if len(_PROJ_CACHE) > 16:
+            _PROJ_CACHE.clear()
+        cached = torch.cat(parts, dim=0).contiguous()
+        _PROJ_CACHE[key] = cached
+    return cached
+
+
+@torch.no_grad()
+def custom_kernel(data):
+    input_tensor, mask, weights, config = data
+    dim = int(config["dim"])
+    hidden_dim = int(config["hidden_dim"])
+
+    x = input_tensor
+    bsz, n, _, _ = x.shape
+    rows = bsz * n * n
+
+    x_flat = x.reshape(rows, dim)
+    x_norm = F.layer_norm(
+        x_flat,
+        (dim,),
+        weights["norm.weight"],
+        weights["norm.bias"],
+        eps=1.0e-5,
+    )
+
+    proj = F.linear(x_norm, _projection_weight(weights))
+
+    left_bdh = torch.empty((bsz * hidden_dim, n, n), device=x.device, dtype=proj.dtype)
+    right_bdh = torch.empty((bsz * hidden_dim, n, n), device=x.device, dtype=proj.dtype)
+    out_gate = torch.empty((rows, hidden_dim), device=x.device, dtype=proj.dtype)
+
+    use_mask = (mask is not None) and (not bool(config.get("nomask", False)))
+    mask_arg = mask.contiguous() if use_mask and not mask.is_contiguous() else mask
+    if mask_arg is None:
+        mask_arg = x
+
+    _gate_store_bdh_kernel[
+        (triton.cdiv(rows, 16), triton.cdiv(hidden_dim, 32))
+    ](
+        proj,
+        mask_arg,
+        left_bdh,
+        right_bdh,
+        out_gate,
+        rows,
+        n,
+        hidden_dim,
+        use_mask,
+        BLOCK_R=16,
+        BLOCK_H=32,
+        num_warps=4,
+    )
+
+    y_bdh = torch.bmm(left_bdh, right_bdh.transpose(1, 2))
+
+    h = torch.empty((rows, hidden_dim), device=x.device, dtype=torch.float32)
+    _norm_gate_bdh_kernel[(triton.cdiv(rows, 8),)](
+        y_bdh,
+        out_gate,
+        weights["to_out_norm.weight"],
+        weights["to_out_norm.bias"],
+        h,
+        rows,
+        n,
+        hidden_dim,
+        BLOCK_R=8,
+        BLOCK_H=hidden_dim,
+        num_warps=8,
+    )
+
+    out = F.linear(h, weights["to_out.weight"])
+    return out.reshape(bsz, n, n, dim).float()
+```

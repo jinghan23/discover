@@ -1,0 +1,140 @@
+```python
+"""
+TriMul outgoing forward pass.
+
+The implementation fuses the N^3 channel-wise contraction in Triton:
+for each batch b and hidden channel h, it computes
+  out[b, i, j, h] = sum_k left[b, i, k, h] * right[b, j, k, h]
+using a tiled matmul over (i, j) and k.  LayerNorms, projections, sigmoid
+gates, and the final output projection use PyTorch kernels to keep the code
+robust across all requested dimensions while still moving the dominant
+TriMul contraction into Triton.
+"""
+
+import torch
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def _trimul_outgoing_kernel(
+    left,
+    right,
+    out,
+    total_tiles: tl.constexpr,
+    N: tl.constexpr,
+    H: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    pid = tl.program_id(0)
+
+    tiles_ij = tl.cdiv(N, BLOCK_M) * tl.cdiv(N, BLOCK_N)
+    bh = pid // tiles_ij
+    rem = pid - bh * tiles_ij
+
+    num_tiles_j = tl.cdiv(N, BLOCK_N)
+    tile_i = rem // num_tiles_j
+    tile_j = rem - tile_i * num_tiles_j
+
+    b = bh // H
+    h = bh - b * H
+
+    offs_i = tile_i * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_j = tile_j * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), tl.float32)
+
+    # left/right are contiguous [B, N, N, H].
+    base = b * N * N * H + h
+    for k0 in range(0, N, BLOCK_K):
+        k = k0 + offs_k
+
+        l_ptrs = left + base + (offs_i[:, None] * N + k[None, :]) * H
+        r_ptrs = right + base + (offs_j[None, :] * N + k[:, None]) * H
+
+        l = tl.load(l_ptrs, mask=(offs_i[:, None] < N) & (k[None, :] < N), other=0.0)
+        r = tl.load(r_ptrs, mask=(k[:, None] < N) & (offs_j[None, :] < N), other=0.0)
+
+        acc += tl.dot(l, r, input_precision="tf32")
+
+    o_ptrs = out + base + (offs_i[:, None] * N + offs_j[None, :]) * H
+    tl.store(o_ptrs, acc, mask=(offs_i[:, None] < N) & (offs_j[None, :] < N))
+
+
+def _ln(x, weight, bias, eps=1e-5):
+    return torch.nn.functional.layer_norm(x, (x.shape[-1],), weight, bias, eps)
+
+
+def custom_kernel(data):
+    input_tensor, mask, weights, config = data
+    x = input_tensor
+    B, N, _, D = x.shape
+    H = int(config["hidden_dim"])
+
+    norm_weight = weights["norm.weight"]
+    norm_bias = weights["norm.bias"]
+    left_proj_weight = weights["left_proj.weight"]
+    right_proj_weight = weights["right_proj.weight"]
+    left_gate_weight = weights["left_gate.weight"]
+    right_gate_weight = weights["right_gate.weight"]
+    out_gate_weight = weights["out_gate.weight"]
+    to_out_norm_weight = weights["to_out_norm.weight"]
+    to_out_norm_bias = weights["to_out_norm.bias"]
+    to_out_weight = weights["to_out.weight"]
+
+    x = x.contiguous()
+    x_norm = _ln(x, norm_weight, norm_bias)
+
+    flat = x_norm.reshape(-1, D)
+
+    left = torch.matmul(flat, left_proj_weight.t()).reshape(B, N, N, H)
+    right = torch.matmul(flat, right_proj_weight.t()).reshape(B, N, N, H)
+
+    if not bool(config.get("nomask", False)):
+        m = mask.to(dtype=left.dtype).unsqueeze(-1)
+        left = left * m
+        right = right * m
+
+    left_gate = torch.sigmoid(torch.matmul(flat, left_gate_weight.t())).reshape(B, N, N, H)
+    right_gate = torch.sigmoid(torch.matmul(flat, right_gate_weight.t())).reshape(B, N, N, H)
+    out_gate = torch.sigmoid(torch.matmul(flat, out_gate_weight.t())).reshape(B, N, N, H)
+
+    left = (left * left_gate).contiguous()
+    right = (right * right_gate).contiguous()
+
+    tri = torch.empty((B, N, N, H), device=x.device, dtype=torch.float32)
+
+    if N >= 768:
+        block_m = 16
+        block_n = 16
+        block_k = 32
+        warps = 4
+    else:
+        block_m = 16
+        block_n = 16
+        block_k = 32
+        warps = 4
+
+    grid = (B * H * triton.cdiv(N, block_m) * triton.cdiv(N, block_n),)
+    _trimul_outgoing_kernel[grid](
+        left,
+        right,
+        tri,
+        grid[0],
+        N,
+        H,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        BLOCK_K=block_k,
+        num_warps=warps,
+        num_stages=3,
+    )
+
+    tri = _ln(tri, to_out_norm_weight, to_out_norm_bias)
+    tri = tri * out_gate
+    out = torch.matmul(tri.reshape(-1, H), to_out_weight.t()).reshape(B, N, N, D)
+    return out.float()
+```

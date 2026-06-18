@@ -1,0 +1,171 @@
+```python
+"""
+Fused TriMul outgoing forward.
+
+The implementation fuses the input LayerNorm, projection, sigmoid gates, and mask
+application into Triton kernels producing left/right/out_gate in hidden channels.
+The N^3 outgoing multiplicative update is evaluated as batched GEMMs, one GEMM
+per hidden channel, using PyTorch/cuBLAS. A second Triton kernel fuses the output
+LayerNorm, output gate, and final projection back to dim, returning float32.
+"""
+
+import torch
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def _make_lr_gate_kernel(
+    x, mask,
+    w_l, w_r, w_lg, w_rg, w_og,
+    ln_w, ln_b,
+    left, right, ogate,
+    total: tl.constexpr, dim: tl.constexpr, has_mask: tl.constexpr,
+    BLOCK_D: tl.constexpr, H: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offs_d = tl.arange(0, BLOCK_D)
+    x_ptrs = x + pid * dim + offs_d
+    m = offs_d < dim
+
+    xv = tl.load(x_ptrs, mask=m, other=0.0).to(tl.float32)
+    mean = tl.sum(xv, axis=0) / dim
+    xc = tl.where(m, xv - mean, 0.0)
+    var = tl.sum(xc * xc, axis=0) / dim
+    xn = xc * tl.rsqrt(var + 1.0e-5)
+
+    lw = tl.load(ln_w + offs_d, mask=m, other=0.0).to(tl.float32)
+    lb = tl.load(ln_b + offs_d, mask=m, other=0.0).to(tl.float32)
+    xn = tl.where(m, xn * lw + lb, 0.0)
+
+    offs_h = tl.arange(0, H)
+    acc_l = tl.zeros((H,), tl.float32)
+    acc_r = tl.zeros((H,), tl.float32)
+    acc_lg = tl.zeros((H,), tl.float32)
+    acc_rg = tl.zeros((H,), tl.float32)
+    acc_og = tl.zeros((H,), tl.float32)
+
+    for d0 in range(0, BLOCK_D):
+        xd = tl.load(x + pid * dim + d0).to(tl.float32)
+        # Recompute normalized scalar from vector values to avoid illegal scalar indexing
+        wd = tl.load(ln_w + d0).to(tl.float32)
+        bd = tl.load(ln_b + d0).to(tl.float32)
+        nd = (xd - mean) * tl.rsqrt(var + 1.0e-5) * wd + bd
+
+        acc_l += nd * tl.load(w_l + offs_h * dim + d0).to(tl.float32)
+        acc_r += nd * tl.load(w_r + offs_h * dim + d0).to(tl.float32)
+        acc_lg += nd * tl.load(w_lg + offs_h * dim + d0).to(tl.float32)
+        acc_rg += nd * tl.load(w_rg + offs_h * dim + d0).to(tl.float32)
+        acc_og += nd * tl.load(w_og + offs_h * dim + d0).to(tl.float32)
+
+    gate_l = 1.0 / (1.0 + tl.exp(-acc_lg))
+    gate_r = 1.0 / (1.0 + tl.exp(-acc_rg))
+    gate_o = 1.0 / (1.0 + tl.exp(-acc_og))
+
+    mv = 1.0
+    if has_mask:
+        mv = tl.load(mask + pid).to(tl.float32)
+
+    base = pid * H + offs_h
+    tl.store(left + base, (acc_l * gate_l * mv).to(tl.float16))
+    tl.store(right + base, (acc_r * gate_r * mv).to(tl.float16))
+    tl.store(ogate + base, gate_o.to(tl.float16))
+
+
+@triton.jit
+def _out_norm_project_kernel(
+    tri, ogate,
+    out_w, ln_w, ln_b,
+    y,
+    total: tl.constexpr, dim: tl.constexpr,
+    H: tl.constexpr, BLOCK_DIM: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offs_h = tl.arange(0, H)
+
+    v = tl.load(tri + pid * H + offs_h).to(tl.float32)
+    mean = tl.sum(v, axis=0) / H
+    vc = v - mean
+    var = tl.sum(vc * vc, axis=0) / H
+
+    nw = tl.load(ln_w + offs_h).to(tl.float32)
+    nb = tl.load(ln_b + offs_h).to(tl.float32)
+    g = tl.load(ogate + pid * H + offs_h).to(tl.float32)
+    z = (vc * tl.rsqrt(var + 1.0e-5) * nw + nb) * g
+
+    offs_o = tl.arange(0, BLOCK_DIM)
+    mask_o = offs_o < dim
+    acc = tl.zeros((BLOCK_DIM,), tl.float32)
+
+    for h in range(0, H):
+        zh = tl.load(tri + pid * H + h).to(tl.float32)
+        zh = (zh - mean) * tl.rsqrt(var + 1.0e-5)
+        zh = zh * tl.load(ln_w + h).to(tl.float32) + tl.load(ln_b + h).to(tl.float32)
+        zh = zh * tl.load(ogate + pid * H + h).to(tl.float32)
+        acc += zh * tl.load(out_w + offs_o * H + h, mask=mask_o, other=0.0).to(tl.float32)
+
+    tl.store(y + pid * dim + offs_o, acc, mask=mask_o)
+
+
+def _ceil_power_of_2(x: int) -> int:
+    return 1 << (x - 1).bit_length()
+
+
+def custom_kernel(data):
+    input_tensor, mask, weights, config = data
+    dim = int(config["dim"])
+    hidden_dim = int(config["hidden_dim"])
+
+    x = input_tensor.contiguous()
+    B, N, _, _ = x.shape
+    total_pairs = B * N * N
+
+    norm_weight = weights["norm.weight"].contiguous()
+    norm_bias = weights["norm.bias"].contiguous()
+    left_proj_weight = weights["left_proj.weight"].contiguous()
+    right_proj_weight = weights["right_proj.weight"].contiguous()
+    left_gate_weight = weights["left_gate.weight"].contiguous()
+    right_gate_weight = weights["right_gate.weight"].contiguous()
+    out_gate_weight = weights["out_gate.weight"].contiguous()
+    to_out_norm_weight = weights["to_out_norm.weight"].contiguous()
+    to_out_norm_bias = weights["to_out_norm.bias"].contiguous()
+    to_out_weight = weights["to_out.weight"].contiguous()
+
+    left = torch.empty((total_pairs, hidden_dim), device=x.device, dtype=torch.float16)
+    right = torch.empty_like(left)
+    out_gate = torch.empty_like(left)
+
+    has_mask = mask is not None
+    if has_mask:
+        mask_c = mask.contiguous()
+    else:
+        mask_c = torch.empty((1,), device=x.device, dtype=x.dtype)
+
+    block_d = _ceil_power_of_2(dim)
+    _make_lr_gate_kernel[(total_pairs,)](
+        x, mask_c,
+        left_proj_weight, right_proj_weight, left_gate_weight, right_gate_weight, out_gate_weight,
+        norm_weight, norm_bias,
+        left, right, out_gate,
+        total_pairs, dim, has_mask,
+        BLOCK_D=block_d, H=hidden_dim,
+        num_warps=8,
+    )
+
+    left5 = left.view(B, N, N, hidden_dim).permute(0, 3, 1, 2).reshape(B * hidden_dim, N, N)
+    right5 = right.view(B, N, N, hidden_dim).permute(0, 3, 2, 1).reshape(B * hidden_dim, N, N)
+    tri = torch.bmm(left5, right5).reshape(B, hidden_dim, N, N).permute(0, 2, 3, 1).contiguous()
+
+    out = torch.empty((total_pairs, dim), device=x.device, dtype=torch.float32)
+    block_out = _ceil_power_of_2(dim)
+    _out_norm_project_kernel[(total_pairs,)](
+        tri, out_gate,
+        to_out_weight, to_out_norm_weight, to_out_norm_bias,
+        out,
+        total_pairs, dim,
+        H=hidden_dim, BLOCK_DIM=block_out,
+        num_warps=8,
+    )
+
+    return out.view(B, N, N, dim)
+```

@@ -1,0 +1,123 @@
+```python
+"""TriMul outgoing forward: use PyTorch for LayerNorm/projection and cuBLAS batched GEMM for the N^3 contraction, with a Triton kernel fusing projection splitting, sigmoid gates, mask application, and layout conversion."""
+
+import torch
+import torch.nn.functional as F
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def _split_gate_mask_kernel(
+    proj_ptr,
+    mask_ptr,
+    left_ptr,
+    right_ptr,
+    out_gate_ptr,
+    TOTAL: tl.constexpr,
+    N2: tl.constexpr,
+    H: tl.constexpr,
+    USE_MASK: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    valid = offs < TOTAL
+
+    h = offs % H
+    row = offs // H
+    base = row * (5 * H) + h
+
+    lp = tl.load(proj_ptr + base, mask=valid, other=0.0).to(tl.float32)
+    rp = tl.load(proj_ptr + base + H, mask=valid, other=0.0).to(tl.float32)
+    lg = tl.load(proj_ptr + base + 2 * H, mask=valid, other=0.0).to(tl.float32)
+    rg = tl.load(proj_ptr + base + 3 * H, mask=valid, other=0.0).to(tl.float32)
+    og = tl.load(proj_ptr + base + 4 * H, mask=valid, other=0.0).to(tl.float32)
+
+    if USE_MASK:
+        m = tl.load(mask_ptr + row, mask=valid, other=0.0).to(tl.float32)
+    else:
+        m = 1.0
+
+    b = row // N2
+    ij = row - b * N2
+    mat_off = (b * H + h) * N2 + ij
+
+    tl.store(left_ptr + mat_off, lp * tl.sigmoid(lg) * m, mask=valid)
+    tl.store(right_ptr + mat_off, rp * tl.sigmoid(rg) * m, mask=valid)
+    tl.store(out_gate_ptr + row * H + h, tl.sigmoid(og), mask=valid)
+
+
+def custom_kernel(data):
+    input_tensor, mask, weights, config = data
+
+    dim = int(config["dim"])
+    hidden_dim = int(config["hidden_dim"])
+    eps = float(config.get("eps", 1.0e-5))
+
+    norm_weight = weights["norm.weight"]
+    norm_bias = weights["norm.bias"]
+    left_proj_weight = weights["left_proj.weight"]
+    right_proj_weight = weights["right_proj.weight"]
+    left_gate_weight = weights["left_gate.weight"]
+    right_gate_weight = weights["right_gate.weight"]
+    out_gate_weight = weights["out_gate.weight"]
+    to_out_norm_weight = weights["to_out_norm.weight"]
+    to_out_norm_bias = weights["to_out_norm.bias"]
+    to_out_weight = weights["to_out.weight"]
+
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+
+    with torch.no_grad():
+        x = input_tensor if input_tensor.dtype == torch.float32 else input_tensor.float()
+        bs, seq_len, _, _ = x.shape
+        rows = bs * seq_len * seq_len
+        n2 = seq_len * seq_len
+
+        x = F.layer_norm(x, (dim,), norm_weight, norm_bias, eps)
+
+        proj_weight = torch.cat(
+            (
+                left_proj_weight,
+                right_proj_weight,
+                left_gate_weight,
+                right_gate_weight,
+                out_gate_weight,
+            ),
+            dim=0,
+        )
+        proj = F.linear(x, proj_weight).contiguous()
+
+        left = torch.empty((bs * hidden_dim, seq_len, seq_len), device=x.device, dtype=proj.dtype)
+        right = torch.empty_like(left)
+        out_gate = torch.empty((bs, seq_len, seq_len, hidden_dim), device=x.device, dtype=proj.dtype)
+
+        use_mask = (mask is not None) and (not bool(config.get("nomask", False)))
+        mask_arg = mask.contiguous() if use_mask else input_tensor
+
+        total = rows * hidden_dim
+        block = 256
+        _split_gate_mask_kernel[(triton.cdiv(total, block),)](
+            proj,
+            mask_arg,
+            left,
+            right,
+            out_gate,
+            TOTAL=total,
+            N2=n2,
+            H=hidden_dim,
+            USE_MASK=use_mask,
+            BLOCK=block,
+            num_warps=4,
+        )
+
+        tri = torch.bmm(left, right.transpose(1, 2))
+        tri = tri.view(bs, hidden_dim, seq_len, seq_len).permute(0, 2, 3, 1).contiguous()
+        tri = tri.view(rows, hidden_dim)
+
+        tri = F.layer_norm(tri, (hidden_dim,), to_out_norm_weight, to_out_norm_bias, eps)
+        tri.mul_(out_gate.view(rows, hidden_dim))
+
+        out = F.linear(tri, to_out_weight)
+        return out.view(bs, seq_len, seq_len, dim).float()
+```

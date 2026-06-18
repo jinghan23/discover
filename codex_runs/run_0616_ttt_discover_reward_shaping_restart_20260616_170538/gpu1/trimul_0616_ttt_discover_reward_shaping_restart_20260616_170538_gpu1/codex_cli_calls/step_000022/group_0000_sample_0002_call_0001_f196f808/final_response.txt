@@ -1,0 +1,126 @@
+```python
+"""
+TriMul outgoing forward pass.
+
+The implementation keeps the numerically sensitive LayerNorm and projection
+steps in PyTorch, then uses a Triton tiled batched GEMM kernel for the outgoing
+triangle multiplication:
+    out[b, h, i, j] = sum_k left[b, h, i, k] * right[b, h, j, k]
+The result is normalized, gated, projected back to dim, and returned as fp32.
+"""
+
+import torch
+import torch.nn.functional as F
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def _tri_mul_outgoing_kernel(
+    left,
+    right,
+    out,
+    N: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    pid_bh = tl.program_id(2)
+
+    offs_i = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_j = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    base = pid_bh * N * N
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), tl.float32)
+
+    for k0 in range(0, N, BLOCK_K):
+        k = k0 + offs_k
+
+        l_ptrs = left + base + offs_i[:, None] * N + k[None, :]
+        r_ptrs = right + base + offs_j[None, :] * N + k[:, None]
+
+        l = tl.load(l_ptrs, mask=(offs_i[:, None] < N) & (k[None, :] < N), other=0.0)
+        r = tl.load(r_ptrs, mask=(offs_j[None, :] < N) & (k[:, None] < N), other=0.0)
+
+        acc += tl.dot(l, r, input_precision="tf32")
+
+    o_ptrs = out + base + offs_i[:, None] * N + offs_j[None, :]
+    tl.store(o_ptrs, acc, mask=(offs_i[:, None] < N) & (offs_j[None, :] < N))
+
+
+def _triangle_mul(left, right, bs, n, h):
+    left_h = left.permute(0, 3, 1, 2).contiguous()
+    right_h = right.permute(0, 3, 1, 2).contiguous()
+    out_h = torch.empty((bs, h, n, n), device=left.device, dtype=torch.float32)
+
+    if n >= 512:
+        bm, bn, bk, warps = 16, 16, 64, 4
+    else:
+        bm, bn, bk, warps = 16, 32, 64, 4
+
+    grid = (triton.cdiv(n, bm), triton.cdiv(n, bn), bs * h)
+    _tri_mul_outgoing_kernel[grid](
+        left_h,
+        right_h,
+        out_h,
+        n,
+        BLOCK_M=bm,
+        BLOCK_N=bn,
+        BLOCK_K=bk,
+        num_warps=warps,
+        num_stages=3,
+    )
+
+    return out_h.permute(0, 2, 3, 1).contiguous()
+
+
+def custom_kernel(data):
+    input_tensor, mask, weights, config = data
+    dim = config["dim"]
+    hidden_dim = config["hidden_dim"]
+
+    x = input_tensor
+    bs, n, _, _ = x.shape
+
+    norm_weight = weights["norm.weight"]
+    norm_bias = weights["norm.bias"]
+    left_proj_weight = weights["left_proj.weight"]
+    right_proj_weight = weights["right_proj.weight"]
+    left_gate_weight = weights["left_gate.weight"]
+    right_gate_weight = weights["right_gate.weight"]
+    out_gate_weight = weights["out_gate.weight"]
+    to_out_norm_weight = weights["to_out_norm.weight"]
+    to_out_norm_bias = weights["to_out_norm.bias"]
+    to_out_weight = weights["to_out.weight"]
+
+    x = F.layer_norm(x, (dim,), norm_weight, norm_bias)
+
+    x2 = x.reshape(bs * n * n, dim)
+
+    left = F.linear(x2, left_proj_weight).reshape(bs, n, n, hidden_dim)
+    right = F.linear(x2, right_proj_weight).reshape(bs, n, n, hidden_dim)
+
+    if mask is not None:
+        m = mask.to(dtype=left.dtype).unsqueeze(-1)
+        left = left * m
+        right = right * m
+
+    left_gate = torch.sigmoid(F.linear(x2, left_gate_weight)).reshape(bs, n, n, hidden_dim)
+    right_gate = torch.sigmoid(F.linear(x2, right_gate_weight)).reshape(bs, n, n, hidden_dim)
+    out_gate = torch.sigmoid(F.linear(x2, out_gate_weight)).reshape(bs, n, n, hidden_dim)
+
+    left = left * left_gate
+    right = right * right_gate
+
+    out = _triangle_mul(left, right, bs, n, hidden_dim)
+
+    out = F.layer_norm(out, (hidden_dim,), to_out_norm_weight, to_out_norm_bias)
+    out = out * out_gate
+    out = F.linear(out.reshape(bs * n * n, hidden_dim), to_out_weight).reshape(bs, n, n, dim)
+
+    return out.float()
+```

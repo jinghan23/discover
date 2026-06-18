@@ -1,0 +1,192 @@
+```python
+"""
+TriMul outgoing forward pass using mixed PyTorch/Triton.
+
+Algorithm:
+1. Apply input LayerNorm with PyTorch.
+2. Compute the five input projections in one fused linear projection.
+3. Use a Triton kernel to apply sigmoid gates, optional mask, and pack left/right/out_gate
+   into channel-major layout for efficient batched GEMM.
+4. Compute the outgoing triangle product as B*H independent N x N GEMMs.
+5. Use a Triton kernel for hidden-dim LayerNorm + out_gate and store back in row-major layout.
+6. Apply the final output projection with PyTorch and return float32.
+"""
+
+import torch
+import torch.nn.functional as F
+import triton
+import triton.language as tl
+
+
+try:
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.set_float32_matmul_precision("high")
+except Exception:
+    pass
+
+
+_WCAT_CACHE = {}
+
+
+@triton.jit
+def _sigmoid(x):
+    return 1.0 / (1.0 + tl.exp(-x))
+
+
+@triton.jit
+def _pack_proj_kernel(
+    proj, mask, left, right, gate,
+    total: tl.constexpr,
+    N: tl.constexpr,
+    H: tl.constexpr,
+    HAS_MASK: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    valid = offs < total
+
+    nn = N * N
+    j = offs % N
+    i = (offs // N) % N
+    h = (offs // nn) % H
+    b = offs // (H * nn)
+
+    src = ((b * N + i) * N + j) * (5 * H) + h
+
+    lv = tl.load(proj + src, mask=valid, other=0.0).to(tl.float32)
+    rv = tl.load(proj + src + H, mask=valid, other=0.0).to(tl.float32)
+    lg = tl.load(proj + src + 2 * H, mask=valid, other=0.0).to(tl.float32)
+    rg = tl.load(proj + src + 3 * H, mask=valid, other=0.0).to(tl.float32)
+    og = tl.load(proj + src + 4 * H, mask=valid, other=0.0).to(tl.float32)
+
+    if HAS_MASK:
+        m = tl.load(mask + (b * N + i) * N + j, mask=valid, other=0.0).to(tl.float32)
+    else:
+        m = 1.0
+
+    tl.store(left + offs, lv * _sigmoid(lg) * m, mask=valid)
+    tl.store(right + offs, rv * _sigmoid(rg) * m, mask=valid)
+    tl.store(gate + offs, _sigmoid(og), mask=valid)
+
+
+@triton.jit
+def _final_norm_gate_kernel(
+    tri, gate, y, ln_w, ln_b,
+    rows: tl.constexpr,
+    N: tl.constexpr,
+    H: tl.constexpr,
+    EPS: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    row = tl.program_id(0)
+    h = tl.arange(0, BLOCK_H)
+    mask_h = h < H
+
+    nn = N * N
+    j = row % N
+    i = (row // N) % N
+    b = row // nn
+
+    bh_base = b * H * nn + h * nn + i * N + j
+    vals = tl.load(tri + bh_base, mask=mask_h, other=0.0).to(tl.float32)
+
+    mean = tl.sum(vals, axis=0) / H
+    diff = vals - mean
+    var = tl.sum(diff * diff, axis=0) / H
+    inv = tl.rsqrt(var + EPS)
+
+    gw = tl.load(ln_w + h, mask=mask_h, other=0.0).to(tl.float32)
+    gb = tl.load(ln_b + h, mask=mask_h, other=0.0).to(tl.float32)
+    og = tl.load(gate + bh_base, mask=mask_h, other=0.0).to(tl.float32)
+
+    out = (diff * inv * gw + gb) * og
+    tl.store(y + row * H + h, out, mask=mask_h)
+
+
+def _get_wcat(weights, dtype):
+    ws = (
+        weights["left_proj.weight"],
+        weights["right_proj.weight"],
+        weights["left_gate.weight"],
+        weights["right_gate.weight"],
+        weights["out_gate.weight"],
+    )
+    key = tuple((int(w.data_ptr()), tuple(w.shape), str(w.dtype), str(w.device)) for w in ws) + (str(dtype),)
+    cached = _WCAT_CACHE.get(key)
+    if cached is not None:
+        return cached
+    wcat = torch.cat(ws, dim=0).contiguous()
+    if wcat.dtype is not dtype:
+        wcat = wcat.to(dtype)
+    _WCAT_CACHE[key] = wcat
+    return wcat
+
+
+def custom_kernel(data):
+    input_tensor, mask, weights, config = data
+    B, N, _, D = input_tensor.shape
+    H = int(config["hidden_dim"])
+
+    with torch.no_grad():
+        x = F.layer_norm(
+            input_tensor,
+            (D,),
+            weights["norm.weight"],
+            weights["norm.bias"],
+            eps=1e-5,
+        )
+
+        proj_dtype = torch.float16
+        wcat = _get_wcat(weights, proj_dtype)
+        proj = F.linear(x.to(proj_dtype), wcat).contiguous()
+        del x
+
+        total = B * H * N * N
+        left = torch.empty((B * H, N, N), device=input_tensor.device, dtype=proj_dtype)
+        right = torch.empty_like(left)
+        gate = torch.empty_like(left)
+
+        nomask = bool(config.get("nomask", False)) or mask is None
+        if not nomask and not mask.is_contiguous():
+            mask = mask.contiguous()
+
+        block = 256
+        grid = (triton.cdiv(total, block),)
+        _pack_proj_kernel[grid](
+            proj,
+            mask if mask is not None else input_tensor,
+            left,
+            right,
+            gate,
+            total,
+            N,
+            H,
+            not nomask,
+            BLOCK=block,
+            num_warps=4,
+        )
+        del proj
+
+        tri = torch.bmm(left, right.transpose(1, 2))
+        del left, right
+
+        y = torch.empty((B, N, N, H), device=input_tensor.device, dtype=torch.float32)
+        _final_norm_gate_kernel[(B * N * N,)](
+            tri,
+            gate,
+            y,
+            weights["to_out_norm.weight"],
+            weights["to_out_norm.bias"],
+            B * N * N,
+            N,
+            H,
+            1e-5,
+            BLOCK_H=128,
+            num_warps=4,
+        )
+        del tri, gate
+
+        out = F.linear(y, weights["to_out.weight"])
+        return out.float()
+```

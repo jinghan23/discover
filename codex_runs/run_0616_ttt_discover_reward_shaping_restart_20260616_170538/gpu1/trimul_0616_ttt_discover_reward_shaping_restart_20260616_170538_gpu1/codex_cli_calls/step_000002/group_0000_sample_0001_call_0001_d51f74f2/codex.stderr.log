@@ -1,0 +1,518 @@
+OpenAI Codex v0.139.0
+--------
+workdir: /opt/tiger/discover-gpu-kernel-experiments
+model: gpt-5.5
+provider: openai
+approval: never
+sandbox: read-only
+reasoning effort: xhigh
+reasoning summaries: none
+session id: 019ecfdc-bc06-7c32-a8f4-c524eb720a2b
+--------
+user
+You are an expert Triton engineer tasked with translating PyTorch code into highly optimized Triton kernel code.
+
+You will be implementing a Triangle Multiplicative Update (TriMul) module that is a core operation
+for AlphaFold3, Chai, Protenix, and other protein structure prediction models in BioML.
+
+The TriMul operator operates over a 4D tensor of shape [B, N, N, C]. 
+
+Your task:
+- Implement the "outgoing" version of the TriMul operator from the AlphaFold3 paper.
+- You will not have to compute or store gradients for this version. You will only need to implement the forward pass.
+
+Your function should be defined as `custom_kernel(data)`.
+Input:
+- `data`: Tuple of (input_tensor: torch.Tensor, mask: torch.Tensor, weights: Dict[str, torch.Tensor], config: Dict)
+    - input_tensor: Input tensor of shape [bs, seq_len, seq_len, dim]
+    - mask: Mask tensor of shape [bs, seq_len, seq_len]
+    - weights: Dictionary containing model weights
+    - config: Dictionary containing model configuration parameters
+
+Output:
+- output: Processed tensor [bs, seq_len, seq_len, dim]
+
+**Problem Constraints:**
+- B ∈ {1,2}, N ∈ {128,256,512,1024}, c ∈ {128}, c_z ∈ {128,384,768}
+- The input distribution will be sampled from a standard Normal distribution, or a heavy-tailed Cauchy distribution (gamma = 2).
+- There will either be no mask, or a randomly sampled mask over the inputs.
+
+**Remarks.** So why is this problem so annoying? Because you have to choose whether to load / deal with either the channel dimensions c,c_z that the LayerNorms require (otherwise you have to do a synchronize to compute the statistics like mean / variance) or the sequence dimension N. 
+The sequence dimension is particularly annoying because it's quite large, but also because we compute pair-wise operations at the last operation that sum over another sequence dimension (this is N^3!). 
+However, I really like this kernel because it only consists of “simple” operations, and is really easy to understand. It is a true test of “fusions” that torch.compile() doesn't do that well.
+
+Here is a pytorch implementation of the TriMul module. You will want to implement a kernel for the operations in the forward call:
+
+```python
+import torch
+from torch import nn, einsum
+import math
+
+# Reference code in PyTorch
+class TriMul(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        hidden_dim: int,
+    ):
+        super().__init__()
+
+        self.norm = nn.LayerNorm(dim)
+
+        self.left_proj = nn.Linear(dim, hidden_dim, bias=False)
+        self.right_proj = nn.Linear(dim, hidden_dim, bias=False)
+
+        self.left_gate = nn.Linear(dim, hidden_dim, bias=False)
+        self.right_gate = nn.Linear(dim, hidden_dim, bias=False)
+        self.out_gate = nn.Linear(dim, hidden_dim, bias=False)
+
+        self.to_out_norm = nn.LayerNorm(hidden_dim)
+        self.to_out = nn.Linear(hidden_dim, dim, bias=False)
+
+    def forward(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        """
+        x: [bs, seq_len, seq_len, dim]
+        mask: [bs, seq_len, seq_len]
+
+        Returns:
+            output: [bs, seq_len, seq_len, dim]
+        """
+        batch_size, seq_len, _, dim = x.shape
+
+        x = self.norm(x)
+
+        left = self.left_proj(x)
+        right = self.right_proj(x)
+
+        mask = mask.unsqueeze(-1)
+        left = left * mask
+        right = right * mask
+
+        left_gate = self.left_gate(x).sigmoid()
+        right_gate = self.right_gate(x).sigmoid()
+        out_gate = self.out_gate(x).sigmoid()
+
+        left = left * left_gate
+        right = right * right_gate
+
+        out = einsum('... i k d, ... j k d -> ... i j d', left, right)
+        # This einsum is the same as the following:
+        # out = torch.zeros(batch_size, seq_len, seq_len, dim, device=x.device)
+        
+        # # Compute using nested loops
+        # for b in range(batch_size):
+        #     for i in range(seq_len):
+        #         for j in range(seq_len):
+        #             # Compute each output element
+        #             for k in range(seq_len):
+        #                 out[b, i, j] += left[b, i, k, :] * right[b, j, k, :]
+
+        out = self.to_out_norm(out)
+        out = out * out_gate
+        return self.to_out(out)
+```
+
+Here is some example skeleton code of the entrypoint function you will create:
+```python
+def custom_kernel(data):
+    input_tensor, mask, weights, config = data
+    dim, hidden_dim = config["dim"], config["hidden_dim"]
+
+    # Access the given weights of the model
+    norm_weight = weights["norm.weight"]
+    norm_bias = weights["norm.bias"]
+    left_proj_weight = weights["left_proj.weight"]
+    right_proj_weight = weights["right_proj.weight"]
+    left_gate_weight = weights["left_gate.weight"]
+    right_gate_weight = weights["right_gate.weight"]
+    out_gate_weight = weights["out_gate.weight"]
+    to_out_norm_weight = weights["to_out_norm.weight"]
+    to_out_norm_bias = weights["to_out_norm.bias"]
+    to_out_weight = weights["to_out.weight"]
+
+    # Perform TriMul
+
+    return out
+```
+
+To help you understand which triton version we are using, here is some example triton code for an unrelated task:
+```python
+import triton
+import triton.language as tl
+
+@triton.jit
+def matmul_persistent_ws_kernel(
+   a_ptr, b_ptr, c_ptr, M, N, K,
+   stride_am, stride_ak, stride_bk, stride_bn, stride_cm, stride_cn,
+   BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+   pid = tl.program_id(axis=0) # async_task 0, 1, 2
+   num_pid_m = tl.cdiv(M, BLOCK_M) # async_task 0, 1, 2
+   num_pid_n = tl.cdiv(N, BLOCK_N) # async_task 0, 1, 2
+   pid_m = pid // num_pid_m # async_task 0, 1, 2
+   pid_n = pid % num_pid_n # async_task 0, 1, 2
+   offs_m_1 = pid_m * BLOCK_M + tl.arange(0, BLOCK_M // 2) # async_task 0, 1, 2
+   offs_m_2 = pid_m * BLOCK_M + tl.arange(BLOCK_M // 2, BLOCK_M) # async_task 0, 1, 2
+   offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_N) # async_task 0, 1, 2
+   offs_k = tl.arange(0, BLOCK_K) # async_task 0
+   a_ptrs_1 = a_ptr + (offs_m_1[:, None] * stride_am + offs_k[None, :] * stride_ak) # async_task 0
+   a_ptrs_2 = a_ptr + (offs_m_2[:, None] * stride_am + offs_k[None, :] * stride_ak) # async_task 0
+   b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn) # async_task 0
+   acc_1 = tl.zeros((BLOCK_M // 2, BLOCK_N), dtype=tl.float32) # async_task 1
+   acc_1 = tl.zeros((BLOCK_M // 2, BLOCK_N), dtype=tl.float32) # async_task 2
+   for k in range(0, tl.cdiv(K, BLOCK_K)): # async_task 0, 1, 2
+       a_1 = tl.load(a_ptrs_1)   # async_task 0
+       a_2 = tl.load(a_ptrs_2)   # async_task 0
+       b = tl.load(b_ptrs)   # async_task 0
+       acc_1 += tl.dot(a_1, b)   # async_task 1
+       acc_2 += tl.dot(a_2, b)   # async_task 2
+       a_ptrs_1 += BLOCK_K * stride_ak # async_task 0
+       a_ptrs_2 += BLOCK_K * stride_ak # async_task 0
+       b_ptrs += BLOCK_K * stride_bk # async_task 0
+   c_1 = acc_1.to(tl.float16) # async_task 1
+   c_2 = acc_2.to(tl.float16) # async_task 2
+   c_ptrs_1 = c_ptr_1 + stride_cm * offs_m_1[:, None] + stride_cn * offs_n[None, :] # async_task 1
+   c_ptrs_2 = c_ptr_2 + stride_cm * offs_m_2[:, None] + stride_cn * offs_n[None, :] # async_task 2
+   tl.store(c_ptrs_1, c_1) # async_task 1
+   tl.store(c_ptrs_2, c_2) # async_task 2
+```
+
+A few general triton tips:
+- tl.arange only takes in constexpr arguments (static or tl.constexpr)
+- You cannot use continue in your kernel code
+- tl.dot can only take in two input tensors
+- There is no tl.mean
+
+Here are the different configs that your kernel will be tested on ("nomask" sets whether there will be no mask, or a randomly sampled mask over the inputs):
+
+Test Cases for correctness and runtime (optimize runtime for these):
+  - {"seqlen": 256, "bs": 2, "dim": 128, "hidden_dim": 128, "nomask": True, "distribution": "normal"}
+  - {"seqlen": 768, "bs": 1, "dim": 128, "hidden_dim": 128, "nomask": True, "distribution": "cauchy"}
+  - {"seqlen": 256, "bs": 2, "dim": 384, "hidden_dim": 128, "nomask": False, "distribution": "normal"}
+  - {"seqlen": 512, "bs": 1, "dim": 128, "hidden_dim": 128, "nomask": True, "distribution": "normal"}
+  - {"seqlen": 1024, "bs": 1, "dim": 128, "hidden_dim": 128, "nomask": True, "distribution": "cauchy"}
+  - {"seqlen": 768, "bs": 1, "dim": 384, "hidden_dim": 128, "nomask": False, "distribution": "normal"}
+  - {"seqlen": 1024, "bs": 1, "dim": 384, "hidden_dim": 128, "nomask": True, "distribution": "normal"}
+
+
+You are iteratively optimizing runtime (microseconds).
+Here is the last code we ran:
+```python
+"""
+TriMul outgoing forward pass.
+
+Algorithm:
+1. Layer-normalize the pair tensor with PyTorch.
+2. Compute the five input projections with torch.mm/addmm-style dense kernels.
+3. Apply sigmoid gates and optional mask.
+4. Use a Triton kernel for the dominant outgoing triangle multiplication:
+      out[b, i, j, h] = sum_k left[b, i, k, h] * right[b, j, k, h]
+   The kernel maps each hidden channel to a separate batched GEMM over (i, j).
+5. Apply output LayerNorm, output gate, and final projection.
+"""
+
+import torch
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def _trimul_outgoing_kernel(
+    left,
+    right,
+    out,
+    total_tiles: tl.constexpr,
+    N: tl.constexpr,
+    H: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    pid = tl.program_id(0)
+
+    num_j_tiles = tl.cdiv(N, BLOCK_N)
+    num_i_tiles = tl.cdiv(N, BLOCK_M)
+    tiles_per_bh = num_i_tiles * num_j_tiles
+
+    bh = pid // tiles_per_bh
+    tile = pid - bh * tiles_per_bh
+
+    tile_i = tile // num_j_tiles
+    tile_j = tile - tile_i * num_j_tiles
+
+    b = bh // H
+    h = bh - b * H
+
+    offs_i = tile_i * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_j = tile_j * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # left  layout: [B, N, N, H], left[b, i, k, h]
+    # right layout: [B, N, N, H], right[b, j, k, h]
+    base = b * N * N * H + h
+
+    for k0 in range(0, N, BLOCK_K):
+        k = k0 + offs_k
+
+        l_ptrs = left + base + (offs_i[:, None] * N * H + k[None, :] * H)
+        r_ptrs = right + base + (offs_j[None, :] * N * H + k[:, None] * H)
+
+        l = tl.load(l_ptrs, mask=(offs_i[:, None] < N) & (k[None, :] < N), other=0.0)
+        r = tl.load(r_ptrs, mask=(offs_j[None, :] < N) & (k[:, None] < N), other=0.0)
+
+        acc += tl.dot(l, r, input_precision="tf32")
+
+    o_ptrs = out + base + (offs_i[:, None] * N * H + offs_j[None, :] * H)
+    tl.store(o_ptrs, acc, mask=(offs_i[:, None] < N) & (offs_j[None, :] < N))
+
+
+def _layer_norm(x, weight, bias, eps=1e-5):
+    xf = x.float()
+    mean = xf.mean(dim=-1, keepdim=True)
+    var = (xf - mean).pow(2).mean(dim=-1, keepdim=True)
+    y = (xf - mean) * torch.rsqrt(var + eps)
+    return y * weight + bias
+
+
+def custom_kernel(data):
+    input_tensor, mask, weights, config = data
+    dim = int(config["dim"])
+    hidden_dim = int(config["hidden_dim"])
+
+    norm_weight = weights["norm.weight"]
+    norm_bias = weights["norm.bias"]
+    left_proj_weight = weights["left_proj.weight"]
+    right_proj_weight = weights["right_proj.weight"]
+    left_gate_weight = weights["left_gate.weight"]
+    right_gate_weight = weights["right_gate.weight"]
+    out_gate_weight = weights["out_gate.weight"]
+    to_out_norm_weight = weights["to_out_norm.weight"]
+    to_out_norm_bias = weights["to_out_norm.bias"]
+    to_out_weight = weights["to_out.weight"]
+
+    B, N, _, _ = input_tensor.shape
+
+    x = _layer_norm(input_tensor, norm_weight, norm_bias)
+    x2 = x.reshape(B * N * N, dim)
+
+    left = torch.matmul(x2, left_proj_weight.t()).reshape(B, N, N, hidden_dim)
+    right = torch.matmul(x2, right_proj_weight.t()).reshape(B, N, N, hidden_dim)
+
+    left_gate = torch.sigmoid(torch.matmul(x2, left_gate_weight.t())).reshape(B, N, N, hidden_dim)
+    right_gate = torch.sigmoid(torch.matmul(x2, right_gate_weight.t())).reshape(B, N, N, hidden_dim)
+    out_gate = torch.sigmoid(torch.matmul(x2, out_gate_weight.t())).reshape(B, N, N, hidden_dim)
+
+    left = left * left_gate
+    right = right * right_gate
+
+    if mask is not None:
+        left = left * mask.unsqueeze(-1)
+        right = right * mask.unsqueeze(-1)
+
+    tri = torch.empty((B, N, N, hidden_dim), device=input_tensor.device, dtype=torch.float32)
+
+    block = 16 if N >= 768 else 32
+    grid = (B * hidden_dim * triton.cdiv(N, block) * triton.cdiv(N, block),)
+
+    _trimul_outgoing_kernel[grid](
+        left,
+        right,
+        tri,
+        grid[0],
+        N,
+        hidden_dim,
+        BLOCK_M=block,
+        BLOCK_N=block,
+        BLOCK_K=32,
+        num_warps=4,
+        num_stages=4,
+    )
+
+    tri = _layer_norm(tri, to_out_norm_weight, to_out_norm_bias)
+    tri = tri * out_gate.float()
+    out = torch.matmul(tri.reshape(B * N * N, hidden_dim), to_out_weight.t())
+    return out.reshape(B, N, N, dim).float()
+```
+Current runtime (microseconds) (lower is better): -95786.455417
+Target: 1000.0. Current gap: -96786.455417. Further improvements will also be generously rewarded.
+
+--- Previous Program Output ---
+--- test ---
+passed=True success=True exit_code=0
+stdout:
+
+stderr:
+
+
+--- leaderboard ---
+passed=True success=True exit_code=0
+stdout:
+
+stderr:
+--- End Output ---
+
+Rules:
+- The tensor arguments passed in will already be on your CUDA device.
+- Define all of your code in one final ```python ``` block.
+- We will test correctness on multiple input shapes; support all potential test cases.
+- You are allowed to use mixed precision computations, but make sure your final output is float32.
+- You must use Triton 3.3.1. These kernels will be run on an A800/A100-class NVIDIA GPU (Ampere SM80, CUDA arch 8.0; A800-SXM4-80GB target). Do not use Hopper/SM90-only features such as TMA, WGMMA, or FP8-only paths.
+- You do not have to implement everything in Triton; PyTorch helper operations are allowed. However, implement at least part of the computation in a kernel.
+- Include a short docstring at the top summarizing your algorithm.
+
+
+Return only the final answer content. Do not edit files or run tools.
+warning: Codex could not find bubblewrap on PATH. Install bubblewrap with your OS package manager. See the sandbox prerequisites: https://developers.openai.com/codex/concepts/sandboxing#prerequisites. Codex will use the bundled bubblewrap in the meantime.
+codex
+Using the existing mixed PyTorch/Triton structure since the last run already passed and the user asked for final code only.
+codex
+```python
+"""
+TriMul outgoing forward pass.
+
+Uses fused PyTorch dense kernels for layer norm and projections, a Triton kernel to
+split the packed projections, apply sigmoid gates, optional mask, and write
+left/right tensors directly in batched-GEMM layout. The triangle multiplication is
+then computed with strided batched GEMM, followed by output LayerNorm, output gate,
+and final projection.
+"""
+
+import torch
+import torch.nn.functional as F
+import triton
+import triton.language as tl
+
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+
+
+@triton.jit
+def _split_gate_kernel(
+    proj,
+    mask,
+    left_bh,
+    right_bh,
+    out_gate,
+    TOTAL_POS: tl.constexpr,
+    N2: tl.constexpr,
+    H: tl.constexpr,
+    HAS_MASK: tl.constexpr,
+    BLOCK_P: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    pid_p = tl.program_id(0)
+    pid_h = tl.program_id(1)
+
+    offs_p = pid_p * BLOCK_P + tl.arange(0, BLOCK_P)
+    offs_h = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
+
+    p = offs_p[:, None]
+    h = offs_h[None, :]
+    valid = (offs_p[:, None] < TOTAL_POS) & (offs_h[None, :] < H)
+
+    base = p * (5 * H) + h
+
+    m = tl.full((BLOCK_P, 1), 1.0, tl.float32)
+    if HAS_MASK:
+        m = tl.load(mask + offs_p, mask=offs_p < TOTAL_POS, other=0.0)[:, None].to(tl.float32)
+
+    l = tl.load(proj + base, mask=valid, other=0.0)
+    lg = tl.sigmoid(tl.load(proj + base + 2 * H, mask=valid, other=0.0))
+    l = l * lg * m
+
+    r = tl.load(proj + base + H, mask=valid, other=0.0)
+    rg = tl.sigmoid(tl.load(proj + base + 3 * H, mask=valid, other=0.0))
+    r = r * rg * m
+
+    og = tl.sigmoid(tl.load(proj + base + 4 * H, mask=valid, other=0.0))
+
+    b = offs_p // N2
+    pair = offs_p - b * N2
+
+    hp_h = offs_h[:, None]
+    hp_p = offs_p[None, :]
+    hp_valid = (offs_h[:, None] < H) & (offs_p[None, :] < TOTAL_POS)
+
+    bh_store = b[None, :] * (H * N2) + hp_h * N2 + pair[None, :]
+    gate_store = hp_p * H + hp_h
+
+    tl.store(left_bh + bh_store, tl.trans(l), mask=hp_valid)
+    tl.store(right_bh + bh_store, tl.trans(r), mask=hp_valid)
+    tl.store(out_gate + gate_store, tl.trans(og), mask=hp_valid)
+
+
+def custom_kernel(data):
+    input_tensor, mask, weights, config = data
+    dim = int(config["dim"])
+    hidden_dim = int(config["hidden_dim"])
+
+    B, N, _, _ = input_tensor.shape
+    total_pos = B * N * N
+    n2 = N * N
+
+    with torch.no_grad():
+        x = F.layer_norm(
+            input_tensor.float(),
+            (dim,),
+            weights["norm.weight"],
+            weights["norm.bias"],
+            1e-5,
+        )
+        x2 = x.reshape(total_pos, dim)
+
+        proj_weight = torch.cat(
+            (
+                weights["left_proj.weight"],
+                weights["right_proj.weight"],
+                weights["left_gate.weight"],
+                weights["right_gate.weight"],
+                weights["out_gate.weight"],
+            ),
+            dim=0,
+        )
+        proj = F.linear(x2, proj_weight)
+
+        left_bh = torch.empty((B * hidden_dim, N, N), device=input_tensor.device, dtype=proj.dtype)
+        right_bh = torch.empty_like(left_bh)
+        out_gate = torch.empty((B, N, N, hidden_dim), device=input_tensor.device, dtype=proj.dtype)
+
+        has_mask = (mask is not None) and (not bool(config.get("nomask", False)))
+        if has_mask and not mask.is_contiguous():
+            mask = mask.contiguous()
+        mask_ptr = mask if has_mask else input_tensor
+
+        grid = (triton.cdiv(total_pos, 32), triton.cdiv(hidden_dim, 32))
+        _split_gate_kernel[grid](
+            proj,
+            mask_ptr,
+            left_bh,
+            right_bh,
+            out_gate,
+            total_pos,
+            n2,
+            hidden_dim,
+            HAS_MASK=has_mask,
+            BLOCK_P=32,
+            BLOCK_H=32,
+            num_warps=4,
+        )
+
+        tri_bh = torch.bmm(left_bh, right_bh.transpose(1, 2))
+        tri = tri_bh.view(B, hidden_dim, N, N).permute(0, 2, 3, 1).contiguous()
+
+        tri = F.layer_norm(
+            tri,
+            (hidden_dim,),
+            weights["to_out_norm.weight"],
+            weights["to_out_norm.bias"],
+            1e-5,
+        )
+        tri.mul_(out_gate)
+
+        out = F.linear(tri.reshape(total_pos, hidden_dim), weights["to_out.weight"])
+        return out.reshape(B, N, N, dim).float()
+```
+tokens used
+14,319

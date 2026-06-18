@@ -1,0 +1,139 @@
+```python
+"""
+Fused TriMul forward: PyTorch handles the large tensor-core GEMMs while Triton fuses
+projection splitting, sigmoid gates, mask application, and layout conversion into
+channel-major buffers for the outgoing triangular product.
+"""
+import torch
+import torch.nn.functional as F
+import triton
+import triton.language as tl
+
+
+_WEIGHT_CACHE = {}
+
+
+@triton.jit
+def _split_gate_layout_kernel(
+    proj, mask, left, right, out_gate,
+    total: tl.constexpr, n: tl.constexpr, hdim: tl.constexpr,
+    NOMASK: tl.constexpr, BLOCK: tl.constexpr,
+):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    valid = offs < total
+
+    h = offs % hdim
+    m = offs // hdim
+    nn = n * n
+    b = m // nn
+    rem = m - b * nn
+    i = rem // n
+    j = rem - i * n
+
+    base = m * (hdim * 5) + h
+
+    l = tl.load(proj + base, mask=valid, other=0.0).to(tl.float32)
+    r = tl.load(proj + base + hdim, mask=valid, other=0.0).to(tl.float32)
+    lg = tl.load(proj + base + 2 * hdim, mask=valid, other=0.0).to(tl.float32)
+    rg = tl.load(proj + base + 3 * hdim, mask=valid, other=0.0).to(tl.float32)
+    og = tl.load(proj + base + 4 * hdim, mask=valid, other=0.0).to(tl.float32)
+
+    l = l * tl.sigmoid(lg)
+    r = r * tl.sigmoid(rg)
+    og = tl.sigmoid(og)
+
+    if not NOMASK:
+        mv = tl.load(mask + m, mask=valid, other=0.0).to(tl.float32)
+        l = l * mv
+        r = r * mv
+
+    ch_major = ((b * hdim + h) * n + i) * n + j
+    tl.store(left + ch_major, l, mask=valid)
+    tl.store(right + ch_major, r, mask=valid)
+
+    hg_last = m * hdim + h
+    tl.store(out_gate + hg_last, og, mask=valid)
+
+
+def _cached_weights(weights, dim, hidden_dim, dtype, device):
+    ptrs = (
+        weights["left_proj.weight"].data_ptr(),
+        weights["right_proj.weight"].data_ptr(),
+        weights["left_gate.weight"].data_ptr(),
+        weights["right_gate.weight"].data_ptr(),
+        weights["out_gate.weight"].data_ptr(),
+        weights["to_out.weight"].data_ptr(),
+        dim,
+        hidden_dim,
+        dtype,
+        device.index if device.type == "cuda" else -1,
+    )
+    cached = _WEIGHT_CACHE.get(ptrs)
+    if cached is None:
+        proj_w = torch.cat(
+            [
+                weights["left_proj.weight"],
+                weights["right_proj.weight"],
+                weights["left_gate.weight"],
+                weights["right_gate.weight"],
+                weights["out_gate.weight"],
+            ],
+            dim=0,
+        ).to(device=device, dtype=dtype).contiguous()
+        to_out_w = weights["to_out.weight"].to(device=device, dtype=dtype).contiguous()
+        cached = (proj_w, to_out_w)
+        _WEIGHT_CACHE[ptrs] = cached
+    return cached
+
+
+def custom_kernel(data):
+    input_tensor, mask, weights, config = data
+    bs, n, _, dim = input_tensor.shape
+    hidden_dim = config["hidden_dim"]
+    nomask = bool(config.get("nomask", False)) or mask is None
+
+    compute_dtype = torch.float16
+    device = input_tensor.device
+    proj_w, to_out_w = _cached_weights(weights, dim, hidden_dim, compute_dtype, device)
+
+    x = F.layer_norm(
+        input_tensor,
+        (dim,),
+        weights["norm.weight"],
+        weights["norm.bias"],
+        eps=1e-5,
+    )
+
+    flat_x = x.reshape(bs * n * n, dim).to(compute_dtype)
+    proj = F.linear(flat_x, proj_w).contiguous()
+
+    left = torch.empty((bs, hidden_dim, n, n), device=device, dtype=compute_dtype)
+    right = torch.empty((bs, hidden_dim, n, n), device=device, dtype=compute_dtype)
+    out_gate = torch.empty((bs * n * n, hidden_dim), device=device, dtype=compute_dtype)
+
+    total = bs * n * n * hidden_dim
+    grid = (triton.cdiv(total, 256),)
+    mask_arg = mask.reshape(bs * n * n).contiguous() if mask is not None else input_tensor
+    _split_gate_layout_kernel[grid](
+        proj, mask_arg, left, right, out_gate,
+        total, n, hidden_dim,
+        NOMASK=nomask, BLOCK=256,
+        num_warps=8,
+    )
+
+    prod = torch.bmm(
+        left.reshape(bs * hidden_dim, n, n),
+        right.reshape(bs * hidden_dim, n, n).transpose(1, 2),
+    )
+    prod = prod.reshape(bs, hidden_dim, n, n).permute(0, 2, 3, 1).contiguous()
+
+    y = F.layer_norm(
+        prod.float(),
+        (hidden_dim,),
+        weights["to_out_norm.weight"],
+        weights["to_out_norm.bias"],
+        eps=1e-5,
+    )
+    y = (y * out_gate.reshape(bs, n, n, hidden_dim).float()).to(compute_dtype)
+    return F.linear(y.reshape(bs * n * n, hidden_dim), to_out_w).reshape(bs, n, n, dim).float()
+```

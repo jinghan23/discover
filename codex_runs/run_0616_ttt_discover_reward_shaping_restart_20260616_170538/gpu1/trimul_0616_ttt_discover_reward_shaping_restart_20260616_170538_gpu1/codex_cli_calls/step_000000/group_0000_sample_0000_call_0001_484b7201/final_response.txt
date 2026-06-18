@@ -1,0 +1,163 @@
+```python
+"""
+TriMul outgoing forward pass using fused PyTorch/Triton execution.
+
+Algorithm:
+1. Apply input LayerNorm in fp32.
+2. Compute the five dim->hidden projections as one packed linear op.
+3. Form bf16 left/right activations with sigmoid gates and optional mask.
+4. Compute outgoing TriMul as grouped batched GEMM over hidden channels.
+5. Use a Triton kernel to fuse hidden LayerNorm, output gate, and final hidden->dim projection.
+"""
+
+import torch
+import torch.nn.functional as F
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def _final_norm_gate_proj_kernel(
+    tri_ptr,
+    gate_ptr,
+    ln_w_ptr,
+    ln_b_ptr,
+    out_w_ptr,
+    y_ptr,
+    total_rows: tl.constexpr,
+    n: tl.constexpr,
+    d_model: tl.constexpr,
+    hdim: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_d = tl.program_id(1)
+
+    rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    ds = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
+    hs = tl.arange(0, BLOCK_H)
+
+    row_mask = rows < total_rows
+    nn = n * n
+    b = rows // nn
+    r = rows - b * nn
+
+    tri = tl.load(
+        tri_ptr + b[:, None] * hdim * nn + hs[None, :] * nn + r[:, None],
+        mask=row_mask[:, None] & (hs[None, :] < hdim),
+        other=0.0,
+    ).to(tl.float32)
+
+    mean = tl.sum(tri, axis=1) / hdim
+    centered = tri - mean[:, None]
+    var = tl.sum(centered * centered, axis=1) / hdim
+    inv = tl.rsqrt(var + 1.0e-5)
+
+    ln_w = tl.load(ln_w_ptr + hs, mask=hs < hdim, other=0.0).to(tl.float32)
+    ln_b = tl.load(ln_b_ptr + hs, mask=hs < hdim, other=0.0).to(tl.float32)
+
+    gate = tl.load(
+        gate_ptr + rows[:, None] * hdim + hs[None, :],
+        mask=row_mask[:, None] & (hs[None, :] < hdim),
+        other=0.0,
+    ).to(tl.float32)
+
+    v = (centered * inv[:, None] * ln_w[None, :] + ln_b[None, :]) * gate
+
+    w = tl.load(
+        out_w_ptr + ds[:, None] * hdim + hs[None, :],
+        mask=(ds[:, None] < d_model) & (hs[None, :] < hdim),
+        other=0.0,
+    ).to(tl.float32)
+
+    acc = tl.dot(v, tl.trans(w), input_precision="tf32")
+    tl.store(
+        y_ptr + rows[:, None] * d_model + ds[None, :],
+        acc,
+        mask=row_mask[:, None] & (ds[None, :] < d_model),
+    )
+
+
+def custom_kernel(data):
+    input_tensor, mask, weights, config = data
+
+    x = input_tensor
+    bsz, n, _, d_model = x.shape
+    hdim = config["hidden_dim"]
+    total_rows = bsz * n * n
+
+    norm_weight = weights["norm.weight"]
+    norm_bias = weights["norm.bias"]
+    left_proj_weight = weights["left_proj.weight"]
+    right_proj_weight = weights["right_proj.weight"]
+    left_gate_weight = weights["left_gate.weight"]
+    right_gate_weight = weights["right_gate.weight"]
+    out_gate_weight = weights["out_gate.weight"]
+    to_out_norm_weight = weights["to_out_norm.weight"]
+    to_out_norm_bias = weights["to_out_norm.bias"]
+    to_out_weight = weights["to_out.weight"]
+
+    torch.backends.cuda.matmul.allow_tf32 = True
+
+    x_norm = F.layer_norm(x, (d_model,), norm_weight, norm_bias, 1.0e-5)
+    x_flat = x_norm.reshape(total_rows, d_model).to(torch.bfloat16)
+
+    packed_w = torch.cat(
+        (
+            left_proj_weight,
+            right_proj_weight,
+            left_gate_weight,
+            right_gate_weight,
+            out_gate_weight,
+        ),
+        dim=0,
+    ).to(torch.bfloat16)
+
+    proj = F.linear(x_flat, packed_w)
+    left_p, right_p, left_g, right_g, out_g = proj.split(hdim, dim=-1)
+
+    left = left_p * torch.sigmoid(left_g.float()).to(torch.bfloat16)
+    right = right_p * torch.sigmoid(right_g.float()).to(torch.bfloat16)
+    out_gate = torch.sigmoid(out_g.float()).to(torch.bfloat16).contiguous()
+
+    if mask is not None and not bool(config.get("nomask", False)):
+        m = mask.reshape(total_rows, 1).to(torch.bfloat16)
+        left = left * m
+        right = right * m
+
+    left = left.view(bsz, n, n, hdim)
+    right = right.view(bsz, n, n, hdim)
+
+    left_bh = left.permute(0, 3, 1, 2).contiguous().view(bsz * hdim, n, n)
+    right_bh = right.permute(0, 3, 1, 2).contiguous().view(bsz * hdim, n, n)
+
+    tri = torch.bmm(left_bh, right_bh.transpose(1, 2)).contiguous()
+
+    output = torch.empty((bsz, n, n, d_model), device=x.device, dtype=torch.float32)
+
+    block_m = 16
+    block_d = 128
+    grid = (triton.cdiv(total_rows, block_m), triton.cdiv(d_model, block_d))
+
+    _final_norm_gate_proj_kernel[grid](
+        tri,
+        out_gate,
+        to_out_norm_weight,
+        to_out_norm_bias,
+        to_out_weight,
+        output,
+        total_rows,
+        n,
+        d_model,
+        hdim,
+        BLOCK_M=block_m,
+        BLOCK_D=block_d,
+        BLOCK_H=128,
+        num_warps=4,
+        num_stages=3,
+    )
+
+    return output
+```

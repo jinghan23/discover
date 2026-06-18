@@ -1,0 +1,174 @@
+```python
+"""
+TriMul outgoing forward implementation.
+
+The code keeps the dense linear projections and layer norms on PyTorch/cuBLAS, then
+uses a Triton kernel for the N^3 outgoing triangle multiplication:
+  out[b, i, j, h] = sum_k left[b, i, k, h] * right[b, j, k, h]
+The Triton kernel computes one hidden channel tile at a time with fp32
+accumulation, followed by PyTorch layer norm, output gate, and final projection.
+"""
+
+import torch
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def _trimul_outgoing_kernel(
+    left_ptr,
+    right_ptr,
+    out_ptr,
+    total_tiles: tl.constexpr,
+    N: tl.constexpr,
+    H: tl.constexpr,
+    stride_lb: tl.constexpr,
+    stride_li: tl.constexpr,
+    stride_lk: tl.constexpr,
+    stride_lh: tl.constexpr,
+    stride_rb: tl.constexpr,
+    stride_rj: tl.constexpr,
+    stride_rk: tl.constexpr,
+    stride_rh: tl.constexpr,
+    stride_ob: tl.constexpr,
+    stride_oi: tl.constexpr,
+    stride_oj: tl.constexpr,
+    stride_oh: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    h = tl.program_id(1)
+    b = tl.program_id(2)
+
+    num_j_tiles = tl.cdiv(N, BLOCK_N)
+    pid_i = pid // num_j_tiles
+    pid_j = pid - pid_i * num_j_tiles
+
+    offs_i = pid_i * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_j = pid_j * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), tl.float32)
+
+    for k0 in range(0, N, BLOCK_K):
+        k = k0 + offs_k
+
+        l_ptrs = (
+            left_ptr
+            + b * stride_lb
+            + offs_i[:, None] * stride_li
+            + k[None, :] * stride_lk
+            + h * stride_lh
+        )
+        r_ptrs = (
+            right_ptr
+            + b * stride_rb
+            + offs_j[None, :] * stride_rj
+            + k[:, None] * stride_rk
+            + h * stride_rh
+        )
+
+        l = tl.load(l_ptrs, mask=(offs_i[:, None] < N) & (k[None, :] < N), other=0.0)
+        r = tl.load(r_ptrs, mask=(k[:, None] < N) & (offs_j[None, :] < N), other=0.0)
+
+        acc += tl.dot(l, r, out_dtype=tl.float32)
+
+    o_ptrs = (
+        out_ptr
+        + b * stride_ob
+        + offs_i[:, None] * stride_oi
+        + offs_j[None, :] * stride_oj
+        + h * stride_oh
+    )
+    tl.store(o_ptrs, acc, mask=(offs_i[:, None] < N) & (offs_j[None, :] < N))
+
+
+def _linear_no_bias(x, w):
+    return torch.matmul(x, w.t())
+
+
+def _layer_norm_last(x, weight, bias, eps=1e-5):
+    return torch.nn.functional.layer_norm(x, (x.shape[-1],), weight, bias, eps)
+
+
+def _launch_trimul(left, right):
+    B, N, _, H = left.shape
+    out = torch.empty((B, N, N, H), device=left.device, dtype=torch.float32)
+
+    if N >= 768:
+        bm, bn, bk = 16, 16, 64
+        warps = 4
+    else:
+        bm, bn, bk = 16, 16, 64
+        warps = 4
+
+    grid = (triton.cdiv(N, bm) * triton.cdiv(N, bn), H, B)
+
+    _trimul_outgoing_kernel[grid](
+        left,
+        right,
+        out,
+        grid[0],
+        N,
+        H,
+        left.stride(0),
+        left.stride(1),
+        left.stride(2),
+        left.stride(3),
+        right.stride(0),
+        right.stride(1),
+        right.stride(2),
+        right.stride(3),
+        out.stride(0),
+        out.stride(1),
+        out.stride(2),
+        out.stride(3),
+        BLOCK_M=bm,
+        BLOCK_N=bn,
+        BLOCK_K=bk,
+        num_warps=warps,
+        num_stages=4,
+    )
+    return out
+
+
+def custom_kernel(data):
+    input_tensor, mask, weights, config = data
+
+    norm_weight = weights["norm.weight"]
+    norm_bias = weights["norm.bias"]
+    left_proj_weight = weights["left_proj.weight"]
+    right_proj_weight = weights["right_proj.weight"]
+    left_gate_weight = weights["left_gate.weight"]
+    right_gate_weight = weights["right_gate.weight"]
+    out_gate_weight = weights["out_gate.weight"]
+    to_out_norm_weight = weights["to_out_norm.weight"]
+    to_out_norm_bias = weights["to_out_norm.bias"]
+    to_out_weight = weights["to_out.weight"]
+
+    x = _layer_norm_last(input_tensor.float(), norm_weight.float(), norm_bias.float())
+
+    left = _linear_no_bias(x, left_proj_weight.float())
+    right = _linear_no_bias(x, right_proj_weight.float())
+
+    if mask is not None:
+        m = mask.to(dtype=left.dtype).unsqueeze(-1)
+        left = left * m
+        right = right * m
+
+    left_gate = torch.sigmoid(_linear_no_bias(x, left_gate_weight.float()))
+    right_gate = torch.sigmoid(_linear_no_bias(x, right_gate_weight.float()))
+    out_gate = torch.sigmoid(_linear_no_bias(x, out_gate_weight.float()))
+
+    left = (left * left_gate).contiguous()
+    right = (right * right_gate).contiguous()
+
+    out = _launch_trimul(left, right)
+    out = _layer_norm_last(out, to_out_norm_weight.float(), to_out_norm_bias.float())
+    out = out * out_gate
+    out = _linear_no_bias(out, to_out_weight.float())
+
+    return out.float()
+```

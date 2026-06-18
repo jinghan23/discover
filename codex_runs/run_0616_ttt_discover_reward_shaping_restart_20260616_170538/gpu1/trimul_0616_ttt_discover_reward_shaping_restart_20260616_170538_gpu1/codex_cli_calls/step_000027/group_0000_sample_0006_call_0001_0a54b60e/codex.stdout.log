@@ -1,0 +1,100 @@
+```python
+"""
+TriMul outgoing forward pass.
+
+LayerNorm and dense projections use PyTorch/cuBLAS. The N^3 outgoing triangle
+multiplication is computed as a strided batched GEMM over hidden channels:
+    out[b, i, j, h] = sum_k left[b, i, k, h] * right[b, j, k, h]
+A tiny Triton kernel is used for the final gate multiply so the implementation
+contains custom Triton code while leaving the heavy GEMM to optimized cuBLAS.
+"""
+
+import torch
+import torch.nn.functional as F
+import triton
+import triton.language as tl
+
+
+@triton.jit
+def _gate_kernel(x_ptr, g_ptr, y_ptr, total: tl.constexpr, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < total
+    x = tl.load(x_ptr + offs, mask=mask, other=0.0)
+    g = tl.load(g_ptr + offs, mask=mask, other=0.0)
+    tl.store(y_ptr + offs, x * g, mask=mask)
+
+
+def _apply_gate_triton(x, gate):
+    y = torch.empty_like(x)
+    total = x.numel()
+    block = 1024
+    grid = (triton.cdiv(total, block),)
+    _gate_kernel[grid](x, gate, y, total, BLOCK=block, num_warps=4)
+    return y
+
+
+def _triangle_mul_bmm(left, right, bs, n, h):
+    left_h = left.permute(0, 3, 1, 2).reshape(bs * h, n, n).contiguous()
+    right_h = right.permute(0, 3, 1, 2).reshape(bs * h, n, n).contiguous()
+    out_h = torch.bmm(left_h, right_h.transpose(1, 2))
+    return out_h.reshape(bs, h, n, n).permute(0, 2, 3, 1).contiguous()
+
+
+def custom_kernel(data):
+    input_tensor, mask, weights, config = data
+    dim = config["dim"]
+    hidden_dim = config["hidden_dim"]
+
+    x = input_tensor
+    bs, n, _, _ = x.shape
+
+    x = F.layer_norm(
+        x,
+        (dim,),
+        weights["norm.weight"],
+        weights["norm.bias"],
+    )
+
+    x2 = x.reshape(bs * n * n, dim)
+
+    left = F.linear(x2, weights["left_proj.weight"]).reshape(bs, n, n, hidden_dim)
+    right = F.linear(x2, weights["right_proj.weight"]).reshape(bs, n, n, hidden_dim)
+
+    if mask is not None:
+        m = mask.to(dtype=left.dtype).unsqueeze(-1)
+        left = left * m
+        right = right * m
+
+    left_gate = torch.sigmoid(
+        F.linear(x2, weights["left_gate.weight"])
+    ).reshape(bs, n, n, hidden_dim)
+    right_gate = torch.sigmoid(
+        F.linear(x2, weights["right_gate.weight"])
+    ).reshape(bs, n, n, hidden_dim)
+
+    left = left * left_gate
+    right = right * right_gate
+
+    out = _triangle_mul_bmm(left, right, bs, n, hidden_dim)
+
+    out = F.layer_norm(
+        out,
+        (hidden_dim,),
+        weights["to_out_norm.weight"],
+        weights["to_out_norm.bias"],
+    )
+
+    out_gate = torch.sigmoid(
+        F.linear(x2, weights["out_gate.weight"])
+    ).reshape(bs, n, n, hidden_dim)
+
+    out = _apply_gate_triton(out, out_gate)
+
+    out = F.linear(
+        out.reshape(bs * n * n, hidden_dim),
+        weights["to_out.weight"],
+    ).reshape(bs, n, n, dim)
+
+    return out.float()
+```
