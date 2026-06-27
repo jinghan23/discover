@@ -1275,7 +1275,11 @@ async def main(cfg: CodexNoFinetuneConfig) -> None:
             "autonomous_blackbox requires a blackbox eval socket or TCP port"
         )
 
-    object.__setattr__(cfg, "log_path", os.path.expanduser(cfg.log_path))
+    object.__setattr__(
+        cfg,
+        "log_path",
+        os.path.abspath(os.path.expanduser(cfg.log_path)),
+    )
     os.makedirs(cfg.log_path, exist_ok=True)
 
     ml_logger = MetricsLogger(

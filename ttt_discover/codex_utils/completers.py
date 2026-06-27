@@ -52,6 +52,19 @@ class CodexCliTimeoutError(RuntimeError):
         )
 
 
+def _write_text_best_effort(path: Path, text: str) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _open_log_target(path: Path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path.open("wb")
+
+
 @dataclass
 class CodexResponseCompleter(TextCompleter):
     """Text completer backed by OpenAI's Responses API."""
@@ -134,6 +147,8 @@ class CodexCliCompleter(TextCompleter):
     config_overrides: tuple[str, ...] = ()
     env: dict[str, str] | None = None
     skip_git_repo_check: bool = False
+    output_read_retries: int = 20
+    output_read_retry_delay: float = 0.25
     _call_idx: int = field(default=0, init=False, repr=False)
 
     def _build_prompt(self, prompt: str) -> str:
@@ -197,9 +212,9 @@ class CodexCliCompleter(TextCompleter):
             effective.update(self.env)
         logged = {key: effective[key] for key in keys if key in effective}
         if logged:
-            (call_dir / "codex_env.json").write_text(
+            _write_text_best_effort(
+                call_dir / "codex_env.json",
                 json.dumps(logged, indent=2, sort_keys=True),
-                encoding="utf-8",
             )
 
     def _next_call_dir(self) -> Path | None:
@@ -211,12 +226,36 @@ class CodexCliCompleter(TextCompleter):
             char if char.isalnum() or char in "._-" else "_"
             for char in name
         )
+        log_dir = Path(self.log_dir).expanduser().resolve()
         call_dir = (
-            Path(self.log_dir)
+            log_dir
             / f"{safe_name}_call_{self._call_idx:04d}_{uuid.uuid4().hex[:8]}"
         )
         call_dir.mkdir(parents=True, exist_ok=True)
         return call_dir
+
+    async def _read_output_with_retry(
+        self,
+        output_path: str,
+        stdout_log_path: Path | None,
+        stdout: bytes | None,
+    ) -> str:
+        path = Path(output_path)
+        attempts = max(1, self.output_read_retries)
+        for i in range(attempts):
+            try:
+                text = path.read_text(encoding="utf-8").strip()
+                if text:
+                    return text
+            except FileNotFoundError:
+                pass
+            if i + 1 < attempts:
+                await asyncio.sleep(self.output_read_retry_delay)
+
+        stdout_text = _read_log_or_bytes(stdout_log_path, stdout).strip()
+        if stdout_text:
+            return stdout_text
+        raise FileNotFoundError(output_path)
 
     async def __call__(self, prompt: str) -> str:
         if self.semaphore is not None:
@@ -237,18 +276,15 @@ class CodexCliCompleter(TextCompleter):
             stderr_log_path = None
         else:
             output_path = str(call_dir / "final_response.txt")
-            (call_dir / "prompt.txt").write_text(prompt, encoding="utf-8")
+            _write_text_best_effort(call_dir / "prompt.txt", prompt)
             stdout_log_path = call_dir / "codex.stdout.log"
             stderr_log_path = call_dir / "codex.stderr.log"
-            stdout_target = stdout_log_path.open("wb")
-            stderr_target = stderr_log_path.open("wb")
+            stdout_target = _open_log_target(stdout_log_path)
+            stderr_target = _open_log_target(stderr_log_path)
 
         cmd = self._build_command(output_path)
         if call_dir is not None:
-            (call_dir / "command.json").write_text(
-                json.dumps(cmd, indent=2),
-                encoding="utf-8",
-            )
+            _write_text_best_effort(call_dir / "command.json", json.dumps(cmd, indent=2))
             self._log_env(call_dir)
 
         try:
@@ -258,6 +294,7 @@ class CodexCliCompleter(TextCompleter):
                     stdin=asyncio.subprocess.PIPE,
                     stdout=stdout_target,
                     stderr=stderr_target,
+                    cwd=self.cwd,
                     env=self._build_process_env(),
                     start_new_session=True,
                 )
@@ -274,9 +311,9 @@ class CodexCliCompleter(TextCompleter):
                     stdout_text = _read_log_or_bytes(stdout_log_path, stdout)
                     stderr_text = _read_log_or_bytes(stderr_log_path, stderr)
                     if call_dir is not None:
-                        (call_dir / "error.txt").write_text(
+                        _write_text_best_effort(
+                            call_dir / "error.txt",
                             f"codex exec timed out after {self.timeout}s\n",
-                            encoding="utf-8",
                         )
                     raise CodexCliTimeoutError(
                         timeout=self.timeout,
@@ -287,9 +324,9 @@ class CodexCliCompleter(TextCompleter):
                 except asyncio.CancelledError:
                     await _kill_process_tree(process)
                     if call_dir is not None:
-                        (call_dir / "error.txt").write_text(
+                        _write_text_best_effort(
+                            call_dir / "error.txt",
                             "codex exec was cancelled\n",
-                            encoding="utf-8",
                         )
                     raise
 
@@ -297,9 +334,9 @@ class CodexCliCompleter(TextCompleter):
                 stderr_text = _read_log_or_bytes(stderr_log_path, stderr)
                 if process.returncode != 0:
                     if call_dir is not None:
-                        (call_dir / "error.txt").write_text(
+                        _write_text_best_effort(
+                            call_dir / "error.txt",
                             f"codex exec failed with exit code {process.returncode}\n",
-                            encoding="utf-8",
                         )
                     raise RuntimeError(
                         "codex exec failed with exit code "
@@ -312,8 +349,7 @@ class CodexCliCompleter(TextCompleter):
                 if stderr_log_path is not None:
                     stderr_target.close()
 
-            with open(output_path, "r", encoding="utf-8") as f:
-                return f.read().strip()
+            return await self._read_output_with_retry(output_path, stdout_log_path, stdout)
         finally:
             if call_dir is None:
                 try:
