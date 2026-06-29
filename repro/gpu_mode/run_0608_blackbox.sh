@@ -30,7 +30,7 @@ else
     CUDA_VISIBLE_DEVICES="$GPU" \
     CUDA_DEVICE_ORDER="$CUDA_DEVICE_ORDER_VALUE" \
     TORCH_CUDA_ARCH_LIST="$TORCH_CUDA_ARCH_LIST_VALUE" \
-    "$PYTHON_BIN" -m ttt_discover.blackbox_eval.server \
+    "$PYTHON_BIN" -m ttt_discover.eval_runners.blackbox_eval.server \
         --env-type examples.gpu_mode.env:GpuModeEnv \
         --problem-type trimul \
         --socket "$SOCK" \
@@ -58,7 +58,8 @@ fi
 
 "$PYTHON_BIN" repro/run_discovery.py \
     --task trimul \
-    --runner codex_no_finetune \
+    --algorithm autoevolve \
+    --eval-runner blackbox \
     --experiment-name trimul_0608_codex_autoevolve_blackbox_gpu3 \
     --log-root codex_runs/trimul_exec_workspaces \
     --gpu "$GPU" \
@@ -76,7 +77,5 @@ fi
     --codex-cli-sandbox danger-full-access \
     --codex-cli-timeout 7200 \
     --codex-max-concurrent-requests 2 \
-    --codex-autonomous \
-    --codex-autonomous-blackbox \
     --blackbox-eval-socket "$SOCK" \
     "${DRY_RUN_ARGS[@]}"

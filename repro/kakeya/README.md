@@ -27,7 +27,7 @@ Small Codex no-finetune run:
 
 ```bash
 .venv/bin/python repro/kakeya/run_kakeya_discovery.py \
-  --runner codex_no_finetune \
+  --algorithm ttt_discover \
   --primes 5,7,13 \
   --num-epochs 10 \
   --group-size 1 \
@@ -39,9 +39,8 @@ Seed with an existing construction:
 
 ```bash
 .venv/bin/python repro/kakeya/run_kakeya_discovery.py \
-  --runner codex_no_finetune \
+  --algorithm ttt_discover \
   --codex-initial-program repro_external/kakeya_construction/idea_reconstruction/exp3_reconstructed.py \
   --primes 5,7,13 \
   --wandb-project ''
 ```
-

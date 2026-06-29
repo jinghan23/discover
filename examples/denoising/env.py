@@ -5,8 +5,8 @@ from ttt_discover import Environment, SandboxRewardEvaluator, State, DiscoverCon
 
 from examples.denoising.utils import EVALUATE_MSE_FUNC, EVALUATE_POISSON_FUNC, BASELINES, evaluate_mse, evaluate_poisson, run_denoising_eval
 from examples.denoising.prompt import SYSTEM_PROMPT
-from ttt_discover.tinker_utils.dataset_builder import VerifyResult
-from ttt_discover.tinker_utils.state import to_json_serializable
+from ttt_discover.algorithms.state import to_json_serializable
+from ttt_discover.tasks import VerifyResult
 
 BASELINES = {
     "pancreas": {
@@ -34,8 +34,31 @@ class DenoisingState(State):
     mse: float
     poisson: float
 
-    def __init__(self, timestep: int, construction: list[Any], code: str, value: float = None, mse: float = None, poisson: float = None, parent_values: list[float] = None, parents: list[dict] = None, id: str = None, observation: str = ""):
-        super().__init__(timestep, construction, code, value, parent_values, parents, id, observation)
+    def __init__(
+        self,
+        timestep: int,
+        construction: list[Any],
+        code: str,
+        value: float = None,
+        mse: float = None,
+        poisson: float = None,
+        parent_values: list[float] = None,
+        parents: list[dict] = None,
+        id: str = None,
+        observation: str = "",
+        metadata: dict[str, Any] | None = None,
+    ):
+        super().__init__(
+            timestep,
+            construction,
+            code,
+            value,
+            parent_values,
+            parents,
+            id,
+            observation,
+            metadata,
+        )
         self.mse = mse
         self.poisson = poisson
         
@@ -50,6 +73,7 @@ class DenoisingState(State):
             "observation": self.observation,
             "construction": to_json_serializable(self.construction),
             "code": self.code,
+            "metadata": to_json_serializable(self.metadata),
             "mse": self.mse,
             "poisson": self.poisson,
         }
@@ -65,6 +89,7 @@ class DenoisingState(State):
             parents=d.get("parents", []),
             id=d.get("id"),
             observation=d.get("observation", ""),
+            metadata=d.get("metadata", {}),
             mse=d.get("mse"),
             poisson=d.get("poisson"),
         )

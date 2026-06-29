@@ -1,11 +1,11 @@
 # Cap-Set Priority Discovery
 
 This task wraps the FunSearch-style cap-set greedy solver as a TTT-Discover
-`codex_no_finetune` problem. The model edits only `priority(el, n)`.
+`ttt_discover` problem. The model edits only `priority(el, n)`.
 
 ```bash
 TOKENIZERS_PARALLELISM=false .venv/bin/python -m repro.cap_set.run_cap_set_discovery \
-  --runner codex_no_finetune \
+  --algorithm ttt_discover \
   --codex-backend cli \
   --experiment-name capset-codex-10 \
   --wandb-project '' \

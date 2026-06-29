@@ -345,12 +345,8 @@ def discover_ac(problem_type: str):
         experiment_name=f"test-{problem_type}-run",
         wandb_project=f"ac-inequalities-{problem_type}",
         model_name="openai/gpt-oss-120b",
-        renderer_name="gpt_oss_high_reasoning",
-        learning_rate=4e-5,
         num_epochs=50,
         temperature=1.0,
-        kl_penalty_coef=0.1,
-        phase1_max_tokens=26000,
         groups_per_batch=8,
         group_size=64,
     )

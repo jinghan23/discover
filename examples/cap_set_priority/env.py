@@ -10,7 +10,7 @@ from typing import Callable
 import numpy as np
 
 from ttt_discover import BaseRewardEvaluator, Environment, State
-from ttt_discover.environments.sandbox_reward_evaluator import run_with_timeout
+from ttt_discover.tasks.sandbox_reward_evaluator import run_with_timeout
 
 
 PriorityFn = Callable[[tuple[int, ...], int], float]

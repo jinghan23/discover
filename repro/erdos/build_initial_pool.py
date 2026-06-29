@@ -15,7 +15,7 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
-from ttt_discover.codex_utils.runtime import State
+from ttt_discover.algorithms.state import State
 
 
 THRESHOLD_C5 = 0.3808694472025862

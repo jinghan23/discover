@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from ttt_discover import BaseRewardEvaluator, DiscoverConfig, Environment, State, discover
-from ttt_discover.blackbox_eval import build_eval_client_source
+from ttt_discover.eval_runners.blackbox_eval import build_eval_client_source
 
 GPU_MODE_ROOT = Path(__file__).resolve().parent
 REPO_ROOT = GPU_MODE_ROOT.parents[1]

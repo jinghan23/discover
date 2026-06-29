@@ -10,7 +10,7 @@ from typing import Iterable
 import numpy as np
 
 from ttt_discover import BaseRewardEvaluator, Environment, State
-from ttt_discover.environments.sandbox_reward_evaluator import run_with_timeout
+from ttt_discover.tasks.sandbox_reward_evaluator import run_with_timeout
 
 
 DEFAULT_PRIMES = (5, 7, 13)

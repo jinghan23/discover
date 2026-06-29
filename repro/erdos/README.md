@@ -69,7 +69,7 @@ export WANDB_API_KEY="..."
 export WANDB_ENTITY="..."
 ```
 
-The Codex no-finetune runner defaults to the local `codex exec` CLI, so it uses
+The Codex CLI backend defaults to the local `codex exec` CLI, so it uses
 the already logged-in Codex/ChatGPT account and does not require
 `OPENAI_API_KEY` or `TINKER_API_KEY`. It still uses the existing tokenizer,
 environment, PUCT sampler, evaluator, and logging code, but skips Tinker
@@ -122,11 +122,10 @@ python -m repro.erdos.run_erdos_discovery \
   --codex-max-concurrent-requests 4
 ```
 
-To run the Codex no-finetune variant:
+To run the Codex-backed `ttt_discover` algorithm:
 
 ```bash
 python -m repro.erdos.run_erdos_discovery \
-  --runner codex_no_finetune \
   --codex-backend cli \
   --experiment-name erdos-min-overlap-codex-smoke \
   --num-epochs 1 \

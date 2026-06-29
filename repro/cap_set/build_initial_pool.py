@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from examples.cap_set_priority.env import is_cap_set
-from ttt_discover.codex_utils.runtime import State
+from ttt_discover.algorithms.state import State
 
 
 DEFAULT_COUNTS = {

@@ -19,7 +19,7 @@ from ttt_discover import (
 
 ### `discover(config: DiscoverConfig) -> None`
 
-Runs discovery with test-time RL training: builds dataset and RL config from `config`, sets up logging and (optionally) Ray, then runs training. This is the main entry point for launching a discovery run.
+Runs Codex-backed discovery: builds a task from `config.env_type`, selects an eval runner, and dispatches to the configured algorithm. This is the main entry point for launching a discovery run.
 
 - **config** — A `DiscoverConfig` instance (see below).
 - **Blocks** until training completes (uses `asyncio.run` internally).
@@ -32,23 +32,22 @@ Configuration for discovery runs. Defined with `chz.chz` (frozen/dataclass-like)
 
 | Attribute | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `model_name` | `str` | `"openai/gpt-oss-120b"` | Model name for training and tokenizer. |
-| `lora_rank` | `int` | `32` | LoRA rank. |
-| `renderer_name` | `str \| None` | `"gpt_oss_high_reasoning"` | Renderer for prompts. |
-| `save_every` | `int` | `5` | Save checkpoint every N epochs. |
-| `group_size` | `int` | `8` | Envs per group. |
-| `groups_per_batch` | `int` | `64` | Groups per batch. |
-| `learning_rate` | `float` | `4e-5` | Learning rate. |
-| `num_epochs` | `int` | `50` | Training epochs. |
-| `temperature` | `float` | `1.0` | Sampling temperature. |
-| `kl_penalty_coef` | `float` | `0.1` | KL penalty coefficient. |
-| `phase1_max_tokens` | `int` | `26000` | Token budget for prompt + thinking (two-phase sampling). |
-| `experiment_name` | `str \| None` | `None` | Experiment name (used in log path). |
-| `wandb_project` | `str \| None` | `"tinker-cookbook"` | Weights & Biases project. |
-| `env_type` | `str` | `Environment` | Environment class (e.g. your subclass of `Environment`). |
-| `problem_type` | `str` | `"26"` | Problem type identifier. |
-| `num_cpus_per_task` | `int` | `0` | CPUs per task; if `> 0`, Ray is initialized for job dispatch. |
-| `eval_timeout` | `int` | `1000` | Evaluation timeout (e.g. seconds). |
+| `experiment_name` | `str \| None` | `None` | Experiment name used for logs. |
+| `env_type` | `type \| None` | `None` | Environment class, usually a subclass of `Environment`. |
+| `problem_type` | `str` | `""` | Problem identifier passed to the environment. |
+| `algorithm` | `"ttt_discover" \| "autoevolve"` | `"ttt_discover"` | Search algorithm. |
+| `eval_runner` | `"auto" \| "in_process" \| "blackbox"` | `"auto"` | Evaluation transport runner. |
+| `backend` | `"cli" \| "responses"` | `"cli"` | Codex completion backend. |
+| `model_name` | `str \| None` | `None` | Model override for the selected backend. |
+| `max_output_tokens` | `int \| None` | `8192` | Completion token limit. |
+| `temperature` | `float \| None` | `None` | Sampling temperature. |
+| `groups_per_batch` | `int` | `1` | Parent states sampled per batch. |
+| `group_size` | `int` | `1` | Candidates generated per parent state. |
+| `num_epochs` | `int` | `1` | Number of discovery batches. |
+| `num_cpus_per_task` | `int` | `1` | CPUs available to reward evaluators. |
+| `eval_timeout` | `int` | `45` | Evaluation timeout in seconds. |
+| `wandb_project` | `str \| None` | `"tinker-cookbook"` | Weights & Biases project; `None` or empty disables it. |
+| `log_path` | `str` | `""` | Explicit log path; otherwise `discover()` uses `./tinker_log/<experiment_name>`. |
 
 ---
 
@@ -59,7 +58,7 @@ Configuration for discovery runs. Defined with `chz.chz` (frozen/dataclass-like)
 Base class for problem environments. Subclass this to define a new task; the discovery pipeline uses it to build rollouts, prompt the model, and verify code.
 
 - **Class attribute:** `state_type` — the `State` subclass used for this env (e.g. `State` or a custom subclass).
-- **Class attribute:** `reward_function` — class (e.g. a `BaseRewardEvaluator` subclass or factory) used to create the evaluator. It is called with `problem_type`, `log_dir`, `eval_timeout`, `num_cpus_per_task`; the returned instance must provide `get_reward(generation, state)`.
+- **Class attribute:** `reward_function` — class (e.g. a `BaseRewardEvaluator` subclass or factory) used to create the reward evaluator. It is called with `problem_type`, `log_dir`, `eval_timeout`, `num_cpus_per_task`; the returned instance must provide `get_reward(generation, state)`.
 
 **Class methods**
 
@@ -130,7 +129,7 @@ Minimal abstract interface for reward evaluation. Concrete evaluators may return
 
 ### `SandboxRewardEvaluator`
 
-Evaluator that runs model-generated code in a separate process via Ray: writes code to a temp file, runs it with CPU affinity and timeout, and returns results (or failure info). Supports code extraction from markdown, stdout capture, and optional verifier preprocessing.
+Reward evaluator that runs model-generated code in a separate process via Ray: writes code to a temp file, runs it with CPU affinity and timeout, and returns results (or failure info). Supports code extraction from markdown, stdout capture, and optional verifier preprocessing.
 
 **Inherits from:** `BaseRewardEvaluator`.
 

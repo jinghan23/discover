@@ -7,13 +7,14 @@ if [[ "${RUN_0608_DRY_RUN:-0}" == "1" ]]; then
     DRY_RUN_ARGS+=(--dry-run)
 fi
 
-# TTT Discover: non-auto, many short Codex samples driven by the sampler/evaluator.
+# TTT Discover: non-auto, many short Codex samples driven by the sampler/eval runner.
 # groups-per-batch = parent states sampled per outer round.
 # group-size = Codex samples per parent; product is samples/evals per round.
 if [[ "${RUN_0608_ONLY_AUTONOMOUS:-0}" != "1" ]]; then
 "$PYTHON_BIN" repro/run_discovery.py \
     --task trimul \
-    --runner codex_no_finetune \
+    --algorithm ttt_discover \
+    --eval-runner in_process \
     --experiment-name trimul_0608_ttt_discover_gpu2 \
     --log-root codex_runs/trimul_exec_workspaces \
     --gpu 2 \
@@ -43,7 +44,8 @@ fi
 # group-size = Codex samples per parent; product is samples/evals per round.
 "$PYTHON_BIN" repro/run_discovery.py \
     --task trimul \
-    --runner codex_no_finetune \
+    --algorithm autoevolve \
+    --eval-runner in_process \
     --experiment-name trimul_0608_codex_autoevolve_gpu2 \
     --log-root codex_runs/trimul_exec_workspaces \
     --gpu 3 \
@@ -61,5 +63,4 @@ fi
     --codex-cli-sandbox danger-full-access \
     --codex-cli-timeout 7200 \
     --codex-max-concurrent-requests 2 \
-    --codex-autonomous \
     "${DRY_RUN_ARGS[@]}"

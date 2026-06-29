@@ -78,6 +78,22 @@ class CodexResponseCompleter(TextCompleter):
     client: Any | None = None
     semaphore: Any | None = None
 
+    @classmethod
+    def from_discover_config(
+        cls,
+        cfg: Any,
+        *,
+        semaphore: Any | None,
+    ) -> "CodexResponseCompleter":
+        return cls(
+            model_name=cfg.model_name,
+            max_output_tokens=cfg.max_output_tokens or 8192,
+            temperature=cfg.temperature,
+            api_key_env=cfg.api_key_env,
+            base_url=cfg.base_url,
+            semaphore=semaphore,
+        )
+
     async def __call__(self, prompt: str) -> str:
         if self.semaphore is not None:
             async with self.semaphore:
@@ -150,6 +166,32 @@ class CodexCliCompleter(TextCompleter):
     output_read_retries: int = 20
     output_read_retry_delay: float = 0.25
     _call_idx: int = field(default=0, init=False, repr=False)
+
+    @classmethod
+    def from_discover_config(
+        cls,
+        cfg: Any,
+        *,
+        cwd: str | None,
+        semaphore: Any | None,
+        step_idx: int,
+        group_idx: int,
+        sample_idx: int,
+    ) -> "CodexCliCompleter":
+        return cls(
+            model_name=cfg.model_name,
+            codex_command=cfg.cli_command,
+            sandbox=cfg.cli_sandbox,
+            cwd=cwd,
+            timeout=cfg.cli_timeout,
+            semaphore=semaphore,
+            log_dir=os.path.join(
+                cfg.log_path,
+                "codex_cli_calls",
+                f"step_{step_idx:06d}",
+            ),
+            call_name=f"group_{group_idx:04d}_sample_{sample_idx:04d}",
+        )
 
     def _build_prompt(self, prompt: str) -> str:
         if not self.append_final_answer_instruction:
