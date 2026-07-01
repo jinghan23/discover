@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from ttt_discover.algorithms.reward_shaping import shape_state_value_from_config
+from ttt_discover.algorithms.variants import apply_prompt_hooks, apply_state_value_hooks
 from ttt_discover.algorithms.runtime import (
     CandidateResult,
     MetricsLogger,
@@ -388,6 +388,7 @@ async def _evaluate_generated_candidate(
     step_idx: int,
     response: str,
     cli_timeout_error: CodexCliTimeoutError | None,
+    prompt_metrics: dict[str, Any] | None = None,
 ) -> CandidateResult:
     parsed_code = candidate.code
     correct_format = task.check_candidate_format(env, parsed_code)
@@ -422,15 +423,10 @@ async def _evaluate_generated_candidate(
         parsed_code=parsed_code,
         outs=outs,
     )
-    if next_state is not None:
-        shaped_value, shaping_metrics = shape_state_value_from_config(
-            getattr(next_state, "value", None),
-            getattr(parent_state, "value", None),
-            step_idx,
-            cfg,
-        )
-        next_state.value = shaped_value
-        metrics.update(shaping_metrics)
+    metrics.update(
+        apply_state_value_hooks(next_state, parent_state, step_idx=step_idx, cfg=cfg)
+    )
+    metrics.update(prompt_metrics or {})
 
     return CandidateResult(
         parent_state=parent_state,
@@ -466,6 +462,15 @@ async def _run_candidate(
     try:
         env = task.make_env(parent_state, sampler=pool)
         prompt = task.get_prompt(env)
+        prompt, prompt_metrics = apply_prompt_hooks(
+            prompt,
+            env=env,
+            parent=parent_state,
+            step_idx=step_idx,
+            group_idx=group_idx,
+            sample_idx=sample_idx,
+            cfg=cfg,
+        )
         completer = _make_completer(
             cfg,
             task=task,
@@ -510,6 +515,7 @@ async def _run_candidate(
                     step_idx=step_idx,
                     response=response,
                     cli_timeout_error=cli_timeout_error,
+                    prompt_metrics=prompt_metrics,
                 )
             )
         return results

@@ -18,7 +18,7 @@ from typing import Any
 
 import numpy as np
 
-from ttt_discover.algorithms.reward_shaping import shape_state_value_from_config
+from ttt_discover.algorithms.variants import apply_prompt_hooks, apply_state_value_hooks
 from ttt_discover.codex_utils.completers import CodexCliCompleter, CodexResponseCompleter
 from ttt_discover.config import DISCOVER_CONFIG_FIELDS, DiscoverConfig
 from ttt_discover.algorithms.state import to_json_serializable
@@ -309,6 +309,76 @@ def update_sampler_from_results(sampler: Any, results: list[CandidateResult]) ->
             result.pool_status = "no_valid_state"
 
 
+def _finite_float_or_none(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    return out if np.isfinite(out) else None
+
+
+def _candidate_state_value(result: CandidateResult) -> float | None:
+    return _finite_float_or_none(getattr(result.next_state, "value", None))
+
+
+def _best_inner_candidate(results: list[CandidateResult]) -> CandidateResult:
+    if not results:
+        raise ValueError("Cannot select from an empty inner candidate list")
+
+    def sort_key(result: CandidateResult) -> tuple[float, float, float, float]:
+        state_value = _candidate_state_value(result)
+        reward = _finite_float_or_none(result.reward)
+        correctness = _finite_float_or_none(result.correctness)
+        reward = reward if reward is not None else float("-inf")
+        correctness = correctness if correctness is not None else float("-inf")
+        if state_value is not None:
+            return (1.0, state_value, reward, correctness)
+        return (0.0, reward, correctness, 0.0)
+
+    return max(results, key=sort_key)
+
+
+def _inner_iteration_metrics(
+    results: list[CandidateResult],
+    selected: CandidateResult,
+    *,
+    requested_iterations: int | None = None,
+    failed_iterations: int = 0,
+) -> dict[str, Any]:
+    rewards = [float(result.reward) for result in results]
+    correctness = [float(result.correctness) for result in results]
+    state_values = [_candidate_state_value(result) for result in results]
+    valid_state_values = [value for value in state_values if value is not None]
+    selected_idx = selected.metrics.get("inner/idx", 0)
+    requested_iterations = (
+        len(results) if requested_iterations is None else requested_iterations
+    )
+
+    metrics: dict[str, Any] = {
+        "inner/iterations": requested_iterations,
+        "inner/completed_iterations": len(results),
+        "inner/failed_iterations": failed_iterations,
+        "inner/selected_idx": int(selected_idx),
+        "inner/valid_states": len(valid_state_values),
+        "inner/attempt_rewards": rewards,
+        "inner/attempt_correctness": correctness,
+        "inner/attempt_state_values": state_values,
+    }
+    if rewards:
+        metrics.update(
+            {
+                "inner/reward_mean": float(np.mean(rewards)),
+                "inner/reward_max": float(np.max(rewards)),
+                "inner/reward_min": float(np.min(rewards)),
+            }
+        )
+    if valid_state_values:
+        metrics["inner/best_state_value"] = float(np.max(valid_state_values))
+    return metrics
+
+
 def sample_table(results: list[CandidateResult]) -> list[tuple[Any, ...]]:
     rows: list[tuple[Any, ...]] = []
     for result in results:
@@ -505,64 +575,109 @@ class Loop:
                 group_idx=group_idx,
                 sample_idx=sample_idx,
             )
+            prompt, prompt_metrics = apply_prompt_hooks(
+                prompt,
+                env=env,
+                parent=parent_state,
+                step_idx=step_idx,
+                group_idx=group_idx,
+                sample_idx=sample_idx,
+                cfg=self.cfg,
+            )
             completer = self.make_completer(
                 semaphore=semaphore,
                 step_idx=step_idx,
                 group_idx=group_idx,
                 sample_idx=sample_idx,
             )
-            response = await completer(prompt)
-            parsed_code = last_codeblock_postprocess(
-                response,
-                codeblock_seps=self.task.code_languages(env),
-                keep_separators=self.task.keep_code_separators(env),
-            )
-            correct_format = self.task.check_candidate_format(env, parsed_code)
-            outs = await safe_grade(
-                self.eval_runner,
-                env,
-                parsed_code,
-                correct_format,
-                timeout=self.cfg.timeout,
-            )
-            metrics = self.task.build_metrics(
-                env,
-                outs,
-                response=response,
-                parsed_code=parsed_code,
-                correct_format=correct_format,
-            )
-            metrics["codex/parsed_code_source"] = "final_response_codeblock"
-            metrics["codex/cli_timeout_salvaged"] = False
-            next_state = self.task.create_next_state(
-                env,
-                step_idx=step_idx,
-                parsed_code=parsed_code,
-                outs=outs,
-            )
-            if next_state is not None:
-                shaped_value, shaping_metrics = shape_state_value_from_config(
-                    getattr(next_state, "value", None),
-                    getattr(parent_state, "value", None),
-                    step_idx,
-                    self.cfg,
+
+            inner_iterations = max(1, int(getattr(self.cfg, "inner_iterations", 1)))
+            inner_results: list[CandidateResult] = []
+            inner_errors: list[str] = []
+            for inner_idx in range(inner_iterations):
+                try:
+                    response = await completer(prompt)
+                    parsed_code = last_codeblock_postprocess(
+                        response,
+                        codeblock_seps=self.task.code_languages(env),
+                        keep_separators=self.task.keep_code_separators(env),
+                    )
+                    correct_format = self.task.check_candidate_format(env, parsed_code)
+                    outs = await safe_grade(
+                        self.eval_runner,
+                        env,
+                        parsed_code,
+                        correct_format,
+                        timeout=self.cfg.timeout,
+                    )
+                    metrics = self.task.build_metrics(
+                        env,
+                        outs,
+                        response=response,
+                        parsed_code=parsed_code,
+                        correct_format=correct_format,
+                    )
+                    metrics["codex/parsed_code_source"] = "final_response_codeblock"
+                    metrics["codex/cli_timeout_salvaged"] = False
+                    metrics["inner/idx"] = inner_idx
+                    metrics.update(prompt_metrics)
+                    next_state = self.task.create_next_state(
+                        env,
+                        step_idx=step_idx,
+                        parsed_code=parsed_code,
+                        outs=outs,
+                    )
+                    inner_results.append(
+                        CandidateResult(
+                            parent_state=parent_state,
+                            group_idx=group_idx,
+                            sample_idx=sample_idx,
+                            prompt=prompt,
+                            response=response,
+                            parsed_code=parsed_code,
+                            reward=float(outs.reward),
+                            correctness=float(outs.correctness),
+                            raw_score=outs.raw_score,
+                            msg=outs.msg,
+                            metrics=metrics,
+                            next_state=next_state,
+                        )
+                    )
+                except Exception as exc:
+                    inner_error = f"inner_idx={inner_idx}: {exc}\n{traceback.format_exc()}"
+                    inner_errors.append(inner_error)
+                    logger.warning(
+                        "Inner candidate failed at step %s group %s sample %s inner %s: %s",
+                        step_idx,
+                        group_idx,
+                        sample_idx,
+                        inner_idx,
+                        exc,
+                    )
+
+            if not inner_results:
+                raise RuntimeError(
+                    "All inner candidate attempts failed:\n" + "\n".join(inner_errors)
                 )
-                next_state.value = shaped_value
-                metrics.update(shaping_metrics)
-            return CandidateResult(
-                parent_state=parent_state,
-                group_idx=group_idx,
-                sample_idx=sample_idx,
-                prompt=prompt,
-                response=response,
-                parsed_code=parsed_code,
-                reward=float(outs.reward),
-                correctness=float(outs.correctness),
-                raw_score=outs.raw_score,
-                msg=outs.msg,
-                metrics=metrics,
-                next_state=next_state,
+
+            selected_result = _best_inner_candidate(inner_results)
+            selected_result.metrics.update(
+                _inner_iteration_metrics(
+                    inner_results,
+                    selected_result,
+                    requested_iterations=inner_iterations,
+                    failed_iterations=len(inner_errors),
+                )
             )
+            selected_result.metrics.update(
+                apply_state_value_hooks(
+                    selected_result.next_state,
+                    parent_state,
+                    step_idx=step_idx,
+                    cfg=self.cfg,
+                )
+            )
+            return selected_result
         except Exception as exc:
             error_msg = f"{exc}\n{traceback.format_exc()}"
             logger.warning(

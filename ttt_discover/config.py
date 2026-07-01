@@ -40,6 +40,7 @@ class DiscoverConfig:
     num_epochs: int = 1
     groups_per_batch: int = 1
     group_size: int = 1
+    inner_iterations: int = 1
     max_concurrent_requests: int | None = 4
     topk_children: int = 16
     remove_constant_reward_groups: bool = False
@@ -90,13 +91,13 @@ class DiscoverConfig:
     wandb_project: str | None = "tinker-cookbook"
     wandb_name: str | None = None
 
-    # Reward shaping
-    reward_shaping: bool = False
-    reward_shaping_threshold_start: float = 0.010
-    reward_shaping_threshold_end: float = 0.002
-    reward_shaping_decay_steps: int = 20
-    reward_shaping_small_weight: float = 0.1
-    reward_shaping_large_weight: float = 1.2
+    # Variants (see ttt_discover/algorithms/variants/): opt-in algorithm hooks
+    # applied by stable hook phases. Adding a variant never edits this schema --
+    # only enable it here per run, e.g.
+    # variants=("reward_shaping",),
+    # variant_params={"reward_shaping": {"threshold_start": 0.01, ...}}.
+    variants: tuple[str, ...] = ()
+    variant_params: dict[str, Any] | None = None
 
     def to_runtime_config(
         self,
@@ -107,6 +108,7 @@ class DiscoverConfig:
         kwargs = chz.asdict(self)
         kwargs.update(
             num_cpus_per_task=max(1, int(self.num_cpus_per_task)),
+            inner_iterations=max(1, int(self.inner_iterations)),
             remove_constant_reward_groups=(
                 bool(self.remove_constant_reward_groups) and int(self.group_size) > 1
             ),
