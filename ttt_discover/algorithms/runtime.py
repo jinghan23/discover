@@ -229,6 +229,119 @@ def latest_sampler_step(log_path: str) -> int:
     return latest
 
 
+def evaluator_call_budget(cfg: Any) -> int | None:
+    budget = getattr(cfg, "max_evaluator_calls", None)
+    if budget is None:
+        return None
+    budget = int(budget)
+    if budget < 1:
+        raise ValueError("max_evaluator_calls must be >= 1")
+    return budget
+
+
+def _metric_int(metrics: dict[str, Any], key: str) -> int | None:
+    value = metrics.get(key)
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        out = int(value)
+    except (TypeError, ValueError):
+        return None
+    return out if out >= 0 else None
+
+
+def _metrics_evaluator_call_count(metrics: dict[str, Any]) -> int:
+    explicit = _metric_int(metrics, "budget/evaluator_calls")
+    if explicit is not None:
+        return explicit
+
+    inner = _metric_int(metrics, "inner/completed_iterations")
+    if inner is not None:
+        return inner
+
+    return 1
+
+
+def evaluator_call_count(results: list[CandidateResult]) -> int:
+    return sum(_metrics_evaluator_call_count(result.metrics) for result in results)
+
+
+def logged_evaluator_call_count(log_path: str) -> int:
+    output_path = os.path.join(log_path, "agent_outputs.jsonl")
+    if not os.path.exists(output_path):
+        return 0
+
+    count = 0
+    with open(output_path, "r", encoding="utf-8") as f:
+        for line in f:
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            metrics = entry.get("metrics")
+            if not isinstance(metrics, dict):
+                metrics = {}
+            count += _metrics_evaluator_call_count(metrics)
+    return count
+
+
+@dataclass
+class BudgetTracker:
+    max_calls: int | None
+    used: int = 0
+
+    @classmethod
+    def from_config(cls, cfg: Any, log_path: str) -> "BudgetTracker":
+        return cls(
+            max_calls=evaluator_call_budget(cfg),
+            used=logged_evaluator_call_count(log_path),
+        )
+
+    @property
+    def enabled(self) -> bool:
+        return self.max_calls is not None
+
+    @property
+    def exceeded(self) -> bool:
+        return self.max_calls is not None and self.used >= self.max_calls
+
+    def add(self, results: list[CandidateResult]) -> dict[str, Any]:
+        start_used = self.used
+        epoch_calls = evaluator_call_count(results)
+        self.used += epoch_calls
+        metrics: dict[str, Any] = {
+            "budget/evaluator_calls_used_start": start_used,
+            "budget/evaluator_calls_epoch": epoch_calls,
+            "budget/evaluator_calls_used": self.used,
+        }
+        if self.max_calls is not None:
+            metrics.update(
+                {
+                    "budget/max_evaluator_calls": self.max_calls,
+                    "budget/evaluator_calls_remaining": max(
+                        0, self.max_calls - self.used
+                    ),
+                    "budget/stop_after_epoch": self.exceeded,
+                }
+            )
+        return metrics
+
+    def done_frac(self, fallback: float) -> float:
+        if self.max_calls is None:
+            return fallback
+        return min(1.0, self.used / self.max_calls)
+
+    def log_start(self, run_name: str) -> None:
+        if self.max_calls is None:
+            return
+        logger.info(
+            "%s evaluator call budget: %s, already used: %s",
+            run_name,
+            self.max_calls,
+            self.used,
+        )
+
+
 def invalid_result(msg: str) -> VerifyResult:
     return VerifyResult(
         reward=0.0,
@@ -566,6 +679,7 @@ class Loop:
         prompt = ""
         response = ""
         parsed_code = ""
+        evaluator_calls = 0
         try:
             env = self.task.make_env(parent_state, sampler=self.sampler)
             prompt = self.build_prompt(
@@ -603,6 +717,8 @@ class Loop:
                         keep_separators=self.task.keep_code_separators(env),
                     )
                     correct_format = self.task.check_candidate_format(env, parsed_code)
+                    evaluator_call = 1 if correct_format else 0
+                    evaluator_calls += evaluator_call
                     outs = await safe_grade(
                         self.eval_runner,
                         env,
@@ -620,6 +736,7 @@ class Loop:
                     metrics["codex/parsed_code_source"] = "final_response_codeblock"
                     metrics["codex/cli_timeout_salvaged"] = False
                     metrics["inner/idx"] = inner_idx
+                    metrics["budget/evaluator_calls"] = evaluator_call
                     metrics.update(prompt_metrics)
                     next_state = self.task.create_next_state(
                         env,
@@ -677,6 +794,7 @@ class Loop:
                     cfg=self.cfg,
                 )
             )
+            selected_result.metrics["budget/evaluator_calls"] = evaluator_calls
             return selected_result
         except Exception as exc:
             error_msg = f"{exc}\n{traceback.format_exc()}"
@@ -698,7 +816,10 @@ class Loop:
                 correctness=0.0,
                 raw_score=None,
                 msg=error_msg,
-                metrics={"error": error_msg},
+                metrics={
+                    "error": error_msg,
+                    "budget/evaluator_calls": evaluator_calls,
+                },
                 next_state=None,
                 error=error_msg,
             )
@@ -775,25 +896,43 @@ class Loop:
         )
         os.makedirs(self.cfg.log_path, exist_ok=True)
 
+        budget = BudgetTracker.from_config(self.cfg, self.cfg.log_path)
         self.ml_logger = MetricsLogger.from_config(self.cfg)
 
         start_batch = self.latest_step()
         self.sampler = self.build_sampler(start_batch)
 
         num_batches_total = self.cfg.num_epochs
-        logger.info("Will run %s for %s steps", type(self).__name__, num_batches_total)
+        logger.info(
+            "Will run %s for up to %s steps",
+            type(self).__name__,
+            num_batches_total,
+        )
+        budget.log_start(type(self).__name__)
         try:
+            if budget.exceeded:
+                logger.info(
+                    "Evaluator call budget already reached (%s/%s); nothing to run",
+                    budget.used,
+                    budget.max_calls,
+                )
+                return
+
             for i_batch in range(start_batch, num_batches_total):
                 metrics: dict[str, Any] = {
                     "progress/batch": i_batch,
-                    "progress/done_frac": (i_batch + 1) / num_batches_total,
                 }
+
                 t_start = time.time()
                 with timed("sampling", metrics):
                     _results, sampling_metrics, all_results = await self.sample_batch(
                         i_batch,
                     )
                 metrics.update(sampling_metrics)
+                metrics.update(budget.add(all_results))
+                metrics["progress/done_frac"] = budget.done_frac(
+                    (i_batch + 1) / num_batches_total
+                )
 
                 sampler_table_columns, sampler_table_data = None, None
                 if hasattr(self.sampler, "get_sample_stats"):
@@ -803,8 +942,13 @@ class Loop:
                             self.sampler.get_sample_table()
                         )
 
+                log_agent_tables(
+                    self.cfg.log_path,
+                    self.ml_logger,
+                    i_batch,
+                    all_results,
+                )
                 self.sampler.flush(step=i_batch + 1)
-                log_agent_tables(self.cfg.log_path, self.ml_logger, i_batch, all_results)
                 log_sampler_table(
                     self.ml_logger,
                     i_batch,
@@ -813,6 +957,14 @@ class Loop:
                 )
                 metrics["time/total"] = time.time() - t_start
                 self.ml_logger.log_metrics(metrics, step=i_batch)
+                if budget.exceeded:
+                    logger.info(
+                        "Stopping after step %s: evaluator call budget reached (%s/%s)",
+                        i_batch,
+                        budget.used,
+                        budget.max_calls,
+                    )
+                    break
         finally:
             self.ml_logger.close()
 

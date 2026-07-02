@@ -4,7 +4,9 @@ import inspect
 import itertools
 import os
 import re
+import shlex
 import tempfile
+from pathlib import Path
 from typing import Callable
 
 import numpy as np
@@ -259,6 +261,77 @@ def priority(el, n):
             return False
         return "def priority(" in parsed_code
 
+    def _initial_priority_source(self) -> str:
+        code = getattr(self.initial_state, "code", "") or ""
+        match = re.search(r"```python\s+([\s\S]*?)\s*```", code)
+        if match is not None:
+            return match.group(1).strip() + "\n"
+        if "def priority(" in code:
+            return code.strip() + "\n"
+        return "def priority(el, n):\n    return 0.0\n"
+
+    def build_blackbox_autonomous_prompt(
+        self,
+        *,
+        prompt: str,
+        workspace: Path,
+        eval_timeout: int,
+        num_cpus_per_task: int,
+        socket_path: str | None = None,
+        host: str = "127.0.0.1",
+        port: int | None = None,
+    ) -> str:
+        del num_cpus_per_task
+        socket_path = socket_path or os.environ.get("TTT_BLACKBOX_EVAL_SOCKET")
+        host = os.environ.get("TTT_BLACKBOX_EVAL_HOST") or host
+        env_port = os.environ.get("TTT_BLACKBOX_EVAL_PORT")
+        if port is None and env_port:
+            port = int(env_port)
+        if socket_path is None and port is None:
+            raise ValueError(
+                "Blackbox autonomous cap-set search requires a socket path or TCP port."
+            )
+
+        (workspace / "submission.py").write_text(
+            self._initial_priority_source(),
+            encoding="utf-8",
+        )
+        (workspace / "eval_client.py").write_text(
+            _cap_set_blackbox_eval_client_source(
+                problem_type=self.problem_type,
+                socket_path=socket_path,
+                host=host,
+                port=port,
+                timeout_s=max(1.0, float(eval_timeout)),
+            ),
+            encoding="utf-8",
+        )
+
+        evaluator_cmd = f"cd {shlex.quote(str(workspace))} && python eval_client.py"
+        return f"""{prompt}
+
+--- Autonomous Cap-Set Blackbox Search Mode ---
+You may inspect files and run shell commands, but keep all edits inside this workspace:
+{workspace}
+
+Editable candidate:
+{workspace / "submission.py"}
+
+The local evaluator is a blackbox service. This workspace intentionally contains
+only `submission.py` and `eval_client.py`; hidden evaluator internals are not
+available here.
+
+Run this evaluator after each revision:
+{evaluator_cmd}
+
+Do not edit `eval_client.py` to improve a score. Only `submission.py` is a valid
+candidate artifact. `submission.py` must define `priority(el, n)` as plain Python
+source, without markdown fences.
+
+When done, put the best implementation in:
+{workspace / "submission.py"}
+"""
+
     def get_question(self) -> str:
         state = self.initial_state
         n = parse_dimension(self.problem_type)
@@ -290,3 +363,94 @@ The baseline constant priority gives 256 in dimension 8; the current seed is int
 {state_ctx}
 
 Reason about how to change the ranking so the greedy solver admits more vectors, then return the final program as one fenced Python code block."""
+
+
+def _cap_set_blackbox_eval_client_source(
+    *,
+    problem_type: str = "",
+    socket_path: str | None = None,
+    host: str = "127.0.0.1",
+    port: int | None = None,
+    timeout_s: float = 3600.0,
+) -> str:
+    if socket_path is None and port is None:
+        raise ValueError("Either socket_path or port must be provided")
+
+    return f'''#!/usr/bin/env python3
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+import socket
+import sys
+import uuid
+
+
+PROBLEM_TYPE = {problem_type!r}
+SOCKET_PATH = {socket_path!r}
+HOST = {host!r}
+PORT = {port!r}
+TIMEOUT_S = {float(timeout_s)!r}
+
+
+def _connect() -> socket.socket:
+    socket_path = os.environ.get("TTT_BLACKBOX_EVAL_SOCKET") or SOCKET_PATH
+    port_value = os.environ.get("TTT_BLACKBOX_EVAL_PORT")
+    host_value = os.environ.get("TTT_BLACKBOX_EVAL_HOST") or HOST
+    if socket_path:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(TIMEOUT_S)
+        sock.connect(socket_path)
+        return sock
+    port = int(port_value) if port_value else PORT
+    if port is None:
+        raise SystemExit("missing blackbox eval runner socket or TCP port")
+    sock = socket.create_connection((host_value, int(port)), timeout=TIMEOUT_S)
+    sock.settimeout(TIMEOUT_S)
+    return sock
+
+
+def _recv_line(sock: socket.socket) -> bytes:
+    chunks = []
+    while True:
+        chunk = sock.recv(65536)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        if b"\\n" in chunk:
+            break
+    return b"".join(chunks).split(b"\\n", 1)[0]
+
+
+def main() -> int:
+    submission_path = sys.argv[1] if len(sys.argv) > 1 else "submission.py"
+    source = Path(submission_path).read_text(encoding="utf-8")
+    request = {{
+        "request_id": str(uuid.uuid4()),
+        "problem_type": PROBLEM_TYPE,
+        "submission": "```python\\n" + source.rstrip() + "\\n```",
+    }}
+    data = json.dumps(request, ensure_ascii=False, separators=(",", ":")).encode() + b"\\n"
+    with _connect() as sock:
+        sock.sendall(data)
+        response_data = _recv_line(sock)
+    response = json.loads(response_data.decode("utf-8"))
+
+    message = str(response.get("message") or "")
+    if response.get("ok"):
+        print(message or "pass")
+        if response.get("raw_score") is not None:
+            print(f"raw_score {{response['raw_score']}}")
+        if response.get("reward") is not None:
+            print(f"reward {{response['reward']}}")
+        return 0
+
+    stage = response.get("stage") or "eval"
+    print(f"FAIL stage={{stage}} message={{message or 'evaluation failed'}}", file=sys.stderr)
+    return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+'''
