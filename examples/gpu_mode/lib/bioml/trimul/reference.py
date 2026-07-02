@@ -171,4 +171,12 @@ def generate_input(
     return (input_tensor, mask, weights, config)
 
 
-check_implementation = make_match_reference(ref_kernel, rtol=2e-2, atol=2e-2)
+_check_values = make_match_reference(ref_kernel, rtol=2e-2, atol=2e-2)
+
+
+def check_implementation(data: input_t, output: output_t):
+    if not isinstance(output, torch.Tensor):
+        return False, f"Output must be a torch.Tensor, got {type(output).__name__}."
+    if output.dtype != torch.float32:
+        return False, f"Output dtype must be torch.float32, got {output.dtype}."
+    return _check_values(data, output)
