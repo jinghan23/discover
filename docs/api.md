@@ -44,10 +44,17 @@ Configuration for discovery runs. Defined with `chz.chz` (frozen/dataclass-like)
 | `groups_per_batch` | `int` | `1` | Parent states sampled per batch. |
 | `group_size` | `int` | `1` | Candidates generated per parent state. |
 | `num_epochs` | `int` | `1` | Number of discovery batches. |
+| `max_evaluator_calls` | `int \| None` | `None` | Optional evaluator-call budget checked after each discovery batch. |
 | `num_cpus_per_task` | `int` | `1` | CPUs available to reward evaluators. |
 | `eval_timeout` | `int` | `45` | Evaluation timeout in seconds. |
 | `wandb_project` | `str \| None` | `"tinker-cookbook"` | Weights & Biases project; `None` or empty disables it. |
 | `log_path` | `str` | `""` | Explicit log path; otherwise `discover()` uses `./tinker_log/<experiment_name>`. |
+
+`max_evaluator_calls` is checked after each completed discovery batch, so a run
+can overshoot the budget by at most one batch. One evaluator call means one
+candidate that passes format validation and invokes `eval_runner.evaluate`.
+`inner_iterations` can therefore consume multiple calls for one logged candidate,
+and AutoEvolve consumes one call per generated candidate it actually evaluates.
 
 ---
 

@@ -14,6 +14,7 @@ from typing import Any
 
 from ttt_discover.algorithms.variants import apply_prompt_hooks, apply_state_value_hooks
 from ttt_discover.algorithms.runtime import (
+    BudgetTracker,
     CandidateResult,
     MetricsLogger,
     last_codeblock_postprocess,
@@ -391,57 +392,95 @@ async def _evaluate_generated_candidate(
     prompt_metrics: dict[str, Any] | None = None,
 ) -> CandidateResult:
     parsed_code = candidate.code
-    correct_format = task.check_candidate_format(env, parsed_code)
-    outs = await safe_grade(
-        eval_runner,
-        env,
-        parsed_code,
-        correct_format,
-        timeout=cfg.timeout,
-    )
-    metrics = task.build_metrics(
-        env,
-        outs,
-        response=response,
-        parsed_code=parsed_code,
-        correct_format=correct_format,
-    )
-    metrics["autoevolve/candidate_idx"] = candidate_idx
-    metrics["autoevolve/candidate_name"] = candidate.name
-    metrics["autoevolve/candidate_path"] = candidate.path
-    metrics["codex/parsed_code_source"] = candidate.source
-    metrics["codex/cli_timeout_salvaged"] = cli_timeout_error is not None
-    if cli_timeout_error is not None:
-        metrics["codex/cli_timeout_error"] = (
-            f"codex exec timed out after {cli_timeout_error.timeout}s; "
-            f"log_dir={cli_timeout_error.call_dir}"
+    evaluator_calls = 0
+    try:
+        correct_format = task.check_candidate_format(env, parsed_code)
+        evaluator_calls = 1 if correct_format else 0
+        outs = await safe_grade(
+            eval_runner,
+            env,
+            parsed_code,
+            correct_format,
+            timeout=cfg.timeout,
         )
+        metrics = task.build_metrics(
+            env,
+            outs,
+            response=response,
+            parsed_code=parsed_code,
+            correct_format=correct_format,
+        )
+        metrics["autoevolve/candidate_idx"] = candidate_idx
+        metrics["autoevolve/candidate_name"] = candidate.name
+        metrics["autoevolve/candidate_path"] = candidate.path
+        metrics["codex/parsed_code_source"] = candidate.source
+        metrics["codex/cli_timeout_salvaged"] = cli_timeout_error is not None
+        metrics["budget/evaluator_calls"] = evaluator_calls
+        if cli_timeout_error is not None:
+            metrics["codex/cli_timeout_error"] = (
+                f"codex exec timed out after {cli_timeout_error.timeout}s; "
+                f"log_dir={cli_timeout_error.call_dir}"
+            )
 
-    next_state = task.create_next_state(
-        env,
-        step_idx=step_idx,
-        parsed_code=parsed_code,
-        outs=outs,
-    )
-    metrics.update(
-        apply_state_value_hooks(next_state, parent_state, step_idx=step_idx, cfg=cfg)
-    )
-    metrics.update(prompt_metrics or {})
+        next_state = task.create_next_state(
+            env,
+            step_idx=step_idx,
+            parsed_code=parsed_code,
+            outs=outs,
+        )
+        metrics.update(
+            apply_state_value_hooks(next_state, parent_state, step_idx=step_idx, cfg=cfg)
+        )
+        metrics.update(prompt_metrics or {})
 
-    return CandidateResult(
-        parent_state=parent_state,
-        group_idx=group_idx,
-        sample_idx=sample_idx,
-        prompt=task.get_prompt(env),
-        response=response,
-        parsed_code=parsed_code,
-        reward=float(outs.reward),
-        correctness=float(outs.correctness),
-        raw_score=outs.raw_score,
-        msg=outs.msg,
-        metrics=metrics,
-        next_state=next_state,
-    )
+        return CandidateResult(
+            parent_state=parent_state,
+            group_idx=group_idx,
+            sample_idx=sample_idx,
+            prompt=task.get_prompt(env),
+            response=response,
+            parsed_code=parsed_code,
+            reward=float(outs.reward),
+            correctness=float(outs.correctness),
+            raw_score=outs.raw_score,
+            msg=outs.msg,
+            metrics=metrics,
+            next_state=next_state,
+        )
+    except Exception as exc:
+        error_msg = f"{exc}\n{traceback.format_exc()}"
+        logger.warning(
+            "AutoEvolve generated candidate failed at step %s group %s sample %s "
+            "candidate %s: %s",
+            step_idx,
+            group_idx,
+            sample_idx,
+            candidate_idx,
+            exc,
+        )
+        return CandidateResult(
+            parent_state=parent_state,
+            group_idx=group_idx,
+            sample_idx=sample_idx,
+            prompt="",
+            response=response,
+            parsed_code=parsed_code,
+            reward=0.0,
+            correctness=0.0,
+            raw_score=None,
+            msg=error_msg,
+            metrics={
+                "error": error_msg,
+                "autoevolve/candidate_idx": candidate_idx,
+                "autoevolve/candidate_name": candidate.name,
+                "autoevolve/candidate_path": candidate.path,
+                "codex/parsed_code_source": candidate.source,
+                "budget/evaluator_calls": evaluator_calls,
+                **(prompt_metrics or {}),
+            },
+            next_state=None,
+            error=error_msg,
+        )
 
 
 async def _run_candidate(
@@ -540,7 +579,7 @@ async def _run_candidate(
                 correctness=0.0,
                 raw_score=None,
                 msg=error_msg,
-                metrics={"error": error_msg},
+                metrics={"error": error_msg, "budget/evaluator_calls": 0},
                 next_state=None,
                 error=error_msg,
             )
@@ -605,9 +644,14 @@ async def run(
     if not cfg.log_path:
         raise ValueError("log_path is required")
 
-    object.__setattr__(cfg, "log_path", os.path.abspath(os.path.expanduser(cfg.log_path)))
+    object.__setattr__(
+        cfg,
+        "log_path",
+        os.path.abspath(os.path.expanduser(cfg.log_path)),
+    )
     os.makedirs(cfg.log_path, exist_ok=True)
 
+    budget = BudgetTracker.from_config(cfg, cfg.log_path)
     ml_logger = MetricsLogger.from_config(cfg)
 
     start_batch = _latest_pool_step(cfg.log_path)
@@ -619,35 +663,59 @@ async def run(
     )
 
     num_batches_total = cfg.num_epochs
-    logger.info("Will run AutoEvolve for %s steps", num_batches_total)
-    for i_batch in range(start_batch, num_batches_total):
-        metrics: dict[str, Any] = {
-            "progress/batch": i_batch,
-            "progress/done_frac": (i_batch + 1) / num_batches_total,
-        }
-        t_start = time.time()
-        with timed("sampling", metrics):
-            _results, sampling_metrics, all_results = await sample_batch(
-                cfg,
-                task,
-                eval_runner,
-                pool,
-                i_batch,
+    logger.info("Will run AutoEvolve for up to %s steps", num_batches_total)
+    budget.log_start("AutoEvolve")
+
+    try:
+        if budget.exceeded:
+            logger.info(
+                "Evaluator call budget already reached (%s/%s); nothing to run",
+                budget.used,
+                budget.max_calls,
             )
-        metrics.update(sampling_metrics)
-        metrics.update(pool.get_sample_stats())
+            return
 
-        pool.flush(step=i_batch + 1)
-        log_agent_tables(cfg.log_path, ml_logger, i_batch, all_results)
-        pool_columns, pool_rows = pool.get_pool_table()
-        ml_logger.log_table(
-            "autoevolve_pool_states",
-            columns=pool_columns,
-            data=pool_rows,
-            step=i_batch,
-        )
-        metrics["time/total"] = time.time() - t_start
-        ml_logger.log_metrics(metrics, step=i_batch)
+        for i_batch in range(start_batch, num_batches_total):
+            metrics: dict[str, Any] = {
+                "progress/batch": i_batch,
+            }
 
-    ml_logger.close()
+            t_start = time.time()
+            with timed("sampling", metrics):
+                _results, sampling_metrics, all_results = await sample_batch(
+                    cfg,
+                    task,
+                    eval_runner,
+                    pool,
+                    i_batch,
+                )
+            metrics.update(sampling_metrics)
+            metrics.update(budget.add(all_results))
+            metrics["progress/done_frac"] = budget.done_frac(
+                (i_batch + 1) / num_batches_total
+            )
+            metrics.update(pool.get_sample_stats())
+
+            log_agent_tables(cfg.log_path, ml_logger, i_batch, all_results)
+            pool.flush(step=i_batch + 1)
+            pool_columns, pool_rows = pool.get_pool_table()
+            ml_logger.log_table(
+                "autoevolve_pool_states",
+                columns=pool_columns,
+                data=pool_rows,
+                step=i_batch,
+            )
+            metrics["time/total"] = time.time() - t_start
+            ml_logger.log_metrics(metrics, step=i_batch)
+            if budget.exceeded:
+                logger.info(
+                    "Stopping after step %s: evaluator call budget reached (%s/%s)",
+                    i_batch,
+                    budget.used,
+                    budget.max_calls,
+                )
+                break
+
+    finally:
+        ml_logger.close()
     logger.info("AutoEvolve completed successfully")

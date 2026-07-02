@@ -38,6 +38,7 @@ class DiscoverConfig:
     algorithm: AlgorithmName = "ttt_discover"
     initial_state_file: str | None = None
     num_epochs: int = 1
+    max_evaluator_calls: int | None = None
     groups_per_batch: int = 1
     group_size: int = 1
     inner_iterations: int = 1
