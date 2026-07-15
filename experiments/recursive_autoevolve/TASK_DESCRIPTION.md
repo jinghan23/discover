@@ -95,7 +95,24 @@ is reached or the protected evaluator reports a terminal failure:
    arguments.
 9. Wait for all three fresh inner runs to finish. Each uses `num_epochs=1` and
    `max_evaluator_calls=25` with a unique log directory and no state carried
-   over from another harness candidate.
+   over from another harness candidate. If the meta-evaluation tool call yields
+   a live session ID, enforce a 20-minute cooldown before checking that session:
+
+   - Start a blocking local cooldown command equivalent to `sleep 1200`.
+   - While that cooldown command is alive, wait only on the cooldown command.
+     If the tool API returns early because its per-call wait is capped, continue
+     waiting on the same cooldown command with the maximum supported wait. Such
+     continuations are not permission to poll the meta-evaluator, inspect any
+     process or log, reason about progress, or emit commentary.
+   - After the cooldown command exits, poll the meta-evaluation session exactly
+     once. If it is still running, immediately begin another fresh `sleep 1200`
+     cooldown before the next poll.
+   - Remain silent during every cooldown. Do not emit heartbeat commentary or
+     report that nothing has changed. Do not inspect intermediate run artifacts,
+     process tables, GPU state, or logs while the evaluator is running.
+
+   Only evaluator completion or an explicit terminal failure may end a cooldown
+   early. Never replace the 20-minute cooldown with short repeated polls.
 10. Read the protected result summary. You may inspect the referenced public
     run artifacts before proposing the next change.
 11. If the result marks the candidate accepted, treat this commit as the new
