@@ -226,6 +226,16 @@ class CapSetPriorityEnv(Environment):
     state_type = State
     max_construction_len = 1200
 
+    @staticmethod
+    def construction_key(construction) -> tuple[tuple[int, ...], ...]:
+        """Identify a cap set by its points, independent of greedy selection order."""
+        return tuple(
+            sorted(
+                tuple(int(coordinate) for coordinate in vector)
+                for vector in construction
+            )
+        )
+
     @classmethod
     def prepare_initial_program(
         cls,

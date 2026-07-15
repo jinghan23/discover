@@ -257,6 +257,11 @@ class PUCTSampler(StateSampler):
 
     def _get_construction_key(self, state: State) -> tuple | str | None:
         if hasattr(state, 'construction') and state.construction:
+            construction_key = getattr(self.env_type, "construction_key", None)
+            if callable(construction_key):
+                key = construction_key(state.construction)
+                if key is not None:
+                    return self._freeze_key(key)
             return self._freeze_key(state.construction)
         if hasattr(state, 'code') and state.code:
             return state.code
