@@ -91,7 +91,7 @@ class BlackboxRunner(EvalRunner):
                 "msg": message,
                 "correctness": float(correctness),
                 "raw_score": float(raw_score),
-                "result_construction": None,
+                "result_construction": response.get("result_construction"),
                 "stdout": message,
                 "metrics": {
                     "blackbox/ok": ok,

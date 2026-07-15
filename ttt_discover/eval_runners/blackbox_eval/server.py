@@ -208,6 +208,7 @@ class BlackboxVerifier:
             raw_score = _safe_float(_result_get(result, "raw_score"), reward)
             correctness = _safe_float(_result_get(result, "correctness"), 1.0)
             original_msg = _result_get(result, "msg", "")
+        result_construction = _result_get(result, "result_construction")
 
         ok = bool((correctness if correctness is not None else 0.0) > 0.0)
         if ok:
@@ -231,6 +232,7 @@ class BlackboxVerifier:
             "reward": reward,
             "raw_score": raw_score,
             "correctness": correctness,
+            "result_construction": _json_safe(result_construction),
         }
 
 
