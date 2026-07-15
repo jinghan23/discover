@@ -3,13 +3,17 @@ from __future__ import annotations
 import math
 import os
 import re
+import shlex
 from dataclasses import dataclass
+from functools import lru_cache
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable
 
 import numpy as np
 
 from ttt_discover import BaseRewardEvaluator, DiscoverConfig, Environment, State, discover
+from ttt_discover.eval_runners.blackbox_eval import build_eval_client_source
 
 from examples.aicrowd_whestbench.prompt import WHESTBENCH_PROMPT
 
@@ -67,6 +71,30 @@ def monte_carlo_layer_means(
         x = np.maximum(x @ w, 0.0)
         rows.append(np.mean(x, axis=0))
     return np.stack(rows, axis=0)
+
+
+@lru_cache(maxsize=512)
+def _cached_reference(
+    width: int,
+    depth: int,
+    reference_samples: int,
+    seed: int,
+) -> np.ndarray:
+    """Cache trusted Monte Carlo targets without sharing mutable MLP weights.
+
+    Public-50 search evaluates many candidates against the same fixed suite.
+    Recomputing all references for every evaluator call is both wasteful and a
+    source of avoidable timing variance.  Candidates receive a freshly built
+    MLP below, so they cannot mutate this protected cache.
+    """
+    mlp = build_mlp(width=width, depth=depth, seed=seed)
+    reference = monte_carlo_layer_means(
+        mlp,
+        reference_samples,
+        seed=seed + 10_000,
+    )
+    reference.setflags(write=False)
+    return reference
 
 
 def _normal_pdf(x: np.ndarray) -> np.ndarray:
@@ -205,10 +233,11 @@ def _score_callable(
 
     for seed in seeds:
         mlp = build_mlp(width=width, depth=depth, seed=seed)
-        reference = monte_carlo_layer_means(
-            mlp,
+        reference = _cached_reference(
+            width,
+            depth,
             reference_samples,
-            seed=seed + 10_000,
+            seed,
         )
         prediction = _call_estimator(estimator, mlp, budget)
         err = np.square(prediction - reference)
@@ -358,6 +387,75 @@ class WhestBenchEnv(Environment):
             marker in code
             for marker in ("def estimate", "def predict", "class Estimator")
         )
+
+    def _initial_estimator_code(self) -> str:
+        code = _extract_python_code(getattr(self.initial_state, "code", "") or "")
+        if any(
+            marker in code
+            for marker in ("def estimate", "def predict", "class Estimator")
+        ):
+            return code
+        return INITIAL_ESTIMATOR_CODE
+
+    def build_blackbox_autonomous_prompt(
+        self,
+        *,
+        prompt: str,
+        workspace: Path,
+        eval_timeout: int,
+        num_cpus_per_task: int,
+        socket_path: str | None = None,
+        host: str = "127.0.0.1",
+        port: int | None = None,
+    ) -> str:
+        del num_cpus_per_task
+        socket_path = socket_path or os.environ.get("TTT_BLACKBOX_EVAL_SOCKET")
+        host = os.environ.get("TTT_BLACKBOX_EVAL_HOST") or host
+        env_port = os.environ.get("TTT_BLACKBOX_EVAL_PORT")
+        if port is None and env_port:
+            port = int(env_port)
+        if socket_path is None and port is None:
+            raise ValueError(
+                "Blackbox autonomous WhestBench requires a socket path or TCP port."
+            )
+
+        (workspace / "submission.py").write_text(
+            self._initial_estimator_code(),
+            encoding="utf-8",
+        )
+        (workspace / "eval_client.py").write_text(
+            build_eval_client_source(
+                problem_type=self.problem_type,
+                socket_path=socket_path,
+                host=host,
+                port=port,
+                timeout_s=max(1.0, float(eval_timeout)),
+            ),
+            encoding="utf-8",
+        )
+
+        evaluator_cmd = f"cd {shlex.quote(str(workspace))} && python eval_client.py"
+        return f"""{prompt}
+
+--- Autonomous WhestBench Blackbox Search Mode ---
+Work only inside this workspace:
+{workspace}
+
+Editable candidate:
+{workspace / "submission.py"}
+
+The trusted public-50 evaluator is exposed only through a local blackbox
+service. Run it after each meaningful revision:
+{evaluator_cmd}
+
+Do not edit `eval_client.py`. Only `submission.py` is a candidate artifact.
+Lower `raw_score` is better. The protected private-50 instances are not
+available through this evaluator and will be used only once by the outer
+meta-evaluator on the exact best public submission.
+
+When done, leave the best plain Python implementation in:
+{workspace / "submission.py"}
+"""
 
     def get_question(self) -> str:
         state_ctx = self.initial_state.to_prompt(

@@ -1,9 +1,10 @@
 # Recursive AutoEvolve Experiment
 
-This folder describes a first recursive AutoEvolve experiment. It intentionally
-contains only the experiment protocol and the task description for the outer
-Codex agent. The meta-evaluation launcher, the ARC 50/50 split, and remote run
-infrastructure are not implemented here.
+This folder contains the protocol, the task description for the outer Codex
+agent, and the protected local meta-evaluation launcher. The launcher runs each
+committed harness in a detached Git worktree, starts three fresh inner
+AutoEvolve tasks, enforces the evaluator-call limit in the blackbox servers,
+and stores its incumbent ledger outside the repository.
 
 The design is inspired by Weco's
 [AIDE² recursive self-improvement experiment](https://www.weco.ai/blog/first-evidence-of-recursive-self-improvement).
@@ -159,3 +160,67 @@ runs must never resume another harness candidate's state pool.
 - `TASK_DESCRIPTION.md`: the instruction to give the persistent outer Codex
   task.
 - `README.md`: the human-facing experiment design and trusted protocol.
+- `meta_eval.py`: the protected launcher, private WhestBench scorer, selection
+  rule, and external incumbent ledger.
+
+## Protected launcher
+
+The exact command supplied to the outer agent for each committed candidate is:
+
+```bash
+python experiments/recursive_autoevolve/meta_eval.py --candidate-sha HEAD
+```
+
+Results and the incumbent ledger are written under
+`/opt/tiger/recursive_autoevolve_runs` by default. This location is outside the
+Git worktree, so generated artifacts cannot be committed as harness changes.
+The launcher rejects a candidate unless its tree diff from the incumbent is
+limited to the editable paths in `TASK_DESCRIPTION.md`.
+
+An operator may establish the initial baseline before launching the outer loop:
+
+```bash
+python experiments/recursive_autoevolve/meta_eval.py \
+  --candidate-sha HEAD \
+  --bootstrap
+```
+
+If the ledger does not exist when the first candidate is evaluated, the
+launcher automatically evaluates the candidate's parent commit as the initial
+incumbent before evaluating the candidate.
+
+### Fixed phase-one manifest
+
+- Every inner run uses AutoEvolve, one epoch, one autonomous Codex call,
+  `gpt-5.5` with the harness's fixed high reasoning effort, and a blackbox
+  evaluator capped at 25 calls.
+- Erdős starts from one deterministic protected construction.
+- This branch's lightweight NumPy WhestBench environment uses seeds 0–49 as
+  `public-50` and seeds 50–99 as `private-50`. Monte Carlo targets are cached
+  inside the trusted evaluator. Only the aggregate private score is recorded.
+- The kernel task is `trimul`. Each run exclusively reserves one physical GPU
+  from 4, 5, 6, or 7 and exposes only that device through
+  `CUDA_VISIBLE_DEVICES`.
+- The three heterogeneous tasks run concurrently, but each task keeps
+  `group_size=1`, `groups_per_batch=1`, and
+  `max_concurrent_requests=1`.
+
+All three task scores are treated as losses. A candidate is accepted only if:
+
+1. every task and the private WhestBench evaluation is valid;
+2. the geometric mean of incumbent/candidate task-score ratios is at least
+   `1.01`;
+3. no individual task regresses by more than 2%; and
+4. at least two of the three task scores improve.
+
+The candidate result JSON contains the public/private gap, run paths,
+evaluator calls, token usage when reported by Codex, task wall time, GPU
+allocation, and the authoritative accept/reject decision.
+
+Validate command plumbing without launching any inner agents:
+
+```bash
+python experiments/recursive_autoevolve/meta_eval.py \
+  --candidate-sha HEAD \
+  --validate-only
+```
