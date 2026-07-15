@@ -71,7 +71,6 @@ class BudgetTrackerTest(unittest.TestCase):
             tracker = BudgetTracker.from_config(cfg, tmp)
 
             self.assertFalse(tracker.exceeded)
-            self.assertEqual(tracker.remaining, 2)
             metrics = tracker.add(
                 [
                     candidate({"budget/evaluator_calls": 1}),
@@ -80,7 +79,6 @@ class BudgetTrackerTest(unittest.TestCase):
             )
 
             self.assertTrue(tracker.exceeded)
-            self.assertEqual(tracker.remaining, 0)
             self.assertEqual(metrics["budget/evaluator_calls_used_start"], 3)
             self.assertEqual(metrics["budget/evaluator_calls_epoch"], 2)
             self.assertEqual(metrics["budget/evaluator_calls_used"], 5)

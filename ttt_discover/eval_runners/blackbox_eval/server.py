@@ -4,7 +4,6 @@ import argparse
 import asyncio
 import contextlib
 import copy
-import hashlib
 import importlib
 import json
 import logging
@@ -136,7 +135,6 @@ class VerifierConfig:
     debug_responses: bool = False
     message_max_chars: int = 200
     max_evaluations: int | None = None
-    cache_by_submission: bool = False
 
 
 class BlackboxVerifier:
@@ -145,7 +143,6 @@ class BlackboxVerifier:
         self._max_evaluations = config.max_evaluations
         self._eval_count = 0
         self._count_lock = threading.Lock()
-        self._cache: dict[tuple[str, str], dict[str, Any]] = {}
 
     def _try_reserve_call(self) -> tuple[bool, int]:
         """Atomically reserve one evaluator call against the budget.
@@ -163,58 +160,6 @@ class BlackboxVerifier:
                 return False, self._eval_count
             self._eval_count += 1
             return True, self._eval_count
-
-    def _budget_fields(self) -> dict[str, int]:
-        with self._count_lock:
-            return self._budget_fields_unlocked()
-
-    def _cache_key(self, problem_type: str, submission: str) -> tuple[str, str] | None:
-        if not self.config.cache_by_submission:
-            return None
-        digest = hashlib.sha256(submission.encode("utf-8")).hexdigest()
-        return problem_type, digest
-
-    def _cached_response(
-        self,
-        key: tuple[str, str] | None,
-        response_base: dict[str, Any],
-    ) -> dict[str, Any] | None:
-        if key is None:
-            return None
-        with self._count_lock:
-            cached = self._cache.get(key)
-            if cached is None:
-                return None
-            return {
-                **response_base,
-                **self._budget_fields_unlocked(),
-                **copy.deepcopy(cached),
-                "cached": True,
-            }
-
-    def _budget_fields_unlocked(self) -> dict[str, int]:
-        fields = {"evaluations_used": self._eval_count}
-        if self.config.max_evaluations is not None:
-            fields["max_evaluations"] = self.config.max_evaluations
-        return fields
-
-    def _cache_response(
-        self,
-        key: tuple[str, str] | None,
-        response: dict[str, Any],
-    ) -> None:
-        if key is None:
-            return
-        excluded = {
-            "request_id",
-            "evaluations_used",
-            "max_evaluations",
-            "budget_used",
-            "cached",
-        }
-        cached = {name: value for name, value in response.items() if name not in excluded}
-        with self._count_lock:
-            self._cache[key] = copy.deepcopy(cached)
 
     def evaluate(self, request: dict[str, Any]) -> dict[str, Any]:
         request_id = str(request.get("request_id") or uuid.uuid4())
@@ -238,11 +183,6 @@ class BlackboxVerifier:
                 "message": "empty submission",
             }
 
-        cache_key = self._cache_key(problem_type, submission)
-        cached_response = self._cached_response(cache_key, response_base)
-        if cached_response is not None:
-            return cached_response
-
         state = self.config.state_factory()
         if self.config.allow_request_state and isinstance(request.get("state"), dict):
             state_type = type(state) if state is not None else None
@@ -252,18 +192,12 @@ class BlackboxVerifier:
         if not granted:
             return {
                 **response_base,
-                **self._budget_fields(),
                 "ok": False,
-                "stage": "budget",
-                "message": "evaluation budget exhausted",
+                "stage": "server",
+                "message": "evaluation unavailable",
                 "budget_used": budget_used,
                 "budget_exhausted": True,
-                "reward": 0.0,
-                "raw_score": 0.0,
-                "correctness": 0.0,
             }
-        response_base.update(self._budget_fields())
-        response_base["budget_used"] = budget_used
 
         request_log_dir = self.config.log_dir / _safe_path_component(request_id)
         request_log_dir.mkdir(parents=True, exist_ok=True)
@@ -288,10 +222,11 @@ class BlackboxVerifier:
                 "ok": False,
                 "stage": "exception",
                 "message": message,
+                "budget_used": budget_used,
             }
 
         response = self._response_from_result(response_base, result)
-        self._cache_response(cache_key, response)
+        response["budget_used"] = budget_used
         return response
 
     def _response_from_result(
@@ -463,8 +398,7 @@ async def _serve(args: argparse.Namespace) -> None:
             allow_request_state=args.allow_request_state,
             debug_responses=args.debug_responses,
             message_max_chars=args.message_max_chars,
-            max_evaluations=getattr(args, "max_evaluations", None),
-            cache_by_submission=getattr(args, "cache_by_submission", False),
+            max_evaluations=args.max_evaluations,
         )
     )
     app = BlackboxEvalServer(
@@ -532,11 +466,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="Hard cap on total evaluator.get_reward() executions across all clients",
-    )
-    parser.add_argument(
-        "--cache-by-submission",
-        action="store_true",
-        help="Reuse trusted results for byte-identical submissions",
     )
     parser.add_argument("--verbose", action="store_true")
     return parser

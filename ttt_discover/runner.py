@@ -37,16 +37,6 @@ async def _maybe_start_blackbox_server(cfg: DiscoverConfig):
     log_dir = os.path.join(cfg.log_path, "blackbox_eval")
     os.makedirs(log_dir, exist_ok=True)
 
-    max_evaluations = cfg.max_evaluator_calls
-    if max_evaluations is not None:
-        # A resumed run must only receive its remaining verifier allowance.
-        from ttt_discover.algorithms.runtime import logged_evaluator_call_count
-
-        max_evaluations = max(
-            0,
-            int(max_evaluations) - logged_evaluator_call_count(cfg.log_path),
-        )
-
     args = Namespace(
         env_type=f"{cfg.env_type.__module__}:{cfg.env_type.__qualname__}",
         evaluator=None,
@@ -66,10 +56,7 @@ async def _maybe_start_blackbox_server(cfg: DiscoverConfig):
         max_frame_bytes=DEFAULT_MAX_FRAME_BYTES,
         debug_responses=False,
         message_max_chars=200,
-        max_evaluations=max_evaluations,
-        cache_by_submission=bool(
-            getattr(cfg.env_type, "blackbox_cache_by_submission", False)
-        ),
+        max_evaluations=cfg.max_evaluator_calls,
         verbose=False,
     )
     server_task = asyncio.create_task(serve_blackbox_eval(args), name="blackbox-eval-server")

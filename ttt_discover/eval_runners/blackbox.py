@@ -4,7 +4,6 @@ import json
 import os
 from pathlib import Path
 import socket
-import threading
 from typing import Any
 import uuid
 
@@ -27,7 +26,6 @@ class BlackboxRunner(EvalRunner):
             host=cfg.blackbox_eval_host,
             port=cfg.blackbox_eval_port,
             timeout_s=max(1.0, float(cfg.eval_timeout)),
-            max_evaluations=getattr(cfg, "max_evaluator_calls", None),
         )
 
     def __init__(
@@ -37,15 +35,11 @@ class BlackboxRunner(EvalRunner):
         host: str = "127.0.0.1",
         port: int | None = None,
         timeout_s: float = 3600.0,
-        max_evaluations: int | None = None,
     ):
         self.socket_path = socket_path
         self.host = host
         self.port = port
         self.timeout_s = timeout_s
-        self.max_evaluations = max_evaluations
-        self._budget_lock = threading.Lock()
-        self._reported_evaluations_used = 0
 
     def _endpoint(self) -> tuple[str | None, str, int | None]:
         socket_path = os.environ.get("TTT_BLACKBOX_EVAL_SOCKET") or self.socket_path
@@ -80,35 +74,6 @@ class BlackboxRunner(EvalRunner):
             sock.sendall(data)
             response_data = _recv_line(sock)
         response = json.loads(response_data.decode("utf-8"))
-        evaluations_used = response.get("evaluations_used")
-        if evaluations_used is None:
-            evaluations_used = response.get("budget_used")
-        evaluations_delta = None
-        if evaluations_used is not None:
-            evaluations_used = max(0, int(evaluations_used))
-            with self._budget_lock:
-                evaluations_delta = max(
-                    0,
-                    evaluations_used - self._reported_evaluations_used,
-                )
-                self._reported_evaluations_used = max(
-                    self._reported_evaluations_used,
-                    evaluations_used,
-                )
-        server_evaluations_used = evaluations_used
-        server_max_evaluations = response.get("max_evaluations")
-        if (
-            server_evaluations_used is not None
-            and server_max_evaluations is not None
-            and self.max_evaluations is not None
-        ):
-            # A managed server receives only the remaining allowance on a
-            # resumed run. Convert its local count back to the run-wide total
-            # expected by BudgetTracker.
-            server_evaluations_used += max(
-                0,
-                int(self.max_evaluations) - int(server_max_evaluations),
-            )
         ok = bool(response.get("ok"))
         message = str(response.get("message") or "")
         reward = response.get("reward")
@@ -131,14 +96,10 @@ class BlackboxRunner(EvalRunner):
                 "metrics": {
                     "blackbox/ok": ok,
                     "blackbox/stage": response.get("stage"),
-                    "budget/evaluator_calls_server": server_evaluations_used,
+                    "budget/evaluator_calls_server": response.get("budget_used"),
                     "blackbox/budget_exhausted": bool(
                         response.get("budget_exhausted")
-                        or response.get("stage") == "budget"
                     ),
-                    "blackbox/evaluations_used": evaluations_used,
-                    "blackbox/evaluator_calls_delta": evaluations_delta,
-                    "blackbox/max_evaluations": server_max_evaluations,
                 },
             }
         )

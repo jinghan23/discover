@@ -409,11 +409,6 @@ async def _evaluate_generated_candidate(
             correct_format,
             timeout=cfg.timeout,
         )
-        blackbox_delta = (outs.metrics or {}).get(
-            "blackbox/evaluator_calls_delta"
-        )
-        if blackbox_delta is not None:
-            evaluator_calls = max(0, int(blackbox_delta))
         metrics = task.build_metrics(
             env,
             outs,
@@ -511,7 +506,6 @@ async def _run_candidate(
     sample_idx: int,
     step_idx: int,
     semaphore: asyncio.Semaphore | None,
-    evaluator_call_limit: int | None = None,
 ) -> list[CandidateResult]:
     prompt = ""
     response = ""
@@ -546,18 +540,6 @@ async def _run_candidate(
         response_candidate = _response_candidate(task, env, response)
         if response_candidate is not None:
             generated_candidates.append(response_candidate)
-
-        unique_candidates: list[GeneratedCandidate] = []
-        seen_code: set[str] = set()
-        for candidate in generated_candidates:
-            if candidate.code in seen_code:
-                continue
-            seen_code.add(candidate.code)
-            unique_candidates.append(candidate)
-        generated_candidates = unique_candidates
-
-        if evaluator_call_limit is not None:
-            generated_candidates = generated_candidates[: max(0, evaluator_call_limit)]
 
         if not generated_candidates:
             generated_candidates = [
@@ -622,8 +604,6 @@ async def sample_batch(
     eval_runner: EvalRunner,
     pool: AutoEvolvePool,
     i_batch: int,
-    *,
-    max_evaluator_calls: int | None = None,
 ) -> tuple[list[CandidateResult], dict[str, Any], list[CandidateResult]]:
     metrics: dict[str, Any] = {}
     parent_states = pool.sample_states(cfg.groups_per_batch)
@@ -633,46 +613,25 @@ async def sample_batch(
         else None
     )
 
-    candidate_specs = [
-        (group_idx, sample_idx, parent_state)
-        for group_idx, parent_state in enumerate(parent_states)
-        for sample_idx in range(cfg.group_size)
-    ]
-    if max_evaluator_calls is None:
-        quotas: list[int | None] = [None] * len(candidate_specs)
-    else:
-        remaining = max(0, int(max_evaluator_calls))
-        active = min(len(candidate_specs), remaining)
-        candidate_specs = candidate_specs[:active]
-        if active:
-            base, extra = divmod(remaining, active)
-            quotas = [base + (idx < extra) for idx in range(active)]
-        else:
-            quotas = []
-
     tasks = []
-    for (group_idx, sample_idx, parent_state), quota in zip(
-        candidate_specs,
-        quotas,
-        strict=True,
-    ):
-        tasks.append(
-            asyncio.create_task(
-                _run_candidate(
-                    cfg,
-                    task,
-                    eval_runner,
-                    pool,
-                    parent_state,
-                    group_idx=group_idx,
-                    sample_idx=sample_idx,
-                    step_idx=i_batch,
-                    semaphore=semaphore,
-                    evaluator_call_limit=quota,
-                ),
-                name=f"autoevolve_sample_{group_idx}_{sample_idx}",
+    for group_idx, parent_state in enumerate(parent_states):
+        for sample_idx in range(cfg.group_size):
+            tasks.append(
+                asyncio.create_task(
+                    _run_candidate(
+                        cfg,
+                        task,
+                        eval_runner,
+                        pool,
+                        parent_state,
+                        group_idx=group_idx,
+                        sample_idx=sample_idx,
+                        step_idx=i_batch,
+                        semaphore=semaphore,
+                    ),
+                    name=f"autoevolve_sample_{group_idx}_{sample_idx}",
+                )
             )
-        )
 
     nested_results = await asyncio.gather(*tasks)
     all_results = [result for results in nested_results for result in results]
@@ -742,7 +701,6 @@ async def run(
                     eval_runner,
                     pool,
                     i_batch,
-                    max_evaluator_calls=budget.remaining,
                 )
             metrics.update(sampling_metrics)
             metrics.update(budget.add(all_results))
