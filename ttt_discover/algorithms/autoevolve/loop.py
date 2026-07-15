@@ -29,6 +29,7 @@ from ttt_discover.algorithms.state import state_from_dict, to_json_serializable
 from ttt_discover.config import DiscoverConfig
 from ttt_discover.eval_runners import EvalRunner
 from ttt_discover.tasks import Task
+from ttt_discover.algorithms.ttt_discover.sampler import load_initial_states
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +69,7 @@ class AutoEvolvePool:
         log_path: str,
         task: Task,
         batch_size: int,
+        initial_state_file: str | None = None,
         resume_step: int | None = None,
     ):
         self.log_path = log_path
@@ -81,8 +83,12 @@ class AutoEvolvePool:
         if resume_step is not None:
             self._load(resume_step)
         if not self._states:
-            for _ in range(self.batch_size):
-                state = self.task.create_initial_state()
+            initial_states = (
+                load_initial_states(initial_state_file, self.task.env_type)
+                if initial_state_file
+                else [self.task.create_initial_state() for _ in range(self.batch_size)]
+            )
+            for state in initial_states:
                 self._states.append(state)
                 self._initial_states.append(state)
             self.flush(step=self._current_step)
@@ -659,6 +665,7 @@ async def run(
         log_path=cfg.log_path,
         task=task,
         batch_size=cfg.groups_per_batch,
+        initial_state_file=cfg.initial_state_file,
         resume_step=start_batch if start_batch > 0 else None,
     )
 
