@@ -70,6 +70,7 @@ class AutonomousCodexCliCompleter(CodexCliCompleter):
             isolate_danger_full_access=cfg.cli_sandbox == "danger-full-access",
             skip_git_repo_check=True,
             prompt_builder=task.autonomous_prompt_builder(eval_runner, env),
+            output_read_retries=1 if cfg.cli_command == "claude" else 20,
         )
 
     def __init__(
@@ -195,6 +196,9 @@ Finish with exactly one Python code block defining the primary best `priority(el
         workspace = getattr(self, "_workspace", None)
         if workspace is None:
             raise RuntimeError("Autonomous Codex workspace was not initialized.")
+        if self.codex_command == "claude":
+            self.cwd = str(workspace)
+            return super()._build_command(output_path)
         if self.isolate_danger_full_access:
             return self._build_isolated_command(workspace, output_path)
         original_cwd = self.cwd
