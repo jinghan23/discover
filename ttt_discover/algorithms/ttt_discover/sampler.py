@@ -131,7 +131,8 @@ def load_initial_states(file_path: str, env_type: type) -> list[State]:
     with open(path, "r", encoding="utf-8") as f:
         payload = json.load(f)
     if isinstance(payload, dict):
-        payload = [payload]
+        wrapped_states = payload.get("states")
+        payload = wrapped_states if isinstance(wrapped_states, list) else [payload]
     if not isinstance(payload, list) or not payload:
         raise ValueError("initial_state_file must contain a state object or a non-empty list")
 
@@ -257,6 +258,11 @@ class PUCTSampler(StateSampler):
 
     def _get_construction_key(self, state: State) -> tuple | str | None:
         if hasattr(state, 'construction') and state.construction:
+            construction_key = getattr(self.env_type, "construction_key", None)
+            if callable(construction_key):
+                key = construction_key(state.construction)
+                if key is not None:
+                    return self._freeze_key(key)
             return self._freeze_key(state.construction)
         if hasattr(state, 'code') and state.code:
             return state.code

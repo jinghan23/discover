@@ -191,6 +191,7 @@ class CodexCliCompleter(TextCompleter):
                 f"step_{step_idx:06d}",
             ),
             call_name=f"group_{group_idx:04d}_sample_{sample_idx:04d}",
+            output_read_retries=1 if cfg.cli_command == "claude" else 20,
         )
 
     def _build_prompt(self, prompt: str) -> str:
@@ -202,6 +203,29 @@ class CodexCliCompleter(TextCompleter):
         )
 
     def _build_command(self, output_path: str) -> list[str]:
+        if self.codex_command == "claude":
+            cmd = [
+                self.codex_command,
+                "-p",
+                "--no-session-persistence",
+                "--output-format",
+                "text",
+            ]
+            if self.model_name:
+                cmd.extend(["--model", self.model_name])
+            if self.sandbox == "read-only":
+                cmd.extend(["--permission-mode", "dontAsk", "--tools", ""])
+            elif self.sandbox == "workspace-write":
+                cmd.extend([
+                    "--permission-mode",
+                    "acceptEdits",
+                    "--allowedTools",
+                    "Bash,Edit,Write,Read,Glob,Grep",
+                ])
+            elif self.sandbox == "danger-full-access":
+                cmd.append("--dangerously-skip-permissions")
+            return cmd
+
         cmd = [
             self.codex_command,
             "exec",

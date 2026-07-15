@@ -91,11 +91,15 @@ class BlackboxRunner(EvalRunner):
                 "msg": message,
                 "correctness": float(correctness),
                 "raw_score": float(raw_score),
-                "result_construction": None,
+                "result_construction": response.get("result_construction"),
                 "stdout": message,
                 "metrics": {
                     "blackbox/ok": ok,
                     "blackbox/stage": response.get("stage"),
+                    "budget/evaluator_calls_server": response.get("budget_used"),
+                    "blackbox/budget_exhausted": bool(
+                        response.get("budget_exhausted")
+                    ),
                 },
             }
         )

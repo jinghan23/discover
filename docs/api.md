@@ -44,17 +44,32 @@ Configuration for discovery runs. Defined with `chz.chz` (frozen/dataclass-like)
 | `groups_per_batch` | `int` | `1` | Parent states sampled per batch. |
 | `group_size` | `int` | `1` | Candidates generated per parent state. |
 | `num_epochs` | `int` | `1` | Number of discovery batches. |
-| `max_evaluator_calls` | `int \| None` | `None` | Optional evaluator-call budget checked after each discovery batch. |
+| `max_evaluator_calls` | `int \| None` | `None` | Optional evaluator-call budget. Managed blackbox servers enforce it as a hard cap. |
 | `num_cpus_per_task` | `int` | `1` | CPUs available to reward evaluators. |
 | `eval_timeout` | `int` | `45` | Evaluation timeout in seconds. |
 | `wandb_project` | `str \| None` | `"tinker-cookbook"` | Weights & Biases project; `None` or empty disables it. |
 | `log_path` | `str` | `""` | Explicit log path; otherwise `discover()` uses `./tinker_log/<experiment_name>`. |
 
-`max_evaluator_calls` is checked after each completed discovery batch, so a run
-can overshoot the budget by at most one batch. One evaluator call means one
-candidate that passes format validation and invokes `eval_runner.evaluate`.
-`inner_iterations` can therefore consume multiple calls for one logged candidate,
-and AutoEvolve consumes one call per generated candidate it actually evaluates.
+For in-process evaluation, `max_evaluator_calls` is checked after each completed
+discovery batch, so a run can overshoot the budget by at most one batch. One
+evaluator call means one candidate that passes format validation and invokes
+`eval_runner.evaluate`; `inner_iterations` can therefore consume multiple calls
+for one logged candidate.
+
+For a managed blackbox server (the default AutoEvolve path when no external
+endpoint is configured), `max_evaluator_calls` is a hard server-side cap. The
+server atomically reserves one call immediately before invoking
+`evaluator.get_reward()`. Agent-internal `eval_client.py` calls and outer
+candidate re-evaluations share the same counter, so concurrent requests cannot
+execute more than the configured total. A reserved call remains charged if the
+evaluator later fails; malformed requests rejected before reservation do not
+consume budget. The budget is not added to the Agent prompt.
+
+When using an already-running external blackbox endpoint, start that server with
+the matching `--max-evaluations` value. Its counter is scoped to the server
+process and is shared by every client and run using that endpoint; restarting the
+server resets the counter. Use a dedicated server process when a cap must apply
+to only one discovery run.
 
 ---
 

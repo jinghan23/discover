@@ -1,5 +1,8 @@
 import json
+import os
 import re
+import shlex
+from pathlib import Path
 
 import numpy as np
 
@@ -72,12 +75,27 @@ class ErdosMinOverlapRewardEvaluator(SandboxRewardEvaluator):
     def get_program_entrypoint(self) -> str:
         return "run"
 
+    def _extract_code(self, response: str) -> str | None:
+        match = re.search(r"```python\s+([\s\S]*?)\s*```", response)
+        if match is not None:
+            return match.group(1).strip()
+        source = response.strip()
+        return source if "def run(" in source else None
+
     def preprocess_generation(self, generation, state) -> str:
         import inspect
         verifier_src = inspect.getsource(verify_c5_solution)
+        evaluator_src = inspect.getsource(evaluate_erdos_solution)
         numpy_import = "import numpy as np"
         
-        base = numpy_import + "\n\n" + verifier_src + "\n\n"
+        base = (
+            numpy_import
+            + "\n\n"
+            + verifier_src
+            + "\n\n"
+            + evaluator_src
+            + "\n\n"
+        )
         
         # State with construction is required - no silent fallback
         if state is None:
@@ -193,6 +211,88 @@ def run(seed=42, budget_s={budget_s}, **kwargs):
         c5_bound = float(np.max(correlation))
         return State(timestep=-1, code="", value=-c5_bound, construction=list(construction))
 
+    def _initial_submission_source(self) -> str:
+        code = getattr(self.initial_state, "code", "") or ""
+        match = re.search(r"```python\s+([\s\S]*?)\s*```", code)
+        if match is not None:
+            return match.group(1).strip() + "\n"
+        if "def run(" in code:
+            return code.strip() + "\n"
+        budget_s = max(1, int(self.eval_timeout))
+        return f'''import numpy as np
+
+
+def run(seed=42, budget_s={budget_s}, **kwargs):
+    h = np.asarray(initial_h_values, dtype=float).copy()
+    n_points = int(h.size)
+    c5_bound = float(
+        np.max(np.correlate(h, 1.0 - h, mode="full") * (2.0 / n_points))
+    )
+    return h, c5_bound, n_points
+'''
+
+    def build_blackbox_autonomous_prompt(
+        self,
+        *,
+        prompt: str,
+        workspace: Path,
+        eval_timeout: int,
+        num_cpus_per_task: int,
+        socket_path: str | None = None,
+        host: str = "127.0.0.1",
+        port: int | None = None,
+    ) -> str:
+        del num_cpus_per_task
+        socket_path = socket_path or os.environ.get("TTT_BLACKBOX_EVAL_SOCKET")
+        host = os.environ.get("TTT_BLACKBOX_EVAL_HOST") or host
+        env_port = os.environ.get("TTT_BLACKBOX_EVAL_PORT")
+        if port is None and env_port:
+            port = int(env_port)
+        if socket_path is None and port is None:
+            raise ValueError(
+                "Blackbox autonomous Erdos search requires a socket path or TCP port."
+            )
+
+        (workspace / "submission.py").write_text(
+            self._initial_submission_source(),
+            encoding="utf-8",
+        )
+        (workspace / "eval_client.py").write_text(
+            _erdos_blackbox_eval_client_source(
+                problem_type=self.problem_type,
+                socket_path=socket_path,
+                host=host,
+                port=port,
+                timeout_s=max(1.0, float(eval_timeout)),
+                state=self.initial_state.to_dict(),
+            ),
+            encoding="utf-8",
+        )
+
+        evaluator_cmd = f"cd {shlex.quote(str(workspace))} && python eval_client.py"
+        return f"""{prompt}
+
+--- Autonomous Erdos Blackbox Search Mode ---
+You may inspect files and run shell commands, but keep all edits inside this workspace:
+{workspace}
+
+Editable candidate:
+{workspace / "submission.py"}
+
+The local evaluator is a blackbox service. The parent construction is supplied
+to the trusted evaluator as `initial_h_values`; evaluator internals are not
+available in this workspace.
+
+Run this evaluator after each revision:
+{evaluator_cmd}
+
+Do not edit `eval_client.py` to improve a score. Only `submission.py` is a valid
+candidate artifact. It must be plain Python source defining `run(...)`.
+
+When done, put the best implementation in:
+{workspace / "submission.py"}
+"""
+
     def is_maximize(self) -> bool:
         return False # Minimize upper bound
 
@@ -260,6 +360,101 @@ Smaller sequences with less than 1k samples are preferred - they are faster to o
 {state_ctx}
 {construction_section}
 {code_section}
+'''
+
+
+def _erdos_blackbox_eval_client_source(
+    *,
+    state: dict[str, object],
+    problem_type: str = "",
+    socket_path: str | None = None,
+    host: str = "127.0.0.1",
+    port: int | None = None,
+    timeout_s: float = 3600.0,
+) -> str:
+    if socket_path is None and port is None:
+        raise ValueError("Either socket_path or port must be provided")
+
+    state_json = json.dumps(state, ensure_ascii=False, separators=(",", ":"))
+    return f'''#!/usr/bin/env python3
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+import socket
+import sys
+import uuid
+
+
+PROBLEM_TYPE = {problem_type!r}
+SOCKET_PATH = {socket_path!r}
+HOST = {host!r}
+PORT = {port!r}
+TIMEOUT_S = {float(timeout_s)!r}
+STATE = json.loads({state_json!r})
+
+
+def _connect() -> socket.socket:
+    socket_path = os.environ.get("TTT_BLACKBOX_EVAL_SOCKET") or SOCKET_PATH
+    port_value = os.environ.get("TTT_BLACKBOX_EVAL_PORT")
+    host_value = os.environ.get("TTT_BLACKBOX_EVAL_HOST") or HOST
+    if socket_path:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(TIMEOUT_S)
+        sock.connect(socket_path)
+        return sock
+    port = int(port_value) if port_value else PORT
+    if port is None:
+        raise SystemExit("missing blackbox eval runner socket or TCP port")
+    sock = socket.create_connection((host_value, int(port)), timeout=TIMEOUT_S)
+    sock.settimeout(TIMEOUT_S)
+    return sock
+
+
+def _recv_line(sock: socket.socket) -> bytes:
+    chunks = []
+    while True:
+        chunk = sock.recv(65536)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        if b"\\n" in chunk:
+            break
+    return b"".join(chunks).split(b"\\n", 1)[0]
+
+
+def main() -> int:
+    submission_path = sys.argv[1] if len(sys.argv) > 1 else "submission.py"
+    source = Path(submission_path).read_text(encoding="utf-8")
+    request = {{
+        "request_id": str(uuid.uuid4()),
+        "problem_type": PROBLEM_TYPE,
+        "submission": source,
+        "state": STATE,
+    }}
+    data = json.dumps(request, ensure_ascii=False, separators=(",", ":")).encode() + b"\\n"
+    with _connect() as sock:
+        sock.sendall(data)
+        response_data = _recv_line(sock)
+    response = json.loads(response_data.decode("utf-8"))
+
+    message = str(response.get("message") or "")
+    if response.get("ok"):
+        print(message or "pass")
+        if response.get("raw_score") is not None:
+            print(f"raw_score {{response['raw_score']}}")
+        if response.get("reward") is not None:
+            print(f"reward {{response['reward']}}")
+        return 0
+
+    stage = response.get("stage") or "eval"
+    print(f"FAIL stage={{stage}} message={{message or 'evaluation failed'}}", file=sys.stderr)
+    return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
 '''
 
 
