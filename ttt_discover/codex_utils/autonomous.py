@@ -265,6 +265,15 @@ Finish with exactly one Python code block defining the primary best `priority(el
             root = root.resolve()
             if root.exists() and root not in mask_roots:
                 mask_roots.append(root)
+        extra_mask_paths = os.environ.get("TTT_AUTONOMOUS_MASK_PATHS", "")
+        for raw_path in extra_mask_paths.split(os.pathsep):
+            if not raw_path.strip():
+                continue
+            path = Path(raw_path).expanduser().resolve()
+            if path == Path("/"):
+                raise ValueError("TTT_AUTONOMOUS_MASK_PATHS must not contain /")
+            if path.exists() and path not in mask_roots:
+                mask_roots.append(path)
 
         workspace_shell = shlex.quote(str(workspace))
         codex_home_shell = shlex.quote(str(codex_home))
@@ -290,6 +299,8 @@ mount --bind {nvm_shell} "$iso_root/nvm"
 for path in {mask_roots_shell}; do
     if [ -d "$path" ]; then
         mount -t tmpfs tmpfs "$path"
+    elif [ -f "$path" ]; then
+        mount --bind /dev/null "$path"
     fi
 done
 if [ -d {home_shell} ]; then

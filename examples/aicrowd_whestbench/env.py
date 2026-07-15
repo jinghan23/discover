@@ -1,38 +1,107 @@
 from __future__ import annotations
 
-import math
 import os
 import re
-from dataclasses import dataclass
-from types import SimpleNamespace
-from typing import Any, Callable
+import shlex
+import tempfile
+from dataclasses import dataclass, replace
+from functools import lru_cache
+from pathlib import Path
+from typing import Any
 
-import numpy as np
-
-from ttt_discover import BaseRewardEvaluator, DiscoverConfig, Environment, State, discover
+import flopscope.numpy as fnp
+from whestbench import BaseEstimator, SetupContext, load_dataset, metadata
+from whestbench.runner import (
+    EstimatorEntrypoint,
+    LocalRunner,
+    ResourceLimits,
+    SubprocessRunner,
+)
+from whestbench.scoring import (
+    ContestData,
+    ContestSpec,
+    evaluate_estimator,
+    make_contest,
+    make_contest_from_dataset,
+)
 
 from examples.aicrowd_whestbench.prompt import WHESTBENCH_PROMPT
+from ttt_discover import BaseRewardEvaluator, DiscoverConfig, Environment, State, discover
+from ttt_discover.eval_runners.blackbox_eval import build_eval_client_source
 
 
 _CODE_BLOCK_RE = re.compile(r"```(?:python|py)?\s*([\s\S]*?)```")
-_DEFAULT_WIDTH = 64
-_DEFAULT_DEPTH = 8
-_DEFAULT_REFERENCE_SAMPLES = 4096
-_DEFAULT_BUDGET = int(1e9)
-_DEFAULT_SEEDS = (0, 1, 2)
-_TARGET_FINAL_LAYER_MSE = 1.0e-6
+_DEFAULT_DATASET = "aicrowd/arc-whestbench-public-2026"
+_DEFAULT_REVISION = "v1-phase1"
+_DEFAULT_SPLIT = "mini"
+_DEFAULT_N_MLPS = 100
+_DEFAULT_FLOP_BUDGET = 272_000_000_000
+_DEFAULT_LAMBDA_FLOPS_PER_SECOND = 1e11
+_TARGET_ADJUSTED_SCORE = 1e-7
+_INITIAL_ESTIMATOR_PATH_ENV = "WHEST_INITIAL_ESTIMATOR_PATH"
 
 
 @dataclass(frozen=True)
-class WhestMlp:
-    width: int
-    depth: int
-    weights: list[np.ndarray]
-    seed: int
+class OfficialSuiteConfig:
+    dataset: str = _DEFAULT_DATASET
+    revision: str | None = _DEFAULT_REVISION
+    split: str = _DEFAULT_SPLIT
+    n_mlps: int = _DEFAULT_N_MLPS
+    flop_budget: int = _DEFAULT_FLOP_BUDGET
+    setup_timeout_s: float = 5.0
+    predict_timeout_s: float = 30.0
+    memory_limit_mb: int = 65_536
+    wall_time_limit_s: float | None = 60.0
+    residual_wall_time_limit_s: float | None = None
+    lambda_flops_per_second: float = _DEFAULT_LAMBDA_FLOPS_PER_SECOND
+    seed: int = 0
+    runner: str = "subprocess"
+    streaming: bool = False
+
+    def validate(self) -> None:
+        if not self.dataset:
+            raise ValueError("WHEST_DATASET must not be empty")
+        if not self.split:
+            raise ValueError("WHEST_DATASET_SPLIT must not be empty")
+        if self.n_mlps <= 0:
+            raise ValueError("WHEST_N_MLPS must be positive")
+        if self.flop_budget <= 0:
+            raise ValueError("WHEST_FLOP_BUDGET must be positive")
+        if self.lambda_flops_per_second <= 0:
+            raise ValueError("WHEST_LAMBDA_FLOPS_PER_SECOND must be positive")
+        if self.runner not in {"local", "subprocess"}:
+            raise ValueError("WHEST_RUNNER must be 'local' or 'subprocess'")
 
 
-class CandidateError(ValueError):
-    """Candidate code failed the local WhestBench contract."""
+INITIAL_ESTIMATOR_CODE = '''from __future__ import annotations
+
+import flopscope as flops
+import flopscope.numpy as fnp
+from whestbench import BaseEstimator
+
+
+class Estimator(BaseEstimator):
+    """Official diagonal mean/variance propagation baseline."""
+
+    def predict(self, mlp, budget):
+        del budget
+        mu = fnp.zeros(mlp.width)
+        var = fnp.ones(mlp.width)
+        rows = []
+        for w in mlp.weights:
+            mu_pre = w.T @ mu
+            var_pre = (w * w).T @ var
+            var_pre = fnp.maximum(var_pre, 1e-12)
+            sigma_pre = fnp.sqrt(var_pre)
+            alpha = mu_pre / sigma_pre
+            phi = flops.stats.norm.pdf(alpha)
+            cdf = flops.stats.norm.cdf(alpha)
+            mu = mu_pre * cdf + sigma_pre * phi
+            ez2 = (mu_pre * mu_pre + var_pre) * cdf + mu_pre * sigma_pre * phi
+            var = fnp.maximum(ez2 - mu * mu, 0.0)
+            rows.append(mu)
+        return fnp.stack(rows, axis=0)
+'''
 
 
 def _extract_python_code(text: str) -> str:
@@ -42,220 +111,238 @@ def _extract_python_code(text: str) -> str:
     return (text or "").strip() + "\n"
 
 
-def build_mlp(width: int, depth: int, seed: int) -> WhestMlp:
-    if width < 1 or depth < 1:
-        raise ValueError(f"width and depth must be positive, got {width=} {depth=}")
-    rng = np.random.default_rng(seed)
-    scale = math.sqrt(2.0 / width)
-    weights = [
-        (rng.standard_normal((width, width)) * scale).astype(np.float32)
-        for _ in range(depth)
-    ]
-    return WhestMlp(width=width, depth=depth, weights=weights, seed=seed)
+def _optional_float_env(name: str, default: float | None) -> float | None:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    if value.strip().lower() in {"", "none", "null", "off"}:
+        return None
+    return float(value)
 
 
-def monte_carlo_layer_means(
-    mlp: WhestMlp,
-    n_samples: int,
-    *,
-    seed: int,
-) -> np.ndarray:
-    rng = np.random.default_rng(seed)
-    x = rng.standard_normal((n_samples, mlp.width)).astype(np.float32)
-    rows: list[np.ndarray] = []
-    for w in mlp.weights:
-        x = np.maximum(x @ w, 0.0)
-        rows.append(np.mean(x, axis=0))
-    return np.stack(rows, axis=0)
+def _bool_env(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in {"0", "false", "no", "off"}
 
 
-def _normal_pdf(x: np.ndarray) -> np.ndarray:
-    return np.exp(-0.5 * x * x) / math.sqrt(2.0 * math.pi)
-
-
-def _normal_cdf_approx(x: np.ndarray) -> np.ndarray:
-    # GELU-style tanh approximation; avoids a scipy dependency for local smoke tests.
-    return 0.5 * (
-        1.0
-        + np.tanh(math.sqrt(2.0 / math.pi) * (x + 0.044715 * np.power(x, 3)))
-    )
-
-
-def mean_propagation_estimate(mlp: WhestMlp, budget: int = _DEFAULT_BUDGET) -> np.ndarray:
-    del budget
-    mu = np.zeros(mlp.width, dtype=np.float64)
-    var = np.ones(mlp.width, dtype=np.float64)
-    rows: list[np.ndarray] = []
-    for w in mlp.weights:
-        w64 = w.astype(np.float64, copy=False)
-        mu_pre = w64.T @ mu
-        var_pre = (w64 * w64).T @ var
-        var_pre = np.maximum(var_pre, 1e-12)
-        sigma_pre = np.sqrt(var_pre)
-        alpha = mu_pre / sigma_pre
-        phi = _normal_pdf(alpha)
-        cdf = _normal_cdf_approx(alpha)
-        mu = mu_pre * cdf + sigma_pre * phi
-        ez2 = (mu_pre * mu_pre + var_pre) * cdf + mu_pre * sigma_pre * phi
-        var = np.maximum(ez2 - mu * mu, 0.0)
-        rows.append(mu.astype(np.float64, copy=True))
-    return np.stack(rows, axis=0)
-
-
-INITIAL_ESTIMATOR_CODE = '''import math
-import numpy as np
-
-
-def _normal_pdf(x):
-    return np.exp(-0.5 * x * x) / math.sqrt(2.0 * math.pi)
-
-
-def _normal_cdf_approx(x):
-    return 0.5 * (
-        1.0
-        + np.tanh(math.sqrt(2.0 / math.pi) * (x + 0.044715 * np.power(x, 3)))
-    )
-
-
-def estimate(mlp, budget):
-    """Diagonal mean/variance propagation baseline for WhestBench."""
-    del budget
-    mu = np.zeros(mlp.width, dtype=np.float64)
-    var = np.ones(mlp.width, dtype=np.float64)
-    rows = []
-    for w in mlp.weights:
-        w64 = w.astype(np.float64, copy=False)
-        mu_pre = w64.T @ mu
-        var_pre = (w64 * w64).T @ var
-        var_pre = np.maximum(var_pre, 1e-12)
-        sigma_pre = np.sqrt(var_pre)
-        alpha = mu_pre / sigma_pre
-        phi = _normal_pdf(alpha)
-        cdf = _normal_cdf_approx(alpha)
-        mu = mu_pre * cdf + sigma_pre * phi
-        ez2 = (mu_pre * mu_pre + var_pre) * cdf + mu_pre * sigma_pre * phi
-        var = np.maximum(ez2 - mu * mu, 0.0)
-        rows.append(mu.astype(np.float64, copy=True))
-    return np.stack(rows, axis=0)
-'''
-
-
-def _call_estimator(fn: Callable[..., Any], mlp: WhestMlp, budget: int) -> np.ndarray:
-    try:
-        prediction = fn(mlp, budget)
-    except TypeError:
-        prediction = fn(mlp)
-    arr = np.asarray(prediction, dtype=np.float64)
-    if arr.shape != (mlp.depth, mlp.width):
-        raise CandidateError(
-            f"prediction has shape {arr.shape}, expected {(mlp.depth, mlp.width)}"
-        )
-    if not np.all(np.isfinite(arr)):
-        raise CandidateError("prediction contains non-finite values")
-    return arr
-
-
-def _load_estimator(code: str) -> Callable[[WhestMlp, int], np.ndarray]:
-    namespace: dict[str, Any] = {
-        "__builtins__": __builtins__,
-        "math": math,
-        "np": np,
-        "numpy": np,
-    }
-    try:
-        exec(compile(code, "<whestbench-candidate>", "exec"), namespace, namespace)
-    except Exception as exc:
-        raise CandidateError(f"could not execute candidate code: {exc}") from exc
-
-    if callable(namespace.get("estimate")):
-        return namespace["estimate"]
-    if callable(namespace.get("predict")):
-        return namespace["predict"]
-
-    estimator_cls = namespace.get("Estimator")
-    if estimator_cls is not None:
-        try:
-            estimator = estimator_cls()
-            if hasattr(estimator, "setup"):
-                estimator.setup(SimpleNamespace(seed=0))
-        except Exception as exc:
-            raise CandidateError(f"could not construct Estimator: {exc}") from exc
-        predict = getattr(estimator, "predict", None)
-        if callable(predict):
-            return predict
-
-    raise CandidateError(
-        "candidate must define estimate(mlp, budget), predict(mlp, budget), "
-        "or class Estimator with predict()"
-    )
-
-
-def _score_callable(
-    estimator: Callable[[WhestMlp, int], np.ndarray],
-    *,
-    width: int,
-    depth: int,
-    reference_samples: int,
-    seeds: tuple[int, ...],
-    budget: int,
-) -> dict[str, Any]:
-    rows: list[dict[str, Any]] = []
-    final_mses: list[float] = []
-    all_mses: list[float] = []
-
-    for seed in seeds:
-        mlp = build_mlp(width=width, depth=depth, seed=seed)
-        reference = monte_carlo_layer_means(
-            mlp,
-            reference_samples,
-            seed=seed + 10_000,
-        )
-        prediction = _call_estimator(estimator, mlp, budget)
-        err = np.square(prediction - reference)
-        final_mse = float(np.mean(err[-1]))
-        all_mse = float(np.mean(err))
-        final_mses.append(final_mse)
-        all_mses.append(all_mse)
-        rows.append(
-            {
-                "seed": seed,
-                "final_layer_mse": final_mse,
-                "all_layer_mse": all_mse,
-            }
-        )
-
-    return {
-        "final_layer_mse": float(np.mean(final_mses)),
-        "all_layer_mse": float(np.mean(all_mses)),
-        "rows": rows,
-    }
-
-
-def _parse_seed_list(value: str | None) -> tuple[int, ...]:
-    if not value:
-        return _DEFAULT_SEEDS
-    seeds = tuple(int(part.strip()) for part in value.split(",") if part.strip())
-    return seeds or _DEFAULT_SEEDS
-
-
-def _suite_from_env() -> dict[str, Any]:
-    return {
-        "width": int(os.environ.get("WHEST_LOCAL_WIDTH", _DEFAULT_WIDTH)),
-        "depth": int(os.environ.get("WHEST_LOCAL_DEPTH", _DEFAULT_DEPTH)),
-        "reference_samples": int(
-            os.environ.get("WHEST_LOCAL_REFERENCE_SAMPLES", _DEFAULT_REFERENCE_SAMPLES)
+def _suite_from_env() -> OfficialSuiteConfig:
+    dataset = os.environ.get("WHEST_DATASET", _DEFAULT_DATASET).strip()
+    revision_value = os.environ.get("WHEST_DATASET_REVISION", _DEFAULT_REVISION).strip()
+    config = OfficialSuiteConfig(
+        dataset=dataset,
+        revision=revision_value or None,
+        split=os.environ.get("WHEST_DATASET_SPLIT", _DEFAULT_SPLIT).strip(),
+        n_mlps=int(os.environ.get("WHEST_N_MLPS", _DEFAULT_N_MLPS)),
+        flop_budget=int(os.environ.get("WHEST_FLOP_BUDGET", _DEFAULT_FLOP_BUDGET)),
+        setup_timeout_s=float(os.environ.get("WHEST_SETUP_TIMEOUT", 5.0)),
+        predict_timeout_s=float(os.environ.get("WHEST_PREDICT_TIMEOUT", 30.0)),
+        memory_limit_mb=int(os.environ.get("WHEST_MEMORY_LIMIT_MB", 65_536)),
+        wall_time_limit_s=_optional_float_env("WHEST_WALL_TIME_LIMIT", 60.0),
+        residual_wall_time_limit_s=_optional_float_env(
+            "WHEST_RESIDUAL_WALL_TIME_LIMIT", None
         ),
-        "seeds": _parse_seed_list(os.environ.get("WHEST_LOCAL_SEEDS")),
-        "budget": int(os.environ.get("WHEST_LOCAL_BUDGET", _DEFAULT_BUDGET)),
-    }
+        lambda_flops_per_second=float(
+            os.environ.get(
+                "WHEST_LAMBDA_FLOPS_PER_SECOND", _DEFAULT_LAMBDA_FLOPS_PER_SECOND
+            )
+        ),
+        seed=int(os.environ.get("WHEST_SETUP_SEED", 0)),
+        runner=os.environ.get("WHEST_RUNNER", "subprocess").strip().lower(),
+        streaming=_bool_env("WHEST_DATASET_STREAMING", False),
+    )
+    config.validate()
+    return config
 
 
-def _format_rows(rows: list[dict[str, Any]]) -> str:
-    lines = ["seed | final_layer_mse | all_layer_mse"]
-    for row in rows:
+def _resolve_dataset_source(config: OfficialSuiteConfig) -> tuple[str, str | None]:
+    source = config.dataset
+    revision = config.revision
+    if source.startswith("hf://"):
+        source = source[len("hf://") :]
+    if not Path(source).exists() and "@" in source:
+        source, embedded_revision = source.rsplit("@", 1)
+        revision = embedded_revision or revision
+    return source, revision
+
+
+@lru_cache(maxsize=4)
+def _load_contest_data(config: OfficialSuiteConfig) -> ContestData:
+    config.validate()
+    source, revision = _resolve_dataset_source(config)
+    is_local = Path(source).exists()
+    dataset = load_dataset(
+        source,
+        revision=revision,
+        split=config.split,
+        streaming=config.streaming and not is_local,
+    )
+    dataset_metadata = metadata(dataset)
+    available = int(dataset_metadata.get("n_mlps") or 0)
+    if available and config.n_mlps > available:
+        raise ValueError(
+            f"WHEST_N_MLPS={config.n_mlps} exceeds dataset split size {available}"
+        )
+
+    spec = ContestSpec(
+        width=int(dataset_metadata["width"]),
+        depth=int(dataset_metadata["depth"]),
+        n_mlps=config.n_mlps,
+        flop_budget=config.flop_budget,
+        ground_truth_samples=max(1, int(dataset_metadata.get("n_samples") or 1)),
+        setup_timeout_s=config.setup_timeout_s,
+        predict_timeout_s=config.predict_timeout_s,
+        memory_limit_mb=config.memory_limit_mb,
+        wall_time_limit_s=config.wall_time_limit_s,
+        residual_wall_time_limit_s=config.residual_wall_time_limit_s,
+        seed=config.seed,
+        lambda_flops_per_second=config.lambda_flops_per_second,
+    )
+    return make_contest_from_dataset(spec, dataset, config.n_mlps)
+
+
+class _RunnerEstimator(BaseEstimator):
+    def __init__(self, runner: LocalRunner | SubprocessRunner):
+        self.runner = runner
+
+    def predict(self, mlp, budget):
+        return self.runner.predict(mlp, budget)
+
+    def last_predict_stats(self):
+        return self.runner.last_predict_stats()
+
+
+class _FailedEstimator(BaseEstimator):
+    def __init__(self, error: Exception):
+        self.error = error
+
+    def predict(self, mlp, budget):
+        del mlp, budget
+        raise self.error
+
+
+def _runner_for(config: OfficialSuiteConfig) -> LocalRunner | SubprocessRunner:
+    return SubprocessRunner() if config.runner == "subprocess" else LocalRunner()
+
+
+def _close_runner(runner: LocalRunner | SubprocessRunner) -> None:
+    # whestbench 0.12.0rc5 terminates the worker but leaves its Popen pipes open.
+    process = getattr(runner, "_process", None)
+    runner.close()
+    if process is None:
+        return
+    for stream_name in ("stdin", "stdout", "stderr"):
+        stream = getattr(process, stream_name, None)
+        if stream is not None and not stream.closed:
+            stream.close()
+
+
+def _score_code(
+    code: str,
+    data: ContestData,
+    config: OfficialSuiteConfig,
+) -> dict[str, Any]:
+    runner = _runner_for(config)
+    with tempfile.TemporaryDirectory(prefix="ttt-whestbench-") as tmp:
+        submission_dir = Path(tmp)
+        estimator_path = submission_dir / "estimator.py"
+        estimator_path.write_text(code, encoding="utf-8")
+        scratch_dir = submission_dir / "scratch"
+        scratch_dir.mkdir()
+
+        context = SetupContext(
+            width=data.spec.width,
+            depth=data.spec.depth,
+            flop_budget=data.spec.flop_budget,
+            api_version="1.0",
+            scratch_dir=str(scratch_dir),
+            submission_dir=str(submission_dir),
+            seed=config.seed,
+        )
+        limits = ResourceLimits(
+            setup_timeout_s=config.setup_timeout_s,
+            predict_timeout_s=config.predict_timeout_s,
+            memory_limit_mb=config.memory_limit_mb,
+            flop_budget=config.flop_budget,
+            wall_time_limit_s=config.wall_time_limit_s,
+            residual_wall_time_limit_s=config.residual_wall_time_limit_s,
+        )
+
+        try:
+            runner.start(
+                EstimatorEntrypoint(file_path=estimator_path, class_name="Estimator"),
+                context,
+                limits,
+            )
+        except Exception as exc:
+            _close_runner(runner)
+            return evaluate_estimator(_FailedEstimator(exc), data)
+
+        try:
+            return evaluate_estimator(_RunnerEstimator(runner), data)
+        finally:
+            _close_runner(runner)
+
+
+@lru_cache(maxsize=4)
+def _official_baseline_report(config: OfficialSuiteConfig) -> dict[str, Any]:
+    return _score_code(INITIAL_ESTIMATOR_CODE, _load_contest_data(config), config)
+
+
+@lru_cache(maxsize=8)
+def _configured_initial_estimator(
+    config: OfficialSuiteConfig,
+    estimator_path: str,
+) -> tuple[str, dict[str, Any]]:
+    if not estimator_path:
+        return INITIAL_ESTIMATOR_CODE, _official_baseline_report(config)
+
+    path = Path(estimator_path).expanduser().resolve()
+    code = _extract_python_code(path.read_text(encoding="utf-8"))
+    if "class Estimator" not in code or "def predict" not in code:
+        raise ValueError(
+            f"{_INITIAL_ESTIMATOR_PATH_ENV} must define an Estimator.predict method: {path}"
+        )
+    return code, _score_code(code, _load_contest_data(config), config)
+
+
+def _per_mlp_summary(report: dict[str, Any]) -> list[dict[str, Any]]:
+    keys = (
+        "mlp_index",
+        "mlp_name",
+        "adjusted_final_layer_score",
+        "final_layer_mse",
+        "all_layers_mse",
+        "flops_used",
+        "effective_compute",
+        "budget_exhausted",
+        "time_exhausted",
+        "residual_wall_time_exhausted",
+        "combined_budget_exhausted",
+        "error_code",
+    )
+    return [{key: row.get(key) for key in keys if key in row} for row in report["per_mlp"]]
+
+
+def _format_report(report: dict[str, Any]) -> str:
+    lines = ["mlp | adjusted_score | final_mse | effective_compute | status"]
+    for row in report["per_mlp"]:
+        failed = bool(row.get("error_code")) or any(
+            row.get(flag)
+            for flag in (
+                "budget_exhausted",
+                "time_exhausted",
+                "residual_wall_time_exhausted",
+                "combined_budget_exhausted",
+            )
+        )
         lines.append(
-            f"{row['seed']} | {row['final_layer_mse']:.8g} | "
-            f"{row['all_layer_mse']:.8g}"
+            f"{row.get('mlp_name') or row['mlp_index']} | "
+            f"{row['adjusted_final_layer_score']:.8g} | "
+            f"{row['final_layer_mse']:.8g} | "
+            f"{row.get('effective_compute', 0.0):.8g} | "
+            f"{'failed' if failed else 'ok'}"
         )
     return "\n".join(lines)
 
@@ -263,52 +350,72 @@ def _format_rows(rows: list[dict[str, Any]]) -> str:
 class WhestBenchRewardEvaluator(BaseRewardEvaluator):
     def __init__(self, *args, **kwargs):
         del args
-        self.problem_type = kwargs.get("problem_type", "arc_whestbench_2026")
-        self.suite = _suite_from_env()
+        self.problem_type = kwargs.pop("problem_type", "arc_whestbench_2026")
+        self.config = kwargs.pop("suite_config", None) or _suite_from_env()
+        provided_contest_data = kwargs.pop("contest_data", None)
+        self.contest_data = provided_contest_data or _load_contest_data(self.config)
+        self.baseline = kwargs.pop("baseline_report", None)
+        if self.baseline is None:
+            if provided_contest_data is None:
+                self.baseline = _official_baseline_report(self.config)
+            else:
+                self.baseline = _score_code(
+                    INITIAL_ESTIMATOR_CODE, self.contest_data, self.config
+                )
 
     def get_reward(self, code: str, state: State) -> dict[str, Any]:
         del state
         candidate_code = _extract_python_code(code)
         if not candidate_code.strip():
-            return self._failure("Empty candidate.")
+            return self._infrastructure_failure("Empty candidate.")
 
         try:
-            estimator = _load_estimator(candidate_code)
-            candidate = _score_callable(estimator, **self.suite)
-            baseline = _score_callable(mean_propagation_estimate, **self.suite)
-        except CandidateError as exc:
-            return self._failure(str(exc))
+            candidate = _score_code(candidate_code, self.contest_data, self.config)
         except Exception as exc:
-            return self._failure(f"Error while scoring candidate: {exc}")
+            return self._infrastructure_failure(f"Official evaluator failed: {exc}")
 
-        score = candidate["final_layer_mse"]
-        baseline_score = baseline["final_layer_mse"]
-        reward = baseline_score / max(score, 1e-12)
-        stdout = _format_rows(candidate["rows"])
+        score = float(candidate["adjusted_final_layer_score"])
+        baseline_score = float(self.baseline["adjusted_final_layer_score"])
+        reward = baseline_score / max(score, 1e-30)
+        n_mlps = len(candidate["per_mlp"])
+        n_failed = int(candidate["n_failed_mlps"])
+        correctness = (n_mlps - n_failed) / n_mlps if n_mlps else 0.0
         return {
             "reward": float(reward),
             "msg": (
-                f"final_layer_mse={score:.8g}; "
-                f"baseline_final_layer_mse={baseline_score:.8g}; "
-                f"all_layer_mse={candidate['all_layer_mse']:.8g}"
+                f"adjusted_final_layer_score={score:.8g}; "
+                f"final_layer_mse={candidate['final_layer_mse']:.8g}; "
+                f"baseline_adjusted_score={baseline_score:.8g}; "
+                f"failed_mlps={n_failed}/{n_mlps}"
             ),
-            "correctness": 1.0,
-            "raw_score": float(score),
-            "result_construction": candidate["rows"],
-            "stdout": stdout,
+            "correctness": float(correctness),
+            "raw_score": score,
+            "result_construction": _per_mlp_summary(candidate),
+            "stdout": _format_report(candidate),
             "metrics": {
-                "whestbench/final_layer_mse": float(score),
-                "whestbench/all_layer_mse": float(candidate["all_layer_mse"]),
-                "whestbench/baseline_final_layer_mse": float(baseline_score),
+                "whestbench/adjusted_final_layer_score": score,
+                "whestbench/final_layer_mse": float(candidate["final_layer_mse"]),
+                "whestbench/all_layers_mse": float(candidate["all_layers_mse"]),
+                "whestbench/baseline_adjusted_score": baseline_score,
                 "whestbench/reward_vs_baseline": float(reward),
-                "whestbench/width": self.suite["width"],
-                "whestbench/depth": self.suite["depth"],
-                "whestbench/reference_samples": self.suite["reference_samples"],
+                "whestbench/mean_score_multiplier": float(
+                    candidate["mean_score_multiplier"]
+                ),
+                "whestbench/mean_compute_utilization": float(
+                    candidate["mean_compute_utilization"]
+                ),
+                "whestbench/mean_effective_compute": float(
+                    candidate["mean_effective_compute"]
+                ),
+                "whestbench/n_failed_mlps": n_failed,
+                "whestbench/n_mlps": n_mlps,
+                "whestbench/flop_budget": self.config.flop_budget,
+                "whestbench/lambda_flops_per_second": self.config.lambda_flops_per_second,
             },
         }
 
     @staticmethod
-    def _failure(msg: str) -> dict[str, Any]:
+    def _infrastructure_failure(msg: str) -> dict[str, Any]:
         return {
             "reward": 0.0,
             "msg": msg,
@@ -327,17 +434,38 @@ class WhestBenchEnv(Environment):
     @classmethod
     def create_initial_state(cls, problem_type: str) -> State:
         del problem_type
-        suite = _suite_from_env()
-        baseline = _score_callable(mean_propagation_estimate, **suite)
+        config = _suite_from_env()
+        data = _load_contest_data(config)
+        baseline = _official_baseline_report(config)
+        estimator_path = os.environ.get(_INITIAL_ESTIMATOR_PATH_ENV, "").strip()
+        initial_code, initial = _configured_initial_estimator(config, estimator_path)
+        spec = data.spec
         return State(
             timestep=-1,
-            construction=baseline["rows"],
-            code=INITIAL_ESTIMATOR_CODE,
-            value=-baseline["final_layer_mse"],
+            construction=_per_mlp_summary(initial),
+            code=initial_code,
+            value=-float(initial["adjusted_final_layer_score"]),
             metadata={
                 "challenge": "ARC White-Box Estimation Challenge 2026",
-                "local_suite": suite,
-                "baseline_all_layer_mse": baseline["all_layer_mse"],
+                "official_suite": {
+                    "dataset": config.dataset,
+                    "revision": config.revision,
+                    "split": config.split,
+                    "n_mlps": spec.n_mlps,
+                    "width": spec.width,
+                    "depth": spec.depth,
+                    "flop_budget": spec.flop_budget,
+                    "lambda_flops_per_second": spec.lambda_flops_per_second,
+                    "runner": config.runner,
+                },
+                "baseline_final_layer_mse": baseline["final_layer_mse"],
+                "baseline_all_layers_mse": baseline["all_layers_mse"],
+                "initial_estimator_path": estimator_path or None,
+                "initial_adjusted_final_layer_score": initial[
+                    "adjusted_final_layer_score"
+                ],
+                "initial_final_layer_mse": initial["final_layer_mse"],
+                "initial_all_layers_mse": initial["all_layers_mse"],
             },
         )
 
@@ -354,32 +482,129 @@ class WhestBenchEnv(Environment):
         if not parsed_code or not parsed_code.strip():
             return False
         code = _extract_python_code(parsed_code)
-        return any(
-            marker in code
-            for marker in ("def estimate", "def predict", "class Estimator")
+        return "class Estimator" in code and "def predict" in code
+
+    def _initial_estimator_code(self) -> str:
+        code = _extract_python_code(getattr(self.initial_state, "code", "") or "")
+        if "class Estimator" in code and "def predict" in code:
+            return code
+        return INITIAL_ESTIMATOR_CODE
+
+    def build_autonomous_prompt(
+        self,
+        *,
+        prompt: str,
+        workspace: Path,
+        eval_timeout: int,
+        num_cpus_per_task: int,
+    ) -> str:
+        del eval_timeout, num_cpus_per_task
+        (workspace / "submission.py").write_text(
+            self._initial_estimator_code(),
+            encoding="utf-8",
         )
+        return f"""{prompt}
+
+--- Autonomous WhestBench Isolated Search Mode ---
+Work only inside this workspace:
+{workspace}
+
+Editable candidate:
+{workspace / "submission.py"}
+
+This isolated workspace intentionally contains no evaluation data or evaluator.
+Derive an improved estimator analytically from the public task description. Do
+not inspect files outside the workspace or search for datasets, caches, reports,
+or target values. The outer AutoEvolve runner will score the final candidate with
+the trusted official evaluator.
+
+Leave the best plain Python implementation in:
+{workspace / "submission.py"}
+"""
+
+    def build_blackbox_autonomous_prompt(
+        self,
+        *,
+        prompt: str,
+        workspace: Path,
+        eval_timeout: int,
+        num_cpus_per_task: int,
+        socket_path: str | None = None,
+        host: str = "127.0.0.1",
+        port: int | None = None,
+    ) -> str:
+        del num_cpus_per_task
+        socket_path = socket_path or os.environ.get("TTT_BLACKBOX_EVAL_SOCKET")
+        host = os.environ.get("TTT_BLACKBOX_EVAL_HOST") or host
+        env_port = os.environ.get("TTT_BLACKBOX_EVAL_PORT")
+        if port is None and env_port:
+            port = int(env_port)
+        if socket_path is None and port is None:
+            raise ValueError(
+                "Blackbox autonomous WhestBench requires a socket path or TCP port."
+            )
+
+        (workspace / "submission.py").write_text(
+            self._initial_estimator_code(),
+            encoding="utf-8",
+        )
+        (workspace / "eval_client.py").write_text(
+            build_eval_client_source(
+                problem_type=self.problem_type,
+                socket_path=socket_path,
+                host=host,
+                port=port,
+                timeout_s=max(1.0, float(eval_timeout)),
+            ),
+            encoding="utf-8",
+        )
+
+        evaluator_cmd = f"cd {shlex.quote(str(workspace))} && python eval_client.py"
+        return f"""{prompt}
+
+--- Autonomous WhestBench Blackbox Search Mode ---
+Work only inside this workspace:
+{workspace}
+
+Editable candidate:
+{workspace / "submission.py"}
+
+The trusted official evaluator is exposed only through a local blackbox service.
+Run it after each meaningful revision:
+{evaluator_cmd}
+
+Do not edit `eval_client.py`. Only `submission.py` is a candidate artifact. It
+must be plain Python source defining the official `Estimator(BaseEstimator)`
+class, without Markdown fences. Lower `raw_score` is better; `reward` is the
+official baseline score divided by the candidate score.
+Do not inspect evaluation datasets, caches, reports, or target values; derive
+the estimator only from the supplied task description and blackbox scores.
+
+When done, leave the best implementation in:
+{workspace / "submission.py"}
+"""
 
     def get_question(self) -> str:
         state_ctx = self.initial_state.to_prompt(
-            _TARGET_FINAL_LAYER_MSE,
-            metric_name="final-layer MSE",
+            _TARGET_ADJUSTED_SCORE,
+            metric_name="budget-adjusted final-layer score",
             maximize=False,
             language="python",
         )
-        suite = _suite_from_env()
+        suite = self.initial_state.metadata.get("official_suite", {})
         return f"""{WHESTBENCH_PROMPT}
 
-Local evaluation suite for this run:
-- width: {suite['width']}
-- depth: {suite['depth']}
-- reference samples per MLP: {suite['reference_samples']}
-- seeds: {suite['seeds']}
+Official evaluation suite for this run:
+- dataset: {suite.get('dataset')}@{suite.get('revision')}
+- split / MLPs: {suite.get('split')} / first {suite.get('n_mlps')}
+- width / depth: {suite.get('width')} / {suite.get('depth')}
+- FLOP budget per MLP: {suite.get('flop_budget')}
+- residual penalty lambda: {suite.get('lambda_flops_per_second')} FLOPs/second
+- runner: {suite.get('runner')}
 
 {state_ctx}
 
-Return one final Python code block. Keep the official `Estimator.predict` path in
-mind, but the local evaluator accepts a simpler `estimate(mlp, budget)` function
-for fast iteration.
+Return one final Python code block containing an official `Estimator` class.
 """
 
 
@@ -387,7 +612,7 @@ def discover_whestbench(problem_type: str = "arc_whestbench_2026") -> None:
     config = DiscoverConfig(
         env_type=WhestBenchEnv,
         problem_type=problem_type,
-        eval_timeout=300,
+        eval_timeout=4000,
         experiment_name=f"test-{problem_type}-run",
         wandb_project="whestbench",
     )
@@ -395,7 +620,31 @@ def discover_whestbench(problem_type: str = "arc_whestbench_2026") -> None:
 
 
 def smoke_test() -> None:
-    evaluator = WhestBenchRewardEvaluator(problem_type="arc_whestbench_2026")
+    smoke_config = replace(
+        _suite_from_env(),
+        dataset="generated-smoke",
+        revision=None,
+        split="smoke",
+        n_mlps=2,
+        flop_budget=10_000_000_000,
+        runner="local",
+        streaming=False,
+    )
+    spec = ContestSpec(
+        width=16,
+        depth=4,
+        n_mlps=2,
+        flop_budget=smoke_config.flop_budget,
+        ground_truth_samples=512,
+        seed=0,
+        wall_time_limit_s=smoke_config.wall_time_limit_s,
+        lambda_flops_per_second=smoke_config.lambda_flops_per_second,
+    )
+    evaluator = WhestBenchRewardEvaluator(
+        problem_type="arc_whestbench_2026",
+        suite_config=smoke_config,
+        contest_data=make_contest(spec),
+    )
     result = evaluator.get_reward(INITIAL_ESTIMATOR_CODE, State(-1, [], "", 0.0))
     print(result["msg"])
     print(result["stdout"])

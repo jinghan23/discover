@@ -1,34 +1,45 @@
 WHESTBENCH_PROMPT = """You are solving the ARC White-Box Estimation Challenge 2026
-(WhestBench).
+(WhestBench) under the official evaluator contract.
 
 Task:
-- You are given the weights of a randomly initialized square ReLU MLP.
-- Inputs are standard normal vectors.
-- Return an array with shape (depth, width), where each row estimates the
-  per-neuron post-ReLU activation mean for that layer.
-- The main score uses the final row's MSE against a high-sample Monte Carlo
-  reference. Lower final-layer MSE is better.
+- You receive the weights of a randomly initialized square ReLU MLP.
+- Inputs follow a standard normal distribution.
+- Predict the per-neuron post-ReLU activation mean for every layer.
+- Return a `flopscope.numpy.ndarray` with shape `(mlp.depth, mlp.width)`.
 
-Local interface:
-- Write Python code defining `estimate(mlp, budget)`.
-- `mlp.width`, `mlp.depth`, `mlp.seed`, and `mlp.weights` are available.
-- `mlp.weights` is a list of NumPy arrays with shape (width, width).
-- Return a finite NumPy-compatible array of shape (mlp.depth, mlp.width).
-- You may also define `predict(mlp, budget)` or `class Estimator` with a
-  `predict(self, mlp, budget)` method.
+Required submission interface:
+- Import `flopscope.numpy as fnp` for numerical operations.
+- Define `class Estimator(BaseEstimator)` with
+  `predict(self, mlp, budget)`.
+- Optional `setup(self, context)` and `teardown(self)` hooks follow the official
+  WhestBench API.
+- Seed predict-time randomness from `mlp.seed` and setup-time randomness from
+  `context.seed`.
 
-Official submission notes:
-- The official AIcrowd starter kit expects an `Estimator` class with
-  `predict(self, mlp, budget)` in `estimator.py`.
-- In the official harness, use `flopscope.numpy` rather than plain `numpy` for
-  FLOP-counted operations.
-- The official package is submitted as a tarball or through `whest submit`.
+Official scoring:
+- For each MLP, compute final-layer MSE against the official Monte Carlo target.
+- Effective compute is `C = FLOPs + lambda * residual_wall_time`.
+- A valid MLP score is `final_layer_mse * max(0.1, C / flop_budget)`.
+- The suite score is the arithmetic mean of those per-MLP scores; lower is better.
+- Exceptions, invalid shapes/non-finite values, FLOP/time exhaustion, or combined
+  budget exhaustion use an all-zero prediction and multiplier 1.0 for that MLP.
+- All-layer MSE is diagnostic only.
+
+Do not use plain NumPy or uninstrumented numerical libraries to evade FLOP
+accounting. Residual Python or uninstrumented work is charged at the official
+lambda rate and can exhaust the combined budget.
+
+Fairness and data isolation:
+- Derive predictions only from the `mlp` weights and allowed setup context.
+- Do not inspect, search for, or read evaluation datasets, Hugging Face caches,
+  saved evaluation reports, target moments, or ground-truth files.
+- Do not hardcode values tied to public mini MLPs. Such candidates are invalid
+  even if they receive a low local score.
 
 Algorithm directions worth exploring:
 - Mean and diagonal-variance propagation through ReLU moments.
-- Full or low-rank covariance propagation.
-- Hybrid analytic propagation plus limited Monte Carlo or randomized probes.
-- Layer-wise corrections for correlation error in deeper networks.
-- Compute-aware approximations that spend FLOPs only where final-layer MSE is
-  most sensitive.
+- Full, structured, or low-rank covariance propagation.
+- Hybrid analytic propagation with compute-budgeted Monte Carlo probes.
+- Layer-wise corrections for correlation error in deep networks.
+- Allocating FLOPs to layers where final-layer MSE is most sensitive.
 """

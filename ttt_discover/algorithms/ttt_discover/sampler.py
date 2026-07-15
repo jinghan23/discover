@@ -291,6 +291,10 @@ class PUCTSampler(StateSampler):
         if values.size == 0:
             return 1.0
         v = values[mask] if mask is not None else values
+        # Unevaluated seed states are represented as ``-inf``.  A pool that only
+        # contains such a seed must still have a finite exploration scale; using
+        # ``max(v) - min(v)`` directly produces NaN and poisons the PUCT bonus.
+        v = v[np.isfinite(v)]
         return float(max(np.max(v) - np.min(v), 1e-6)) if v.size > 0 else 1.0
 
     def _compute_prior(self, values: np.ndarray, scale: float) -> np.ndarray:

@@ -335,6 +335,12 @@ class BudgetTracker:
     def exceeded(self) -> bool:
         return self.max_calls is not None and self.used >= self.max_calls
 
+    @property
+    def remaining(self) -> int | None:
+        if self.max_calls is None:
+            return None
+        return max(0, self.max_calls - self.used)
+
     def add(self, results: list[CandidateResult]) -> dict[str, Any]:
         start_used = self.used
         server_used = _max_server_call_count(results)
@@ -709,6 +715,7 @@ class Loop:
         sample_idx: int,
         step_idx: int,
         semaphore: asyncio.Semaphore | None,
+        evaluator_call_limit: int | None = None,
     ) -> CandidateResult:
         if self.sampler is None:
             raise RuntimeError("Loop sampler is not initialized")
@@ -746,6 +753,11 @@ class Loop:
             inner_results: list[CandidateResult] = []
             inner_errors: list[str] = []
             for inner_idx in range(inner_iterations):
+                if (
+                    evaluator_call_limit is not None
+                    and evaluator_calls >= evaluator_call_limit
+                ):
+                    break
                 try:
                     response = await completer(prompt)
                     parsed_code = last_codeblock_postprocess(
@@ -864,6 +876,8 @@ class Loop:
     async def sample_batch(
         self,
         i_batch: int,
+        *,
+        max_evaluator_calls: int | None = None,
     ) -> tuple[list[CandidateResult], dict[str, Any], list[CandidateResult]]:
         if self.sampler is None:
             raise RuntimeError("Loop sampler is not initialized")
@@ -877,8 +891,20 @@ class Loop:
         )
 
         tasks = []
+        remaining_calls = (
+            None
+            if max_evaluator_calls is None
+            else max(0, int(max_evaluator_calls))
+        )
+        inner_iterations = max(1, int(getattr(self.cfg, "inner_iterations", 1)))
         for group_idx, parent_state in enumerate(parent_states):
             for sample_idx in range(self.cfg.group_size):
+                if remaining_calls is not None and remaining_calls <= 0:
+                    break
+                evaluator_call_limit = None
+                if remaining_calls is not None:
+                    evaluator_call_limit = min(inner_iterations, remaining_calls)
+                    remaining_calls -= evaluator_call_limit
                 tasks.append(
                     asyncio.create_task(
                         self.run_candidate(
@@ -887,10 +913,13 @@ class Loop:
                             sample_idx=sample_idx,
                             step_idx=i_batch,
                             semaphore=semaphore,
+                            evaluator_call_limit=evaluator_call_limit,
                         ),
                         name=f"{type(self).__name__}_sample_{group_idx}_{sample_idx}",
                     )
                 )
+            if remaining_calls is not None and remaining_calls <= 0:
+                break
 
         results = await asyncio.gather(*tasks)
         update_sampler_from_results(self.sampler, results)
@@ -964,6 +993,7 @@ class Loop:
                 with timed("sampling", metrics):
                     _results, sampling_metrics, all_results = await self.sample_batch(
                         i_batch,
+                        max_evaluator_calls=budget.remaining,
                     )
                 metrics.update(sampling_metrics)
                 metrics.update(budget.add(all_results))

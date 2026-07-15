@@ -1,48 +1,105 @@
 # ARC WhestBench Task
 
-This directory adds a TTT-Discover environment for the
-[ARC White-Box Estimation Challenge 2026](https://www.aicrowd.com/challenges/arc-white-box-estimation-challenge-2026).
+This directory integrates the
+[ARC White-Box Estimation Challenge 2026](https://www.aicrowd.com/challenges/arc-white-box-estimation-challenge-2026)
+with TTT-Discover using the official `whestbench` and `flopscope` runtimes.
 
-The official task asks participants to predict per-neuron post-ReLU activation
-means for random He-initialized MLPs under standard-normal inputs. Submissions
-are executable Python estimators, and the public leaderboard ranks primarily by
-adjusted final-layer MSE, lower is better.
+The task predicts per-neuron post-ReLU activation means for random
+He-initialized MLPs under standard-normal inputs. Candidates must implement the
+official `Estimator(BaseEstimator).predict(mlp, budget)` contract and return a
+`flopscope.numpy.ndarray` with shape `(depth, width)`.
 
-## Local Smoke Test
+## Scoring
+
+Evaluation delegates to `whestbench.scoring.evaluate_estimator`. For each MLP:
+
+```text
+effective_compute = flops_used + lambda * residual_wall_time
+score = final_layer_mse * max(0.1, effective_compute / flop_budget)
+```
+
+The suite score is the mean per-MLP score and is minimized. The official Phase 1
+defaults are:
+
+- Dataset: `aicrowd/arc-whestbench-public-2026@v1-phase1`
+- Split: `mini`, 100 MLPs
+- Shape: width 256, depth 32
+- FLOP budget: `272_000_000_000` per MLP
+- Residual penalty: `100_000_000_000` FLOPs/second
+- Runner: official subprocess runner
+
+The checked-in discovery YAML evaluates all 100 MLPs. Set `WHEST_N_MLPS=10`
+explicitly for cheaper search iterations, then return to 100 for comparable
+final measurements.
+
+Failures follow the official semantics: invalid output, exceptions, or compute
+exhaustion replace that MLP's prediction with zeros and force the score
+multiplier to 1.0.
+
+## Smoke Test
+
+The smoke test uses a tiny generated contest while exercising the same official
+runner and scoring implementation. It does not download the public dataset.
 
 ```bash
 python -m examples.aicrowd_whestbench.env
 ```
 
-The local evaluator is intentionally lightweight and NumPy-only. It builds small
-random MLPs, estimates Monte Carlo references, and scores a candidate
-`estimate(mlp, budget)` function by final-layer MSE.
+## Discovery
 
-Useful knobs:
+Run the checked-in configuration:
 
 ```bash
-WHEST_LOCAL_WIDTH=128 \
-WHEST_LOCAL_DEPTH=16 \
-WHEST_LOCAL_REFERENCE_SAMPLES=8192 \
-WHEST_LOCAL_SEEDS=0,1,2,3 \
-python -m examples.aicrowd_whestbench.env
+python repro/run_from_yaml.py \
+  --config configs/discovery_runs.yaml \
+  --run aicrowd_whestbench
 ```
 
-## Running Discovery
+The first run downloads and caches the pinned `mini` split (about 850 MB).
+Override `WHEST_N_MLPS` for a cheaper or broader scoring run. Set
+`WHEST_DATASET` to a local official dataset directory for fully offline
+evaluation. `WHEST_DATASET_STREAMING=1` is available for constrained
+environments, but materialized evaluation is the official starter-kit default.
 
-```python
-from examples.aicrowd_whestbench import discover_whestbench
+To run both TTT-Discover and AutoEvolve with the same official CPU evaluator,
+use the reproducibility launcher. AutoEvolve uses the trusted blackbox server;
+TTT-Discover uses the in-process evaluator adapter. Neither path requires CUDA.
 
-discover_whestbench()
+```bash
+# One epoch and one mini MLP on each algorithm.
+RUN_WHEST_SMOKE=1 \
+  bash repro/aicrowd_whestbench/run_official_mini.sh all
+
+# Search on all 100 mini MLPs.
+WHEST_SEARCH_N_MLPS=100 \
+  bash repro/aicrowd_whestbench/run_official_mini.sh all
 ```
 
-## Official Submission Path
+Where Unix sockets or mount namespaces are unavailable, AutoEvolve can run in
+isolated one-shot mode and leave final scoring to the outer official evaluator:
 
-Use the official starter kit for competition validation and packaging:
+```bash
+RUN_WHEST_SMOKE=1 \
+  bash repro/aicrowd_whestbench/run_official_mini.sh autoevolve-in-process
+```
+
+## Official Validation
+
+TTT-Discover scores candidates with the official Python evaluator, but final
+submission validation and packaging should still use the official CLI:
+
+```bash
+whest validate --estimator estimator.py
+whest run \
+  --estimator estimator.py \
+  --dataset hf://aicrowd/arc-whestbench-public-2026@v1-phase1 \
+  --split mini \
+  --runner subprocess
+whest package --estimator estimator.py
+```
+
+Official resources:
 
 - Starter kit: <https://github.com/AIcrowd/whest-starterkit>
-- Challenge page: <https://www.aicrowd.com/challenges/arc-white-box-estimation-challenge-2026>
-
-The official contract expects `estimator.py` to define an `Estimator` class with
-`predict(self, mlp, budget)`. In the official harness, use `flopscope.numpy` for
-FLOP-counted operations, then validate/package with `whest`.
+- Evaluator: <https://github.com/AIcrowd/whestbench>
+- FLOP accounting: <https://github.com/AIcrowd/flopscope>
