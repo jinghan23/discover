@@ -262,6 +262,29 @@ def _metrics_evaluator_call_count(metrics: dict[str, Any]) -> int:
     return 1
 
 
+_SERVER_CALL_KEY = "budget/evaluator_calls_server"
+
+
+def _metrics_server_call_count(metrics: dict[str, Any]) -> int | None:
+    """Authoritative running total reported by the blackbox eval server.
+
+    Unlike the per-candidate ``budget/evaluator_calls`` (a 0/1 increment), this
+    is a monotonic cumulative counter shared by the agent's inner
+    eval_client.py calls and the outer re-eval, so it is aggregated by taking
+    the maximum rather than summing.
+    """
+    return _metric_int(metrics, _SERVER_CALL_KEY)
+
+
+def _max_server_call_count(results: list[CandidateResult]) -> int | None:
+    seen = [
+        count
+        for count in (_metrics_server_call_count(r.metrics) for r in results)
+        if count is not None
+    ]
+    return max(seen) if seen else None
+
+
 def evaluator_call_count(results: list[CandidateResult]) -> int:
     return sum(_metrics_evaluator_call_count(result.metrics) for result in results)
 
@@ -272,6 +295,7 @@ def logged_evaluator_call_count(log_path: str) -> int:
         return 0
 
     count = 0
+    server_max: int | None = None
     with open(output_path, "r", encoding="utf-8") as f:
         for line in f:
             try:
@@ -281,8 +305,14 @@ def logged_evaluator_call_count(log_path: str) -> int:
             metrics = entry.get("metrics")
             if not isinstance(metrics, dict):
                 metrics = {}
+            server = _metrics_server_call_count(metrics)
+            if server is not None:
+                server_max = server if server_max is None else max(server_max, server)
             count += _metrics_evaluator_call_count(metrics)
-    return count
+    # When the blackbox server reported an authoritative cumulative count, trust
+    # it (it includes inner eval_client.py calls); otherwise fall back to the
+    # per-candidate sum for non-blackbox runners.
+    return server_max if server_max is not None else count
 
 
 @dataclass
@@ -307,8 +337,15 @@ class BudgetTracker:
 
     def add(self, results: list[CandidateResult]) -> dict[str, Any]:
         start_used = self.used
-        epoch_calls = evaluator_call_count(results)
-        self.used += epoch_calls
+        server_used = _max_server_call_count(results)
+        if server_used is not None:
+            # The blackbox server owns the authoritative cumulative count; take
+            # the high-water mark instead of summing per-candidate deltas.
+            self.used = max(self.used, server_used)
+            epoch_calls = self.used - start_used
+        else:
+            epoch_calls = evaluator_call_count(results)
+            self.used += epoch_calls
         metrics: dict[str, Any] = {
             "budget/evaluator_calls_used_start": start_used,
             "budget/evaluator_calls_epoch": epoch_calls,

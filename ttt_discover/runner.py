@@ -56,6 +56,7 @@ async def _maybe_start_blackbox_server(cfg: DiscoverConfig):
         max_frame_bytes=DEFAULT_MAX_FRAME_BYTES,
         debug_responses=False,
         message_max_chars=200,
+        max_evaluations=cfg.max_evaluator_calls,
         verbose=False,
     )
     server_task = asyncio.create_task(serve_blackbox_eval(args), name="blackbox-eval-server")

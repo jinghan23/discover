@@ -96,6 +96,10 @@ class BlackboxRunner(EvalRunner):
                 "metrics": {
                     "blackbox/ok": ok,
                     "blackbox/stage": response.get("stage"),
+                    "budget/evaluator_calls_server": response.get("budget_used"),
+                    "blackbox/budget_exhausted": bool(
+                        response.get("budget_exhausted")
+                    ),
                 },
             }
         )

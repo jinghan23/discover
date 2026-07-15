@@ -422,6 +422,12 @@ async def _evaluate_generated_candidate(
         metrics["codex/parsed_code_source"] = candidate.source
         metrics["codex/cli_timeout_salvaged"] = cli_timeout_error is not None
         metrics["budget/evaluator_calls"] = evaluator_calls
+        # Authoritative running total from the blackbox server (covers the
+        # agent's inner eval_client.py calls too), copied through explicitly so
+        # it survives envs with a custom _build_metrics.
+        server_calls = outs.metrics.get("budget/evaluator_calls_server")
+        if server_calls is not None:
+            metrics["budget/evaluator_calls_server"] = server_calls
         if cli_timeout_error is not None:
             metrics["codex/cli_timeout_error"] = (
                 f"codex exec timed out after {cli_timeout_error.timeout}s; "

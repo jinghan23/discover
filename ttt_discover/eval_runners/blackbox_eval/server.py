@@ -9,6 +9,7 @@ import json
 import logging
 import math
 import os
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -133,11 +134,32 @@ class VerifierConfig:
     allow_request_state: bool = False
     debug_responses: bool = False
     message_max_chars: int = 200
+    max_evaluations: int | None = None
 
 
 class BlackboxVerifier:
     def __init__(self, config: VerifierConfig):
         self.config = config
+        self._max_evaluations = config.max_evaluations
+        self._eval_count = 0
+        self._count_lock = threading.Lock()
+
+    def _try_reserve_call(self) -> tuple[bool, int]:
+        """Atomically reserve one evaluator call against the budget.
+
+        Returns (granted, used). The count is incremented *before* the
+        evaluator runs and is never rolled back, so a call that later errors
+        or times out still consumes budget. Format/protocol failures return
+        earlier and never reach here, so they don't consume budget.
+        """
+        with self._count_lock:
+            if (
+                self._max_evaluations is not None
+                and self._eval_count >= self._max_evaluations
+            ):
+                return False, self._eval_count
+            self._eval_count += 1
+            return True, self._eval_count
 
     def evaluate(self, request: dict[str, Any]) -> dict[str, Any]:
         request_id = str(request.get("request_id") or uuid.uuid4())
@@ -166,6 +188,17 @@ class BlackboxVerifier:
             state_type = type(state) if state is not None else None
             state = _state_from_dict(copy.deepcopy(request["state"]), state_type)
 
+        granted, budget_used = self._try_reserve_call()
+        if not granted:
+            return {
+                **response_base,
+                "ok": False,
+                "stage": "server",
+                "message": "evaluation unavailable",
+                "budget_used": budget_used,
+                "budget_exhausted": True,
+            }
+
         request_log_dir = self.config.log_dir / _safe_path_component(request_id)
         request_log_dir.mkdir(parents=True, exist_ok=True)
 
@@ -189,9 +222,12 @@ class BlackboxVerifier:
                 "ok": False,
                 "stage": "exception",
                 "message": message,
+                "budget_used": budget_used,
             }
 
-        return self._response_from_result(response_base, result)
+        response = self._response_from_result(response_base, result)
+        response["budget_used"] = budget_used
+        return response
 
     def _response_from_result(
         self,
@@ -362,6 +398,7 @@ async def _serve(args: argparse.Namespace) -> None:
             allow_request_state=args.allow_request_state,
             debug_responses=args.debug_responses,
             message_max_chars=args.message_max_chars,
+            max_evaluations=args.max_evaluations,
         )
     )
     app = BlackboxEvalServer(
@@ -424,6 +461,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-frame-bytes", type=int, default=DEFAULT_MAX_FRAME_BYTES)
     parser.add_argument("--debug-responses", action="store_true")
     parser.add_argument("--message-max-chars", type=int, default=200)
+    parser.add_argument(
+        "--max-evaluations",
+        type=int,
+        default=None,
+        help="Hard cap on total evaluator.get_reward() executions across all clients",
+    )
     parser.add_argument("--verbose", action="store_true")
     return parser
 
