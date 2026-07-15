@@ -314,7 +314,18 @@ def _workspace_candidates(completer: Any) -> list[GeneratedCandidate]:
         return []
     workspace = Path(workspace_raw)
 
-    candidates = _manifest_candidates(workspace)
+    candidates: list[GeneratedCandidate] = []
+    submission = workspace / "submission.py"
+    if submission.is_file():
+        candidate = _candidate_from_file(
+            submission,
+            name="submission.py",
+            source="workspace_submission.py",
+        )
+        if candidate is not None:
+            candidates.append(candidate)
+
+    candidates.extend(_manifest_candidates(workspace))
     for dirname in ("state_pool", "candidate_pool", "pool"):
         pool_dir = workspace / dirname
         if not pool_dir.is_dir():
@@ -327,16 +338,6 @@ def _workspace_candidates(completer: Any) -> list[GeneratedCandidate]:
             )
             if candidate is not None:
                 candidates.append(candidate)
-
-    submission = workspace / "submission.py"
-    if submission.is_file():
-        candidate = _candidate_from_file(
-            submission,
-            name="submission.py",
-            source="workspace_submission.py",
-        )
-        if candidate is not None:
-            candidates.append(candidate)
     return candidates
 
 
@@ -353,6 +354,26 @@ def _response_candidate(task: Task, env: Any, response: str) -> GeneratedCandida
         code=parsed_code,
         source="final_response_codeblock",
     )
+
+
+def _candidate_dedupe_key(candidate: GeneratedCandidate) -> str:
+    code = candidate.code.strip()
+    match = re.fullmatch(r"```[A-Za-z0-9_.+-]*\n(.*?)\n```", code, re.DOTALL)
+    if match:
+        code = match.group(1).strip()
+    return code
+
+
+def _dedupe_candidates(candidates: list[GeneratedCandidate]) -> list[GeneratedCandidate]:
+    deduped: list[GeneratedCandidate] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        key = _candidate_dedupe_key(candidate)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        deduped.append(candidate)
+    return deduped
 
 
 def _make_completer(
@@ -536,10 +557,18 @@ async def _run_candidate(
             cli_timeout_error = exc
             response = ""
 
-        generated_candidates = _workspace_candidates(completer)
+        workspace_candidates = _workspace_candidates(completer)
         response_candidate = _response_candidate(task, env, response)
+        generated_candidates = list(workspace_candidates)
         if response_candidate is not None:
-            generated_candidates.append(response_candidate)
+            insertion_idx = (
+                1
+                if generated_candidates
+                and generated_candidates[0].name == "submission.py"
+                else 0
+            )
+            generated_candidates.insert(insertion_idx, response_candidate)
+        generated_candidates = _dedupe_candidates(generated_candidates)
 
         if not generated_candidates:
             generated_candidates = [
