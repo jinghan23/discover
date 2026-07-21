@@ -17,7 +17,9 @@ Environment overrides:
   RUN_WHEST_BLACKBOX_MAX_EVALUATIONS=...  Hard cap shared by agent and outer verifier calls
   RUN_WHEST_BLACKBOX_CACHE=1         Cache exact duplicate submissions
   RUN_WHEST_VERIFIER_WORKERS=...     CPU verifier workers (default 1)
+  RUN_WHEST_CODEX_MODEL=...          Empty string uses the CLI's default model
   WHEST_INITIAL_ESTIMATOR_PATH=...    Seed AutoEvolve from an estimator source file
+  WHEST_DIVERSITY_MODE_FILE=...       UTF-8 prompt block appended for this launch
   WHEST_SEARCH_N_MLPS=...            MLPs per candidate (default 100)
   WHEST_DEPS_PATH=...                 Directory containing whestbench/flopscope
   HF_HOME=...                         Hugging Face cache (default /tmp/hf-whest-cache)
@@ -63,7 +65,7 @@ done
 PYTHON_BIN="${PYTHON:-python}"
 LOG_ROOT="${RUN_WHEST_LOG_ROOT:-codex_runs/aicrowd_whestbench}"
 WANDB_PROJECT="${RUN_WHEST_WANDB_PROJECT:-}"
-CODEX_MODEL="${RUN_WHEST_CODEX_MODEL:-gpt-5.5}"
+CODEX_MODEL="${RUN_WHEST_CODEX_MODEL-gpt-5.6-sol}"
 CODEX_COMMAND="${RUN_WHEST_CODEX_COMMAND:-codex}"
 NUM_CPUS_PER_TASK="${RUN_WHEST_NUM_CPUS_PER_TASK:-1}"
 EVAL_TIMEOUT="${RUN_WHEST_EVAL_TIMEOUT:-4000}"
@@ -165,6 +167,7 @@ defaults:
   env:
     PYTHONUNBUFFERED: "1"
     HF_HOME: "$HF_HOME"
+    WHEST_DIVERSITY_MODE_FILE: "${WHEST_DIVERSITY_MODE_FILE:-}"
     WHEST_DATASET: aicrowd/arc-whestbench-public-2026
     WHEST_DATASET_REVISION: v1-phase1
     WHEST_DATASET_SPLIT: mini
@@ -222,7 +225,7 @@ run_config() {
     "$PYTHON_BIN" repro/run_from_yaml.py \
         --config "$CONFIG_FILE" \
         --run "$run_name" \
-        "${DRY_RUN_ARGS[@]}"
+        ${DRY_RUN_ARGS[@]+"${DRY_RUN_ARGS[@]}"}
 }
 
 start_blackbox_server() {

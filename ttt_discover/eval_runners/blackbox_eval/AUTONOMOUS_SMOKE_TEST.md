@@ -43,7 +43,8 @@ CUDA_VISIBLE_DEVICES=0 CUDA_DEVICE_ORDER=PCI_BUS_ID TORCH_CUDA_ARCH_LIST=8.0 \
   --eval-timeout 1200 \
   --wandb-project "" \
   --codex-backend cli \
-  --codex-model-name gpt-5.5 \
+  --codex-model-name gpt-5.6-sol \
+  --cli-reasoning-effort xhigh \
   --codex-cli-command codex \
   --codex-cli-sandbox danger-full-access \
   --codex-cli-timeout 7200 \

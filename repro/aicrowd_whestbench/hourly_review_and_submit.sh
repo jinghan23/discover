@@ -6,6 +6,7 @@ cd "$REPO_ROOT"
 
 INTERVAL_SECONDS="${WHEST_REVIEW_INTERVAL_SECONDS:-1200}"
 CODEX_MODEL="${WHEST_REVIEW_CODEX_MODEL:-gpt-5.6-sol}"
+CODEX_REASONING_EFFORT="${WHEST_REVIEW_REASONING_EFFORT:-xhigh}"
 RUN_ROOT="${WHEST_REVIEW_RUN_ROOT:-$REPO_ROOT/codex_runs/aicrowd_whestbench/multi_initial_20260718}"
 STATE_ROOT="${WHEST_REVIEW_STATE_ROOT:-$RUN_ROOT/hourly_submission_review}"
 LEDGER="$STATE_ROOT/REVIEW_LOG.md"
@@ -192,6 +193,7 @@ run_cycle() {
     printf '[%s] starting Codex review cycle\n' "$cycle_stamp" | tee -a "$MONITOR_LOG"
     if render_prompt | codex exec \
         --model "$CODEX_MODEL" \
+        -c "model_reasoning_effort=\"$CODEX_REASONING_EFFORT\"" \
         --cd "$REPO_ROOT" \
         --dangerously-bypass-approvals-and-sandbox \
         --json \

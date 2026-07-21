@@ -26,8 +26,8 @@ Environment overrides:
   RUN_WHEST_ABMCTS_EVAL_TOP_K=...              Novel tree candidates to full-evaluate (default 2)
   RUN_WHEST_ABMCTS_SMOKE=1                    1 epoch, width 4, first-1, eval first-10
   RUN_WHEST_ABMCTS_FORCE_EVAL=1                Replace an existing full-100 report
-  RUN_WHEST_ABMCTS_CODEX_MODEL=...             Default gpt-5.5
-  RUN_WHEST_ABMCTS_REASONING_EFFORT=...         Default high; smoke defaults medium
+  RUN_WHEST_ABMCTS_CODEX_MODEL=...             Default gpt-5.6-sol
+  RUN_WHEST_ABMCTS_REASONING_EFFORT=...         Default xhigh, including smoke runs
   RUN_WHEST_ABMCTS_CLI_TIMEOUT=...              Per-action timeout in seconds (default 600)
   PYTHON=...                                   Default .venv/bin/python
   HF_HOME=...                                  Default /tmp/hf-whest-cache
@@ -105,8 +105,8 @@ ROOT_MIN_WIDTH="${RUN_WHEST_ABMCTS_ROOT_MIN_WIDTH:-8}"
 SEARCH_N_MLPS="${RUN_WHEST_ABMCTS_SEARCH_N_MLPS:-100}"
 FULL_N_MLPS="${RUN_WHEST_ABMCTS_FULL_N_MLPS:-100}"
 EVAL_TOP_K="${RUN_WHEST_ABMCTS_EVAL_TOP_K:-2}"
-CODEX_MODEL="${RUN_WHEST_ABMCTS_CODEX_MODEL:-gpt-5.5}"
-REASONING_EFFORT="${RUN_WHEST_ABMCTS_REASONING_EFFORT:-high}"
+CODEX_MODEL="${RUN_WHEST_ABMCTS_CODEX_MODEL:-gpt-5.6-sol}"
+REASONING_EFFORT="${RUN_WHEST_ABMCTS_REASONING_EFFORT:-xhigh}"
 DEFAULT_CODEX_COMMAND=codex
 if [[ -x /Applications/ChatGPT.app/Contents/Resources/codex ]]; then
     DEFAULT_CODEX_COMMAND=/Applications/ChatGPT.app/Contents/Resources/codex
@@ -124,7 +124,7 @@ if [[ "${RUN_WHEST_ABMCTS_SMOKE:-0}" == "1" ]]; then
     ROOT_MIN_WIDTH="${RUN_WHEST_ABMCTS_ROOT_MIN_WIDTH:-4}"
     SEARCH_N_MLPS="${RUN_WHEST_ABMCTS_SEARCH_N_MLPS:-1}"
     FULL_N_MLPS="${RUN_WHEST_ABMCTS_FULL_N_MLPS:-10}"
-    REASONING_EFFORT="${RUN_WHEST_ABMCTS_REASONING_EFFORT:-medium}"
+    REASONING_EFFORT="${RUN_WHEST_ABMCTS_REASONING_EFFORT:-xhigh}"
 fi
 
 export HF_HOME

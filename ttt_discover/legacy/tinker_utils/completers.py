@@ -58,9 +58,9 @@ class CodexTokenCompleter(TokenCompleter):
     """
 
     tokenizer: Tokenizer
-    model_name: str | None = "gpt-5.2-codex"
+    model_name: str | None = "gpt-5.6-sol"
     max_output_tokens: int = 8192
-    reasoning_effort: str | None = "medium"
+    reasoning_effort: str | None = "xhigh"
     temperature: float | None = None
     api_key_env: str = "OPENAI_API_KEY"
     base_url: str | None = None
@@ -154,7 +154,7 @@ class CodexTokenCompleter(TokenCompleter):
             self.client = AsyncOpenAI(api_key=api_key, base_url=self.base_url)
 
         request: dict[str, Any] = {
-            "model": self.model_name or "gpt-5.2-codex",
+            "model": self.model_name or "gpt-5.6-sol",
             "input": self._build_input(self._decode_model_input(model_input)),
             "max_output_tokens": self.max_output_tokens,
             "store": False,
@@ -185,7 +185,8 @@ class CodexCliTokenCompleter(TokenCompleter):
     """
 
     tokenizer: Tokenizer
-    model_name: str | None = None
+    model_name: str | None = "gpt-5.6-sol"
+    reasoning_effort: str | None = "xhigh"
     codex_command: str = "codex"
     sandbox: Literal["read-only", "workspace-write", "danger-full-access"] = "read-only"
     cwd: str | None = None
@@ -245,6 +246,11 @@ class CodexCliTokenCompleter(TokenCompleter):
             cmd.extend(["-C", self.cwd])
         if self.model_name:
             cmd.extend(["-m", self.model_name])
+        if self.reasoning_effort:
+            cmd.extend([
+                "-c",
+                f"model_reasoning_effort={json.dumps(self.reasoning_effort)}",
+            ])
         cmd.append("-")
 
         try:

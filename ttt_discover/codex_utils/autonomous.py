@@ -228,7 +228,7 @@ Finish with exactly one Python code block defining the primary best `priority(el
             cmd.append("--ignore-user-config")
         if self.ignore_rules:
             cmd.append("--ignore-rules")
-        cmd.extend(["-m", self.model_name or "gpt-5.5"])
+        cmd.extend(["-m", self.model_name or "gpt-5.6-sol"])
         if self.reasoning_effort:
             cmd.extend([
                 "-c",

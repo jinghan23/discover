@@ -13,6 +13,7 @@ from examples.aicrowd_whestbench.env import (
     WhestBenchEnv,
     WhestBenchRewardEvaluator,
 )
+from examples.aicrowd_whestbench.prompt import build_whestbench_prompt
 from ttt_discover import State
 
 
@@ -185,6 +186,21 @@ class WhestBenchAutonomousWorkspaceTest(unittest.TestCase):
         self.assertIn("/tmp/test-whestbench.sock", client)
         self.assertIn("python eval_client.py", prompt)
         self.assertIn("Lower `raw_score` is better", prompt)
+
+    def test_launch_time_mode_forcing_loads_one_prompt_file(self):
+        with TemporaryDirectory() as tmp:
+            mode_file = Path(tmp) / "exact_radial.md"
+            mode_file.write_text(
+                "--- Diversity Mode ---\nMode: `exact_radial`\n",
+                encoding="utf-8",
+            )
+
+            prompt = build_whestbench_prompt(mode_file)
+
+            self.assertIn("Mode: `exact_radial`", prompt)
+            self.assertEqual(prompt.count("--- Diversity Mode ---"), 1)
+            with self.assertRaisesRegex(FileNotFoundError, "not found"):
+                build_whestbench_prompt(Path(tmp) / "missing.md")
 
 
 if __name__ == "__main__":

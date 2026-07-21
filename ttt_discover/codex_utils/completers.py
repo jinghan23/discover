@@ -69,9 +69,9 @@ def _open_log_target(path: Path):
 class CodexResponseCompleter(TextCompleter):
     """Text completer backed by OpenAI's Responses API."""
 
-    model_name: str | None = "gpt-5.2-codex"
+    model_name: str | None = "gpt-5.6-sol"
     max_output_tokens: int = 8192
-    reasoning_effort: str | None = "medium"
+    reasoning_effort: str | None = "xhigh"
     temperature: float | None = None
     api_key_env: str = "OPENAI_API_KEY"
     base_url: str | None = None
@@ -112,7 +112,7 @@ class CodexResponseCompleter(TextCompleter):
             self.client = AsyncOpenAI(api_key=api_key, base_url=self.base_url)
 
         request: dict[str, Any] = {
-            "model": self.model_name or "gpt-5.2-codex",
+            "model": self.model_name or "gpt-5.6-sol",
             "input": prompt,
             "max_output_tokens": self.max_output_tokens,
             "store": False,
@@ -148,7 +148,7 @@ class CodexResponseCompleter(TextCompleter):
 class CodexCliCompleter(TextCompleter):
     """Text completer backed by the local `codex exec` CLI."""
 
-    model_name: str | None = "gpt-5.5"
+    model_name: str | None = "gpt-5.6-sol"
     reasoning_effort: str | None = "xhigh"
     codex_command: str = "codex"
     sandbox: Literal["read-only", "workspace-write", "danger-full-access"] = "read-only"
@@ -244,7 +244,7 @@ class CodexCliCompleter(TextCompleter):
             cmd.append("--ignore-user-config")
         if self.ignore_rules:
             cmd.append("--ignore-rules")
-        cmd.extend(["-m", self.model_name or "gpt-5.5"])
+        cmd.extend(["-m", self.model_name or "gpt-5.6-sol"])
         if self.reasoning_effort:
             cmd.extend([
                 "-c",

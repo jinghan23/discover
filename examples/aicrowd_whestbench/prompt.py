@@ -1,3 +1,7 @@
+import os
+from pathlib import Path
+
+
 WHESTBENCH_PROMPT = """You are solving the ARC White-Box Estimation Challenge 2026
 (WhestBench) under the official evaluator contract.
 
@@ -8,6 +12,8 @@ Task:
 - Return a `flopscope.numpy.ndarray` with shape `(mlp.depth, mlp.width)`.
 
 Required submission interface:
+- Import `flopscope as flops` for supported distribution functions such as
+  `flops.stats.norm.pdf` and `flops.stats.norm.cdf`.
 - Import `flopscope.numpy as fnp` for numerical operations.
 - Define `class Estimator(BaseEstimator)` with
   `predict(self, mlp, budget)`.
@@ -15,6 +21,11 @@ Required submission interface:
   WhestBench API.
 - Seed predict-time randomness from `mlp.seed` and setup-time randomness from
   `context.seed`.
+- `flopscope.numpy` does not provide `fnp.erf`; use the supported
+  `flops.stats.norm` functions for Gaussian PDF/CDF calculations.
+- `flopscope.numpy` arrays are immutable: do not use item assignment or indexed
+  in-place updates. Build pieces in Python lists and combine them with
+  `fnp.stack`/`fnp.concatenate`, or use whole-array expressions.
 
 Official scoring:
 - For each MLP, compute final-layer MSE against the official Monte Carlo target.
@@ -43,3 +54,37 @@ Algorithm directions worth exploring:
 - Layer-wise corrections for correlation error in deep networks.
 - Allocating FLOPs to layers where final-layer MSE is most sensitive.
 """
+
+
+WHESTBENCH_PROMPT_BASE = WHESTBENCH_PROMPT
+
+
+DIVERSITY_MODE_FILE_ENV_VAR = "WHEST_DIVERSITY_MODE_FILE"
+
+
+def load_diversity_mode_file(mode_file: str | os.PathLike[str] | None) -> str | None:
+    """Load one complete diversity-mode prompt block from a UTF-8 text file."""
+    if mode_file is None or not str(mode_file).strip():
+        return None
+    path = Path(mode_file).expanduser()
+    if not path.is_file():
+        raise FileNotFoundError(f"WhestBench diversity mode file not found: {path}")
+    block = path.read_text(encoding="utf-8").strip()
+    if not block:
+        raise ValueError(f"WhestBench diversity mode file is empty: {path}")
+    return block
+
+
+def build_whestbench_prompt(
+    mode_file: str | os.PathLike[str] | None = None,
+) -> str:
+    """Append the diversity-mode file, if configured, to the base prompt."""
+    block = load_diversity_mode_file(mode_file)
+    if block is None:
+        return WHESTBENCH_PROMPT_BASE
+    return f"{WHESTBENCH_PROMPT_BASE}\n\n{block}\n"
+
+
+WHESTBENCH_PROMPT = build_whestbench_prompt(
+    os.environ.get(DIVERSITY_MODE_FILE_ENV_VAR)
+)
