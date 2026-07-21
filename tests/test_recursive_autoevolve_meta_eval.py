@@ -36,7 +36,7 @@ def test_protocol_fixes_budget_model_tasks_and_gpu_pool() -> None:
     assert protocol["inner"]["model"] == "gpt-5.5"
     assert protocol["kernel"] == {
         "task": "trimul",
-        "gpu_devices": (4, 5, 6, 7),
+        "gpu_devices": (7,),
     }
     assert set(protocol["whestbench_manifest"]["public_seeds"]).isdisjoint(
         protocol["whestbench_manifest"]["private_seeds"]

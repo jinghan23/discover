@@ -41,7 +41,7 @@ EDITABLE_PREFIXES = (
 INNER_EPOCHS = 1
 MAX_EVALUATOR_CALLS = 25
 MODEL_NAME = "gpt-5.5"
-GPU_DEVICES = (4, 5, 6, 7)
+GPU_DEVICES = (7,)
 WHEST_PUBLIC_SEEDS = tuple(range(0, 50))
 WHEST_PRIVATE_SEEDS = tuple(range(50, 100))
 WHEST_WIDTH = 64
@@ -283,7 +283,7 @@ def _reserved_gpu(devices: Sequence[int] = GPU_DEVICES) -> Iterator[int]:
                 handles.append(handle)
                 yield device
                 return
-            print("All protected GPUs 4-7 are busy; waiting for one device...", flush=True)
+            print("Protected GPU 7 is busy; waiting for the device...", flush=True)
             time.sleep(10)
     finally:
         for handle in handles:

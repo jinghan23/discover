@@ -198,9 +198,8 @@ incumbent before evaluating the candidate.
 - This branch's lightweight NumPy WhestBench environment uses seeds 0–49 as
   `public-50` and seeds 50–99 as `private-50`. Monte Carlo targets are cached
   inside the trusted evaluator. Only the aggregate private score is recorded.
-- The kernel task is `trimul`. Each run exclusively reserves one physical GPU
-  from 4, 5, 6, or 7 and exposes only that device through
-  `CUDA_VISIBLE_DEVICES`.
+- The kernel task is `trimul`. Each run exclusively reserves physical GPU 7
+  and exposes only that device through `CUDA_VISIBLE_DEVICES`.
 - The three heterogeneous tasks run concurrently, but each task keeps
   `group_size=1`, `groups_per_batch=1`, and
   `max_concurrent_requests=1`.
