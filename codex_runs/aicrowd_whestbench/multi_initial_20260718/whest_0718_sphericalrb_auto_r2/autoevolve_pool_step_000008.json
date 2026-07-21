@@ -1,0 +1,1931 @@
+{
+  "initial_states": [
+    {
+      "code": "\"\"\"Progressive Monte Carlo estimators for ARC WhestBench.\n\nThe module keeps the original plain Monte Carlo estimator and adds four\nvariance-reduction stages:\n\n``plain -> quasi-Monte Carlo -> importance sampling -> control variates\n        -> Rao--Blackwellization``.\n\nAll stages estimate the same standard-Gaussian activation means.  The default\n``Estimator`` combines randomized QMC directions, antithetic pairing, angular\nsecond-moment whitening, and analytic integration of the independent Gaussian\nradius.  The radial identity follows because a bias-free ReLU MLP is positively\nhomogeneous: ``f(r * u) = r * f(u)`` for ``r >= 0``.\n\"\"\"\n\nfrom __future__ import annotations\n\nimport math\n\nimport flopscope as flops\nimport flopscope.numpy as fnp\nfrom whestbench import BaseEstimator\n\n\n_TARGET_FLOP_FRACTION = 0.09\n_MAX_WORKING_SET_BYTES = 100 * 1024 * 1024\n_FLOAT32_ITEMSIZE = 4\n_FLOAT64_ITEMSIZE = 8\n_TAIL_CLIP = 1e-11\n_IMPORTANCE_MIXTURE_WEIGHT = 0.8\n_MIN_ANTITHETIC_SAMPLES = 32\n_WHITENING_EIGENVALUE_FLOOR = 1e-8\n\n\ndef sample_count(budget: int, width: int, depth: int) -> int:\n    \"\"\"Choose the original plain-MC sample count from the FLOP model.\"\"\"\n\n    # Per row: Gaussian generation, then for each layer one dense matmul,\n    # ReLU, and reduction into the reported layer mean.\n    random_per_sample = 16 * width\n    layer_per_sample = 2 * width * width + 2 * width\n    per_sample = random_per_sample + depth * layer_per_sample\n    budget_limited = int(_TARGET_FLOP_FRACTION * budget) // max(per_sample, 1)\n    memory_limited = _MAX_WORKING_SET_BYTES // max(\n        width * _FLOAT32_ITEMSIZE,\n        1,\n    )\n    return int(max(1, min(budget_limited, memory_limited)))\n\n\ndef _qmc_sample_count(budget: int, width: int, depth: int, *, radial: bool) -> int:\n    \"\"\"Choose a QMC count using the documented flopscope operation costs.\"\"\"\n\n    inverse_normal_per_sample = 89 * width\n    direction_normalization = 3 * width + 2 if radial else 0\n    radial_proposal = 20 * width + 32 if radial else 0\n    layer_per_sample = 2 * width * width + 2 * width\n    per_sample = (\n        inverse_normal_per_sample\n        + direction_normalization\n        + radial_proposal\n        + depth * layer_per_sample\n    )\n    budget_limited = int(_TARGET_FLOP_FRACTION * budget) // max(per_sample, 1)\n    memory_limited = _MAX_WORKING_SET_BYTES // max(\n        width * _FLOAT64_ITEMSIZE,\n        1,\n    )\n    return int(max(1, min(budget_limited, memory_limited)))\n\n\ndef whitened_antithetic_sample_count(\n    budget: int,\n    width: int,\n    depth: int,\n    target_fraction: float,\n) -> int:\n    \"\"\"Choose an even count for half-lattice antithetic spherical sampling.\"\"\"\n\n    # Only half of the forwarded rows require a lattice inverse-normal map and\n    # normalization.  The angular second-moment matrix costs k*w^2 across the\n    # half batch.  The eigendecomposition, inverse square root, and folding the\n    # transform into the first weight are fixed O(w^3) work.\n    half_lattice_per_sample = (89 * width + 3 * width + 2) // 2\n    layer_per_sample = depth * (2 * width * width + 2 * width)\n    covariance_per_sample = width * width\n    per_sample = (\n        half_lattice_per_sample + layer_per_sample + covariance_per_sample\n    )\n    fixed = 13 * width**3 + 8 * width\n    budget_limited = (\n        int(float(target_fraction) * budget) - fixed\n    ) // max(per_sample, 1)\n    memory_limited = _MAX_WORKING_SET_BYTES // max(\n        width * _FLOAT64_ITEMSIZE,\n        1,\n    )\n    count = int(\n        max(\n            _MIN_ANTITHETIC_SAMPLES,\n            min(budget_limited, memory_limited),\n        )\n    )\n    return count - (count & 1)\n\n\ndef _first_primes(count: int) -> tuple[int, ...]:\n    primes: list[int] = []\n    candidate = 2\n    while len(primes) < count:\n        is_prime = True\n        for prime in primes:\n            if prime * prime > candidate:\n                break\n            if candidate % prime == 0:\n                is_prime = False\n                break\n        if is_prime:\n            primes.append(candidate)\n        candidate += 1\n    return tuple(primes)\n\n\ndef _lattice_normal_samples(n_samples: int, width: int, rng) -> fnp.ndarray:\n    \"\"\"Return one randomly shifted rank-1 lattice mapped through normal PPF.\"\"\"\n\n    roots = fnp.sqrt(fnp.array(_first_primes(width), dtype=fnp.float64))\n    generator = roots - fnp.floor(roots)\n    shift = rng.random(width)\n    indices = fnp.arange(n_samples, dtype=fnp.float64)[:, None]\n    unwrapped = indices * generator[None, :] + shift[None, :]\n    uniforms = unwrapped - fnp.floor(unwrapped)\n    uniforms = fnp.clip(uniforms, _TAIL_CLIP, 1.0 - _TAIL_CLIP)\n    return flops.stats.norm.ppf(uniforms)\n\n\ndef _mean_chi(dimension: int) -> float:\n    \"\"\"Return E[chi_dimension] without requiring SciPy in the submission.\"\"\"\n\n    half_dimension = 0.5 * float(dimension)\n    return math.sqrt(2.0) * math.exp(\n        math.lgamma(half_dimension + 0.5) - math.lgamma(half_dimension)\n    )\n\n\ndef _qmc_directions(n_samples: int, width: int, rng) -> fnp.ndarray:\n    normals = _lattice_normal_samples(n_samples, width, rng)\n    radii = fnp.sqrt(fnp.maximum(fnp.sum(normals * normals, axis=1), 1e-24))\n    return normals / radii[:, None]\n\n\ndef _angular_whitening_transform(directions: fnp.ndarray) -> fnp.ndarray:\n    \"\"\"Match a half-batch's angular second moment to I/width.\n\n    The returned symmetric transform ``A`` satisfies\n    ``width * (directions @ A).T @ (directions @ A) / n = I`` up to numerical\n    precision.  Applying it is a finite-sample moment-matching correction, not\n    an additional Rao--Blackwell identity.\n    \"\"\"\n\n    n_samples, width = directions.shape\n    scaled_second_moment = (\n        directions.T @ directions\n    ) * (float(width) / float(n_samples))\n    eigenvalues, eigenvectors = fnp.linalg.eigh(scaled_second_moment)\n    eigenvalues = fnp.maximum(eigenvalues, _WHITENING_EIGENVALUE_FLOOR)\n    return (eigenvectors / fnp.sqrt(eigenvalues)) @ eigenvectors.T\n\n\ndef _importance_radial_factors(n_samples: int, width: int, rng) -> fnp.ndarray:\n    \"\"\"Sample an exact radial mixture and return likelihood-weighted radii.\n\n    If ``p`` is the chi-width target radial density, its size-biased density is\n    ``p_sb(r) = r p(r) / E[R]``, which is chi-(width+1).  We sample\n    ``q = (1-epsilon) p + epsilon p_sb`` and return\n\n        r p(r) / q(r) = r / ((1-epsilon) + epsilon r/E[R]).\n\n    Multiplying a unit direction by this scalar applies the importance weight\n    to every layer at once via positive homogeneity.\n    \"\"\"\n\n    epsilon = _IMPORTANCE_MIXTURE_WEIGHT\n    radial_normals = rng.standard_normal(\n        (n_samples, width + 1),\n        dtype=fnp.float32,\n    )\n    squared_radius = fnp.sum(radial_normals[:, :width] ** 2, axis=1)\n    target_radius = fnp.sqrt(fnp.maximum(squared_radius, 1e-24))\n    size_biased_radius = fnp.sqrt(\n        fnp.maximum(squared_radius + radial_normals[:, width] ** 2, 1e-24)\n    )\n    use_size_biased = rng.random(n_samples) < epsilon\n    proposal_radius = fnp.where(\n        use_size_biased,\n        size_biased_radius,\n        target_radius,\n    )\n    density_ratio = (1.0 - epsilon) + epsilon * proposal_radius / _mean_chi(width)\n    return proposal_radius / density_ratio\n\n\ndef _diagonal_gaussian_means(mlp) -> list[fnp.ndarray]:\n    \"\"\"Cheap fixed coefficients for the radial control variate.\"\"\"\n\n    mean = fnp.zeros(mlp.width)\n    variance = fnp.ones(mlp.width)\n    rows = []\n    for weights in mlp.weights:\n        pre_mean = weights.T @ mean\n        pre_variance = fnp.maximum((weights * weights).T @ variance, 1e-12)\n        pre_sigma = fnp.sqrt(pre_variance)\n        alpha = pre_mean / pre_sigma\n        density = flops.stats.norm.pdf(alpha)\n        probability = flops.stats.norm.cdf(alpha)\n        mean = pre_mean * probability + pre_sigma * density\n        second_moment = (\n            (pre_mean * pre_mean + pre_variance) * probability\n            + pre_mean * pre_sigma * density\n        )\n        variance = fnp.maximum(second_moment - mean * mean, 0.0)\n        rows.append(mean)\n    return rows\n\n\ndef _exact_first_layer_mean(weights: fnp.ndarray) -> fnp.ndarray:\n    standard_deviation = fnp.sqrt(fnp.sum(weights * weights, axis=0))\n    return standard_deviation / fnp.sqrt(2.0 * fnp.pi)\n\n\ndef _forward_means(mlp, activations, *, radial_control=None):\n    rows = []\n    control_mean = None\n    control_coefficients = None\n    if radial_control is not None:\n        radial_factors, control_coefficients = radial_control\n        control_mean = fnp.mean(radial_factors) - _mean_chi(mlp.width)\n\n    for layer_index, weights in enumerate(mlp.weights):\n        activations = fnp.maximum(activations @ weights, 0.0)\n        row = fnp.mean(activations, axis=0)\n        if control_coefficients is not None:\n            row = row - control_coefficients[layer_index] * control_mean\n        rows.append(row)\n    return rows\n\n\nclass PlainMonteCarloEstimator(BaseEstimator):\n    \"\"\"Stage 1: independent pseudo-random Gaussian samples.\"\"\"\n\n    def predict(self, mlp, budget: int) -> fnp.ndarray:\n        n_samples = sample_count(budget, mlp.width, mlp.depth)\n        rng = fnp.random.default_rng(mlp.seed)\n        activations = rng.standard_normal(\n            (n_samples, mlp.width),\n            dtype=fnp.float32,\n        )\n        rows = _forward_means(mlp, activations)\n        return fnp.asarray(fnp.stack(rows, axis=0), dtype=fnp.float32)\n\n\nclass QuasiMonteCarloEstimator(BaseEstimator):\n    \"\"\"Stage 2: a Cranley--Patterson shifted rank-1 lattice.\"\"\"\n\n    def predict(self, mlp, budget: int) -> fnp.ndarray:\n        n_samples = _qmc_sample_count(\n            budget,\n            mlp.width,\n            mlp.depth,\n            radial=False,\n        )\n        rng = fnp.random.default_rng(mlp.seed)\n        activations = _lattice_normal_samples(n_samples, mlp.width, rng)\n        rows = _forward_means(mlp, activations)\n        return fnp.asarray(fnp.stack(rows, axis=0), dtype=fnp.float32)\n\n\nclass ImportanceSamplingEstimator(BaseEstimator):\n    \"\"\"Stage 3: QMC directions with exact radial mixture importance sampling.\"\"\"\n\n    def predict(self, mlp, budget: int) -> fnp.ndarray:\n        n_samples = _qmc_sample_count(\n            budget,\n            mlp.width,\n            mlp.depth,\n            radial=True,\n        )\n        rng = fnp.random.default_rng(mlp.seed)\n        directions = _qmc_directions(n_samples, mlp.width, rng)\n        radial_factors = _importance_radial_factors(\n            n_samples,\n            mlp.width,\n            rng,\n        )\n        rows = _forward_means(mlp, directions * radial_factors[:, None])\n        return fnp.asarray(fnp.stack(rows, axis=0), dtype=fnp.float32)\n\n\nclass ControlVariateEstimator(BaseEstimator):\n    \"\"\"Stage 4: fixed radial controls with known expectation E[chi_width].\"\"\"\n\n    def predict(self, mlp, budget: int) -> fnp.ndarray:\n        n_samples = _qmc_sample_count(\n            budget,\n            mlp.width,\n            mlp.depth,\n            radial=True,\n        )\n        rng = fnp.random.default_rng(mlp.seed)\n        directions = _qmc_directions(n_samples, mlp.width, rng)\n        radial_factors = _importance_radial_factors(\n            n_samples,\n            mlp.width,\n            rng,\n        )\n        mean_radius = _mean_chi(mlp.width)\n        coefficients = [\n            row / mean_radius for row in _diagonal_gaussian_means(mlp)\n        ]\n        rows = _forward_means(\n            mlp,\n            directions * radial_factors[:, None],\n            radial_control=(radial_factors, coefficients),\n        )\n        return fnp.asarray(fnp.stack(rows, axis=0), dtype=fnp.float32)\n\n\nclass RaoBlackwellEstimator(BaseEstimator):\n    \"\"\"Stage 5: integrate the Gaussian radius and the reported first layer.\"\"\"\n\n    def predict(self, mlp, budget: int) -> fnp.ndarray:\n        n_samples = _qmc_sample_count(\n            budget,\n            mlp.width,\n            mlp.depth,\n            radial=False,\n        )\n        rng = fnp.random.default_rng(mlp.seed)\n        directions = _qmc_directions(n_samples, mlp.width, rng)\n        activations = directions * _mean_chi(mlp.width)\n        rows = _forward_means(mlp, activations)\n        rows[0] = _exact_first_layer_mean(mlp.weights[0])\n        return fnp.asarray(fnp.stack(rows, axis=0), dtype=fnp.float32)\n\n\nclass _WhitenedAntitheticRaoBlackwellEstimator(BaseEstimator):\n    \"\"\"Half-lattice antithetic spherical RQMC with angular moment matching.\"\"\"\n\n    target_flop_fraction = 0.10\n\n    def predict(self, mlp, budget: int) -> fnp.ndarray:\n        n_samples = whitened_antithetic_sample_count(\n            budget,\n            mlp.width,\n            mlp.depth,\n            self.target_flop_fraction,\n        )\n        half_samples = n_samples // 2\n        rng = fnp.random.default_rng(mlp.seed)\n        half_directions = _qmc_directions(half_samples, mlp.width, rng)\n        whitening = _angular_whitening_transform(half_directions)\n\n        # Fold the angular whitening into the first weight, avoiding a\n        # sample-sized whitening matmul.  Antipodal pairing makes the empirical\n        # direction mean exactly zero.  E[chi_width] integrates the independent\n        # Gaussian radius for every positively homogeneous ReLU layer.\n        first_weight = whitening @ mlp.weights[0]\n        paired_directions = fnp.concatenate(\n            (half_directions, -half_directions),\n            axis=0,\n        )\n        activations = paired_directions * _mean_chi(mlp.width)\n\n        rows = []\n        activations = fnp.maximum(activations @ first_weight, 0.0)\n        rows.append(_exact_first_layer_mean(mlp.weights[0]))\n        for weights in mlp.weights[1:]:\n            activations = fnp.maximum(activations @ weights, 0.0)\n            rows.append(fnp.mean(activations, axis=0))\n\n        return fnp.asarray(fnp.stack(rows, axis=0), dtype=fnp.float32)\n\n\nclass WhitenedAntitheticRaoBlackwell10Estimator(\n    _WhitenedAntitheticRaoBlackwellEstimator\n):\n    \"\"\"Whitened-antithetic spherical RQMC targeting 10% tracked compute.\"\"\"\n\n    target_flop_fraction = 0.10\n\n\nclass WhitenedAntitheticRaoBlackwell15Estimator(\n    _WhitenedAntitheticRaoBlackwellEstimator\n):\n    \"\"\"Whitened-antithetic spherical RQMC targeting 15% tracked compute.\"\"\"\n\n    target_flop_fraction = 0.15\n\n\nclass Estimator(WhitenedAntitheticRaoBlackwell10Estimator):\n    \"\"\"Best full-100 stage, targeting approximately 10% effective compute.\"\"\"\n",
+      "construction": [
+        {
+          "adjusted_final_layer_score": 2.621832490545025e-07,
+          "all_layers_mse": 5.753431196353631e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 29716245758.1371,
+          "final_layer_mse": 2.399826826149365e-06,
+          "flops_used": 27147538143,
+          "mlp_index": 0,
+          "mlp_name": "daniel-harrison",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.2820095601285613e-07,
+          "all_layers_mse": 6.1912351156934164e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 27582515331.706398,
+          "final_layer_mse": 1.2642306046473095e-06,
+          "flops_used": 27147538143,
+          "mlp_index": 1,
+          "mlp_name": "dustin-robinson",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 8.824435440083967e-07,
+          "all_layers_mse": 7.943550372147001e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 27557690369.686478,
+          "final_layer_mse": 8.709896974323783e-06,
+          "flops_used": 27147538143,
+          "mlp_index": 2,
+          "mlp_name": "cole-martin",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 8.110001472348922e-08,
+          "all_layers_mse": 5.251117727311794e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 27515209766.826027,
+          "final_layer_mse": 8.01709461484279e-07,
+          "flops_used": 27147538143,
+          "mlp_index": 3,
+          "mlp_name": "donna-clarke",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 9.369395211359656e-08,
+          "all_layers_mse": 4.4950947994948365e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 27545035186.013573,
+          "final_layer_mse": 9.25203210044856e-07,
+          "flops_used": 27147538143,
+          "mlp_index": 4,
+          "mlp_name": "rebecca-walker",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.445685566529708e-07,
+          "all_layers_mse": 6.156503786769463e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 27578313576.778763,
+          "final_layer_mse": 1.4258539522415958e-06,
+          "flops_used": 27147538143,
+          "mlp_index": 5,
+          "mlp_name": "monique-stevens",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 2.0568595828583229e-07,
+          "all_layers_mse": 5.448734555102419e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 27563542428.21633,
+          "final_layer_mse": 2.029731149377767e-06,
+          "flops_used": 27147538143,
+          "mlp_index": 6,
+          "mlp_name": "keith-brock",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 9.322757970814212e-08,
+          "all_layers_mse": 4.413681836012984e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 27587212550.24373,
+          "final_layer_mse": 9.191904268845974e-07,
+          "flops_used": 27147538143,
+          "mlp_index": 7,
+          "mlp_name": "robert-huff",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.2682415737365078e-07,
+          "all_layers_mse": 5.230551778367953e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 27623221206.26866,
+          "final_layer_mse": 1.2488105767261004e-06,
+          "flops_used": 27147538143,
+          "mlp_index": 8,
+          "mlp_name": "kimberly-caldwell",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 2.0756573226975183e-07,
+          "all_layers_mse": 6.4426685639773495e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 27606024893.72193,
+          "final_layer_mse": 2.0451288946787827e-06,
+          "flops_used": 27147538143,
+          "mlp_index": 9,
+          "mlp_name": "annette-hansen",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        }
+      ],
+      "id": "359b81d5-2c94-4eb8-a0eb-b42258b0c621",
+      "metadata": {
+        "baseline_all_layers_mse": 0.000785627873847261,
+        "baseline_final_layer_mse": 0.0009320092955022119,
+        "challenge": "ARC White-Box Estimation Challenge 2026",
+        "initial_adjusted_final_layer_score": 2.225493700203189e-07,
+        "initial_all_layers_mse": 5.732656973123085e-06,
+        "initial_estimator_path": "/opt/tiger/discover/codex_runs/aicrowd_whestbench/multi_initial_20260718/initial_states/sphericalrb/estimator.py",
+        "initial_final_layer_mse": 2.1769582076558434e-06,
+        "official_suite": {
+          "dataset": "aicrowd/arc-whestbench-public-2026",
+          "depth": 32,
+          "flop_budget": 272000000000,
+          "lambda_flops_per_second": 100000000000.0,
+          "n_mlps": 10,
+          "revision": "v1-phase1",
+          "runner": "subprocess",
+          "split": "mini",
+          "width": 256
+        }
+      },
+      "observation": "",
+      "parent_values": [],
+      "parents": [],
+      "timestep": -1,
+      "type": "State",
+      "value": -2.225493700203189e-07
+    }
+  ],
+  "states": [
+    {
+      "code": "\"\"\"Progressive Monte Carlo estimators for ARC WhestBench.\n\nThe module keeps the original plain Monte Carlo estimator and adds four\nvariance-reduction stages:\n\n``plain -> quasi-Monte Carlo -> importance sampling -> control variates\n        -> Rao--Blackwellization``.\n\nAll stages estimate the same standard-Gaussian activation means.  The default\n``Estimator`` combines randomized QMC directions, antithetic pairing, angular\nsecond-moment whitening, and analytic integration of the independent Gaussian\nradius.  The radial identity follows because a bias-free ReLU MLP is positively\nhomogeneous: ``f(r * u) = r * f(u)`` for ``r >= 0``.\n\"\"\"\n\nfrom __future__ import annotations\n\nimport math\n\nimport flopscope as flops\nimport flopscope.numpy as fnp\nfrom whestbench import BaseEstimator\n\n\n_TARGET_FLOP_FRACTION = 0.09\n_MAX_WORKING_SET_BYTES = 100 * 1024 * 1024\n_FLOAT32_ITEMSIZE = 4\n_FLOAT64_ITEMSIZE = 8\n_TAIL_CLIP = 1e-11\n_IMPORTANCE_MIXTURE_WEIGHT = 0.8\n_MIN_ANTITHETIC_SAMPLES = 32\n_WHITENING_EIGENVALUE_FLOOR = 1e-8\n\n\ndef sample_count(budget: int, width: int, depth: int) -> int:\n    \"\"\"Choose the original plain-MC sample count from the FLOP model.\"\"\"\n\n    # Per row: Gaussian generation, then for each layer one dense matmul,\n    # ReLU, and reduction into the reported layer mean.\n    random_per_sample = 16 * width\n    layer_per_sample = 2 * width * width + 2 * width\n    per_sample = random_per_sample + depth * layer_per_sample\n    budget_limited = int(_TARGET_FLOP_FRACTION * budget) // max(per_sample, 1)\n    memory_limited = _MAX_WORKING_SET_BYTES // max(\n        width * _FLOAT32_ITEMSIZE,\n        1,\n    )\n    return int(max(1, min(budget_limited, memory_limited)))\n\n\ndef _qmc_sample_count(budget: int, width: int, depth: int, *, radial: bool) -> int:\n    \"\"\"Choose a QMC count using the documented flopscope operation costs.\"\"\"\n\n    inverse_normal_per_sample = 89 * width\n    direction_normalization = 3 * width + 2 if radial else 0\n    radial_proposal = 20 * width + 32 if radial else 0\n    layer_per_sample = 2 * width * width + 2 * width\n    per_sample = (\n        inverse_normal_per_sample\n        + direction_normalization\n        + radial_proposal\n        + depth * layer_per_sample\n    )\n    budget_limited = int(_TARGET_FLOP_FRACTION * budget) // max(per_sample, 1)\n    memory_limited = _MAX_WORKING_SET_BYTES // max(\n        width * _FLOAT64_ITEMSIZE,\n        1,\n    )\n    return int(max(1, min(budget_limited, memory_limited)))\n\n\ndef whitened_antithetic_sample_count(\n    budget: int,\n    width: int,\n    depth: int,\n    target_fraction: float,\n) -> int:\n    \"\"\"Choose an even count for half-lattice antithetic spherical sampling.\"\"\"\n\n    # Only half of the forwarded rows require a lattice inverse-normal map and\n    # normalization.  The angular second-moment matrix costs k*w^2 across the\n    # half batch.  The eigendecomposition, inverse square root, and folding the\n    # transform into the first weight are fixed O(w^3) work.\n    half_lattice_per_sample = (89 * width + 3 * width + 2) // 2\n    layer_per_sample = depth * (2 * width * width + 2 * width)\n    covariance_per_sample = width * width\n    per_sample = (\n        half_lattice_per_sample + layer_per_sample + covariance_per_sample\n    )\n    fixed = 13 * width**3 + 8 * width\n    budget_limited = (\n        int(float(target_fraction) * budget) - fixed\n    ) // max(per_sample, 1)\n    memory_limited = _MAX_WORKING_SET_BYTES // max(\n        width * _FLOAT64_ITEMSIZE,\n        1,\n    )\n    count = int(\n        max(\n            _MIN_ANTITHETIC_SAMPLES,\n            min(budget_limited, memory_limited),\n        )\n    )\n    return count - (count & 1)\n\n\ndef _first_primes(count: int) -> tuple[int, ...]:\n    primes: list[int] = []\n    candidate = 2\n    while len(primes) < count:\n        is_prime = True\n        for prime in primes:\n            if prime * prime > candidate:\n                break\n            if candidate % prime == 0:\n                is_prime = False\n                break\n        if is_prime:\n            primes.append(candidate)\n        candidate += 1\n    return tuple(primes)\n\n\ndef _lattice_normal_samples(n_samples: int, width: int, rng) -> fnp.ndarray:\n    \"\"\"Return one randomly shifted rank-1 lattice mapped through normal PPF.\"\"\"\n\n    roots = fnp.sqrt(fnp.array(_first_primes(width), dtype=fnp.float64))\n    generator = roots - fnp.floor(roots)\n    shift = rng.random(width)\n    indices = fnp.arange(n_samples, dtype=fnp.float64)[:, None]\n    unwrapped = indices * generator[None, :] + shift[None, :]\n    uniforms = unwrapped - fnp.floor(unwrapped)\n    uniforms = fnp.clip(uniforms, _TAIL_CLIP, 1.0 - _TAIL_CLIP)\n    return flops.stats.norm.ppf(uniforms)\n\n\ndef _mean_chi(dimension: int) -> float:\n    \"\"\"Return E[chi_dimension] without requiring SciPy in the submission.\"\"\"\n\n    half_dimension = 0.5 * float(dimension)\n    return math.sqrt(2.0) * math.exp(\n        math.lgamma(half_dimension + 0.5) - math.lgamma(half_dimension)\n    )\n\n\ndef _qmc_directions(n_samples: int, width: int, rng) -> fnp.ndarray:\n    normals = _lattice_normal_samples(n_samples, width, rng)\n    radii = fnp.sqrt(fnp.maximum(fnp.sum(normals * normals, axis=1), 1e-24))\n    return normals / radii[:, None]\n\n\ndef _angular_whitening_transform(directions: fnp.ndarray) -> fnp.ndarray:\n    \"\"\"Match a half-batch's angular second moment to I/width.\n\n    The returned symmetric transform ``A`` satisfies\n    ``width * (directions @ A).T @ (directions @ A) / n = I`` up to numerical\n    precision.  Applying it is a finite-sample moment-matching correction, not\n    an additional Rao--Blackwell identity.\n    \"\"\"\n\n    n_samples, width = directions.shape\n    scaled_second_moment = (\n        directions.T @ directions\n    ) * (float(width) / float(n_samples))\n    eigenvalues, eigenvectors = fnp.linalg.eigh(scaled_second_moment)\n    eigenvalues = fnp.maximum(eigenvalues, _WHITENING_EIGENVALUE_FLOOR)\n    return (eigenvectors / fnp.sqrt(eigenvalues)) @ eigenvectors.T\n\n\ndef _importance_radial_factors(n_samples: int, width: int, rng) -> fnp.ndarray:\n    \"\"\"Sample an exact radial mixture and return likelihood-weighted radii.\n\n    If ``p`` is the chi-width target radial density, its size-biased density is\n    ``p_sb(r) = r p(r) / E[R]``, which is chi-(width+1).  We sample\n    ``q = (1-epsilon) p + epsilon p_sb`` and return\n\n        r p(r) / q(r) = r / ((1-epsilon) + epsilon r/E[R]).\n\n    Multiplying a unit direction by this scalar applies the importance weight\n    to every layer at once via positive homogeneity.\n    \"\"\"\n\n    epsilon = _IMPORTANCE_MIXTURE_WEIGHT\n    radial_normals = rng.standard_normal(\n        (n_samples, width + 1),\n        dtype=fnp.float32,\n    )\n    squared_radius = fnp.sum(radial_normals[:, :width] ** 2, axis=1)\n    target_radius = fnp.sqrt(fnp.maximum(squared_radius, 1e-24))\n    size_biased_radius = fnp.sqrt(\n        fnp.maximum(squared_radius + radial_normals[:, width] ** 2, 1e-24)\n    )\n    use_size_biased = rng.random(n_samples) < epsilon\n    proposal_radius = fnp.where(\n        use_size_biased,\n        size_biased_radius,\n        target_radius,\n    )\n    density_ratio = (1.0 - epsilon) + epsilon * proposal_radius / _mean_chi(width)\n    return proposal_radius / density_ratio\n\n\ndef _diagonal_gaussian_means(mlp) -> list[fnp.ndarray]:\n    \"\"\"Cheap fixed coefficients for the radial control variate.\"\"\"\n\n    mean = fnp.zeros(mlp.width)\n    variance = fnp.ones(mlp.width)\n    rows = []\n    for weights in mlp.weights:\n        pre_mean = weights.T @ mean\n        pre_variance = fnp.maximum((weights * weights).T @ variance, 1e-12)\n        pre_sigma = fnp.sqrt(pre_variance)\n        alpha = pre_mean / pre_sigma\n        density = flops.stats.norm.pdf(alpha)\n        probability = flops.stats.norm.cdf(alpha)\n        mean = pre_mean * probability + pre_sigma * density\n        second_moment = (\n            (pre_mean * pre_mean + pre_variance) * probability\n            + pre_mean * pre_sigma * density\n        )\n        variance = fnp.maximum(second_moment - mean * mean, 0.0)\n        rows.append(mean)\n    return rows\n\n\ndef _exact_first_layer_mean(weights: fnp.ndarray) -> fnp.ndarray:\n    standard_deviation = fnp.sqrt(fnp.sum(weights * weights, axis=0))\n    return standard_deviation / fnp.sqrt(2.0 * fnp.pi)\n\n\ndef _forward_means(mlp, activations, *, radial_control=None):\n    rows = []\n    control_mean = None\n    control_coefficients = None\n    if radial_control is not None:\n        radial_factors, control_coefficients = radial_control\n        control_mean = fnp.mean(radial_factors) - _mean_chi(mlp.width)\n\n    for layer_index, weights in enumerate(mlp.weights):\n        activations = fnp.maximum(activations @ weights, 0.0)\n        row = fnp.mean(activations, axis=0)\n        if control_coefficients is not None:\n            row = row - control_coefficients[layer_index] * control_mean\n        rows.append(row)\n    return rows\n\n\nclass PlainMonteCarloEstimator(BaseEstimator):\n    \"\"\"Stage 1: independent pseudo-random Gaussian samples.\"\"\"\n\n    def predict(self, mlp, budget: int) -> fnp.ndarray:\n        n_samples = sample_count(budget, mlp.width, mlp.depth)\n        rng = fnp.random.default_rng(mlp.seed)\n        activations = rng.standard_normal(\n            (n_samples, mlp.width),\n            dtype=fnp.float32,\n        )\n        rows = _forward_means(mlp, activations)\n        return fnp.asarray(fnp.stack(rows, axis=0), dtype=fnp.float32)\n\n\nclass QuasiMonteCarloEstimator(BaseEstimator):\n    \"\"\"Stage 2: a Cranley--Patterson shifted rank-1 lattice.\"\"\"\n\n    def predict(self, mlp, budget: int) -> fnp.ndarray:\n        n_samples = _qmc_sample_count(\n            budget,\n            mlp.width,\n            mlp.depth,\n            radial=False,\n        )\n        rng = fnp.random.default_rng(mlp.seed)\n        activations = _lattice_normal_samples(n_samples, mlp.width, rng)\n        rows = _forward_means(mlp, activations)\n        return fnp.asarray(fnp.stack(rows, axis=0), dtype=fnp.float32)\n\n\nclass ImportanceSamplingEstimator(BaseEstimator):\n    \"\"\"Stage 3: QMC directions with exact radial mixture importance sampling.\"\"\"\n\n    def predict(self, mlp, budget: int) -> fnp.ndarray:\n        n_samples = _qmc_sample_count(\n            budget,\n            mlp.width,\n            mlp.depth,\n            radial=True,\n        )\n        rng = fnp.random.default_rng(mlp.seed)\n        directions = _qmc_directions(n_samples, mlp.width, rng)\n        radial_factors = _importance_radial_factors(\n            n_samples,\n            mlp.width,\n            rng,\n        )\n        rows = _forward_means(mlp, directions * radial_factors[:, None])\n        return fnp.asarray(fnp.stack(rows, axis=0), dtype=fnp.float32)\n\n\nclass ControlVariateEstimator(BaseEstimator):\n    \"\"\"Stage 4: fixed radial controls with known expectation E[chi_width].\"\"\"\n\n    def predict(self, mlp, budget: int) -> fnp.ndarray:\n        n_samples = _qmc_sample_count(\n            budget,\n            mlp.width,\n            mlp.depth,\n            radial=True,\n        )\n        rng = fnp.random.default_rng(mlp.seed)\n        directions = _qmc_directions(n_samples, mlp.width, rng)\n        radial_factors = _importance_radial_factors(\n            n_samples,\n            mlp.width,\n            rng,\n        )\n        mean_radius = _mean_chi(mlp.width)\n        coefficients = [\n            row / mean_radius for row in _diagonal_gaussian_means(mlp)\n        ]\n        rows = _forward_means(\n            mlp,\n            directions * radial_factors[:, None],\n            radial_control=(radial_factors, coefficients),\n        )\n        return fnp.asarray(fnp.stack(rows, axis=0), dtype=fnp.float32)\n\n\nclass RaoBlackwellEstimator(BaseEstimator):\n    \"\"\"Stage 5: integrate the Gaussian radius and the reported first layer.\"\"\"\n\n    def predict(self, mlp, budget: int) -> fnp.ndarray:\n        n_samples = _qmc_sample_count(\n            budget,\n            mlp.width,\n            mlp.depth,\n            radial=False,\n        )\n        rng = fnp.random.default_rng(mlp.seed)\n        directions = _qmc_directions(n_samples, mlp.width, rng)\n        activations = directions * _mean_chi(mlp.width)\n        rows = _forward_means(mlp, activations)\n        rows[0] = _exact_first_layer_mean(mlp.weights[0])\n        return fnp.asarray(fnp.stack(rows, axis=0), dtype=fnp.float32)\n\n\nclass _WhitenedAntitheticRaoBlackwellEstimator(BaseEstimator):\n    \"\"\"Half-lattice antithetic spherical RQMC with angular moment matching.\"\"\"\n\n    target_flop_fraction = 0.10\n\n    def predict(self, mlp, budget: int) -> fnp.ndarray:\n        n_samples = whitened_antithetic_sample_count(\n            budget,\n            mlp.width,\n            mlp.depth,\n            self.target_flop_fraction,\n        )\n        half_samples = n_samples // 2\n        rng = fnp.random.default_rng(mlp.seed)\n        half_directions = _qmc_directions(half_samples, mlp.width, rng)\n        whitening = _angular_whitening_transform(half_directions)\n\n        # Fold the angular whitening into the first weight, avoiding a\n        # sample-sized whitening matmul.  Antipodal pairing makes the empirical\n        # direction mean exactly zero.  E[chi_width] integrates the independent\n        # Gaussian radius for every positively homogeneous ReLU layer.\n        first_weight = whitening @ mlp.weights[0]\n        paired_directions = fnp.concatenate(\n            (half_directions, -half_directions),\n            axis=0,\n        )\n        activations = paired_directions * _mean_chi(mlp.width)\n\n        rows = []\n        activations = fnp.maximum(activations @ first_weight, 0.0)\n        rows.append(_exact_first_layer_mean(mlp.weights[0]))\n        for weights in mlp.weights[1:]:\n            activations = fnp.maximum(activations @ weights, 0.0)\n            rows.append(fnp.mean(activations, axis=0))\n\n        return fnp.asarray(fnp.stack(rows, axis=0), dtype=fnp.float32)\n\n\nclass WhitenedAntitheticRaoBlackwell10Estimator(\n    _WhitenedAntitheticRaoBlackwellEstimator\n):\n    \"\"\"Whitened-antithetic spherical RQMC targeting 10% tracked compute.\"\"\"\n\n    target_flop_fraction = 0.10\n\n\nclass WhitenedAntitheticRaoBlackwell15Estimator(\n    _WhitenedAntitheticRaoBlackwellEstimator\n):\n    \"\"\"Whitened-antithetic spherical RQMC targeting 15% tracked compute.\"\"\"\n\n    target_flop_fraction = 0.15\n\n\nclass Estimator(WhitenedAntitheticRaoBlackwell10Estimator):\n    \"\"\"Best full-100 stage, targeting approximately 10% effective compute.\"\"\"\n",
+      "construction": [
+        {
+          "adjusted_final_layer_score": 2.621832490545025e-07,
+          "all_layers_mse": 5.753431196353631e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 29716245758.1371,
+          "final_layer_mse": 2.399826826149365e-06,
+          "flops_used": 27147538143,
+          "mlp_index": 0,
+          "mlp_name": "daniel-harrison",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.2820095601285613e-07,
+          "all_layers_mse": 6.1912351156934164e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 27582515331.706398,
+          "final_layer_mse": 1.2642306046473095e-06,
+          "flops_used": 27147538143,
+          "mlp_index": 1,
+          "mlp_name": "dustin-robinson",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 8.824435440083967e-07,
+          "all_layers_mse": 7.943550372147001e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 27557690369.686478,
+          "final_layer_mse": 8.709896974323783e-06,
+          "flops_used": 27147538143,
+          "mlp_index": 2,
+          "mlp_name": "cole-martin",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 8.110001472348922e-08,
+          "all_layers_mse": 5.251117727311794e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 27515209766.826027,
+          "final_layer_mse": 8.01709461484279e-07,
+          "flops_used": 27147538143,
+          "mlp_index": 3,
+          "mlp_name": "donna-clarke",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 9.369395211359656e-08,
+          "all_layers_mse": 4.4950947994948365e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 27545035186.013573,
+          "final_layer_mse": 9.25203210044856e-07,
+          "flops_used": 27147538143,
+          "mlp_index": 4,
+          "mlp_name": "rebecca-walker",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.445685566529708e-07,
+          "all_layers_mse": 6.156503786769463e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 27578313576.778763,
+          "final_layer_mse": 1.4258539522415958e-06,
+          "flops_used": 27147538143,
+          "mlp_index": 5,
+          "mlp_name": "monique-stevens",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 2.0568595828583229e-07,
+          "all_layers_mse": 5.448734555102419e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 27563542428.21633,
+          "final_layer_mse": 2.029731149377767e-06,
+          "flops_used": 27147538143,
+          "mlp_index": 6,
+          "mlp_name": "keith-brock",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 9.322757970814212e-08,
+          "all_layers_mse": 4.413681836012984e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 27587212550.24373,
+          "final_layer_mse": 9.191904268845974e-07,
+          "flops_used": 27147538143,
+          "mlp_index": 7,
+          "mlp_name": "robert-huff",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.2682415737365078e-07,
+          "all_layers_mse": 5.230551778367953e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 27623221206.26866,
+          "final_layer_mse": 1.2488105767261004e-06,
+          "flops_used": 27147538143,
+          "mlp_index": 8,
+          "mlp_name": "kimberly-caldwell",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 2.0756573226975183e-07,
+          "all_layers_mse": 6.4426685639773495e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 27606024893.72193,
+          "final_layer_mse": 2.0451288946787827e-06,
+          "flops_used": 27147538143,
+          "mlp_index": 9,
+          "mlp_name": "annette-hansen",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        }
+      ],
+      "id": "359b81d5-2c94-4eb8-a0eb-b42258b0c621",
+      "metadata": {
+        "baseline_all_layers_mse": 0.000785627873847261,
+        "baseline_final_layer_mse": 0.0009320092955022119,
+        "challenge": "ARC White-Box Estimation Challenge 2026",
+        "initial_adjusted_final_layer_score": 2.225493700203189e-07,
+        "initial_all_layers_mse": 5.732656973123085e-06,
+        "initial_estimator_path": "/opt/tiger/discover/codex_runs/aicrowd_whestbench/multi_initial_20260718/initial_states/sphericalrb/estimator.py",
+        "initial_final_layer_mse": 2.1769582076558434e-06,
+        "official_suite": {
+          "dataset": "aicrowd/arc-whestbench-public-2026",
+          "depth": 32,
+          "flop_budget": 272000000000,
+          "lambda_flops_per_second": 100000000000.0,
+          "n_mlps": 10,
+          "revision": "v1-phase1",
+          "runner": "subprocess",
+          "split": "mini",
+          "width": 256
+        }
+      },
+      "observation": "",
+      "parent_values": [],
+      "parents": [],
+      "timestep": -1,
+      "type": "State",
+      "value": -2.225493700203189e-07
+    },
+    {
+      "code": "\"\"\"Estimator for ARC WhestBench public mini MLPs.\n\nThe estimator uses spherical randomized QMC with antithetic directions.  The\nGaussian radius is integrated analytically via positive homogeneity of\nbias-free ReLU networks.  A finite-sample angular whitening transform is folded\ninto the first weight matrix, and the final layer uses two cheap controls from\nthe already-forwarded samples.\n\"\"\"\n\nfrom __future__ import annotations\n\nimport math\n\nimport flopscope as flops\nimport flopscope.numpy as fnp\nfrom whestbench import BaseEstimator\n\n\n_MAX_WORKING_SET_BYTES = 100 * 1024 * 1024\n_FLOAT64_ITEMSIZE = 8\n_TAIL_CLIP = 1e-11\n_MIN_ANTITHETIC_SAMPLES = 32\n_WHITENING_EIGENVALUE_FLOOR = 1e-8\n\n\ndef _sample_count(\n    budget: int,\n    width: int,\n    depth: int,\n    target_fraction: float,\n) -> int:\n    half_lattice_per_sample = (89 * width + 3 * width + 2) // 2\n    layer_per_sample = depth * (2 * width * width + 2 * width)\n    covariance_per_sample = width * width\n    per_sample = (\n        half_lattice_per_sample + layer_per_sample + covariance_per_sample\n    )\n    fixed = 13 * width**3 + 8 * width\n    budget_limited = (\n        int(float(target_fraction) * budget) - fixed\n    ) // max(per_sample, 1)\n    memory_limited = _MAX_WORKING_SET_BYTES // max(\n        width * _FLOAT64_ITEMSIZE,\n        1,\n    )\n    count = int(\n        max(\n            _MIN_ANTITHETIC_SAMPLES,\n            min(budget_limited, memory_limited),\n        )\n    )\n    return count - (count & 1)\n\n\ndef _first_primes(count: int) -> tuple[int, ...]:\n    primes: list[int] = []\n    candidate = 2\n    while len(primes) < count:\n        is_prime = True\n        for prime in primes:\n            if prime * prime > candidate:\n                break\n            if candidate % prime == 0:\n                is_prime = False\n                break\n        if is_prime:\n            primes.append(candidate)\n        candidate += 1\n    return tuple(primes)\n\n\ndef _lattice_normal_samples(n_samples: int, width: int, rng) -> fnp.ndarray:\n    roots = fnp.sqrt(fnp.array(_first_primes(width), dtype=fnp.float64))\n    generator = roots - fnp.floor(roots)\n    shift = rng.random(width)\n    indices = fnp.arange(n_samples, dtype=fnp.float64)[:, None]\n    unwrapped = indices * generator[None, :] + shift[None, :]\n    uniforms = unwrapped - fnp.floor(unwrapped)\n    uniforms = fnp.clip(uniforms, _TAIL_CLIP, 1.0 - _TAIL_CLIP)\n    return flops.stats.norm.ppf(uniforms)\n\n\ndef _mean_chi(dimension: int) -> float:\n    half_dimension = 0.5 * float(dimension)\n    return math.sqrt(2.0) * math.exp(\n        math.lgamma(half_dimension + 0.5) - math.lgamma(half_dimension)\n    )\n\n\ndef _qmc_directions(n_samples: int, width: int, rng) -> fnp.ndarray:\n    normals = _lattice_normal_samples(n_samples, width, rng)\n    radii = fnp.sqrt(fnp.maximum(fnp.sum(normals * normals, axis=1), 1e-24))\n    return normals / radii[:, None]\n\n\ndef _angular_whitening_transform(directions: fnp.ndarray) -> fnp.ndarray:\n    n_samples, width = directions.shape\n    scaled_second_moment = (\n        directions.T @ directions\n    ) * (float(width) / float(n_samples))\n    eigenvalues, eigenvectors = fnp.linalg.eigh(scaled_second_moment)\n    eigenvalues = fnp.maximum(eigenvalues, _WHITENING_EIGENVALUE_FLOOR)\n    return (eigenvectors / fnp.sqrt(eigenvalues)) @ eigenvectors.T\n\n\ndef _exact_first_layer_mean(weights: fnp.ndarray) -> fnp.ndarray:\n    standard_deviation = fnp.sqrt(fnp.sum(weights * weights, axis=0))\n    return standard_deviation / fnp.sqrt(2.0 * fnp.pi)\n\n\nclass Estimator(BaseEstimator):\n    target_flop_fraction = 0.10\n    sample_delta = -24\n    whitening_strength = 1.010\n    final_scale = 0.99952\n    final_gaussian_blend = -0.03\n    final_nested_blend = 0.22\n\n    def predict(self, mlp, budget: int) -> fnp.ndarray:\n        n_samples = _sample_count(\n            budget,\n            mlp.width,\n            mlp.depth,\n            self.target_flop_fraction,\n        )\n        n_samples = max(_MIN_ANTITHETIC_SAMPLES, n_samples + self.sample_delta)\n        n_samples = n_samples - (n_samples & 1)\n        half_samples = n_samples // 2\n\n        rng = fnp.random.default_rng(mlp.seed)\n        half_directions = _qmc_directions(half_samples, mlp.width, rng)\n        whitening = _angular_whitening_transform(half_directions)\n        whitened_first_weight = whitening @ mlp.weights[0]\n        first_weight = (\n            (1.0 - self.whitening_strength) * mlp.weights[0]\n            + self.whitening_strength * whitened_first_weight\n        )\n\n        paired_directions = fnp.concatenate(\n            (half_directions, -half_directions),\n            axis=0,\n        )\n        activations = paired_directions * _mean_chi(mlp.width)\n\n        rows = []\n        activations = fnp.maximum(activations @ first_weight, 0.0)\n        rows.append(_exact_first_layer_mean(mlp.weights[0]))\n\n        for layer_index, weights in enumerate(mlp.weights[1:], start=1):\n            preactivations = activations @ weights\n            activations = fnp.maximum(preactivations, 0.0)\n            row = fnp.mean(activations, axis=0)\n\n            if layer_index == mlp.depth - 1:\n                pre_mean = fnp.mean(preactivations, axis=0)\n                pre_second = fnp.mean(preactivations * preactivations, axis=0)\n                pre_variance = fnp.maximum(\n                    pre_second - pre_mean * pre_mean,\n                    1e-12,\n                )\n                pre_sigma = fnp.sqrt(pre_variance)\n                alpha = pre_mean / pre_sigma\n                gaussian_row = (\n                    pre_mean * flops.stats.norm.cdf(alpha)\n                    + pre_sigma * flops.stats.norm.pdf(alpha)\n                )\n                row = row + self.final_gaussian_blend * (gaussian_row - row)\n\n                sub_count = half_samples // 2\n                sub_row = (\n                    fnp.sum(activations[:sub_count], axis=0)\n                    + fnp.sum(\n                        activations[half_samples:half_samples + sub_count],\n                        axis=0,\n                    )\n                ) / float(2 * sub_count)\n                row = row + self.final_nested_blend * (row - sub_row)\n\n            rows.append(row)\n\n        rows = fnp.asarray(fnp.stack(rows, axis=0), dtype=fnp.float32)\n        return fnp.concatenate(\n            (rows[:-1], rows[-1:] * self.final_scale),\n            axis=0,\n        )\n",
+      "construction": [
+        {
+          "adjusted_final_layer_score": 2.9839365838397554e-07,
+          "all_layers_mse": 5.713265636586584e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 28023907626.040787,
+          "final_layer_mse": 2.896208343372564e-06,
+          "flops_used": 27050655419,
+          "mlp_index": 0,
+          "mlp_name": "daniel-harrison",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.5091495122993594e-07,
+          "all_layers_mse": 6.170446795294993e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 27488502943.881363,
+          "final_layer_mse": 1.4933103784642299e-06,
+          "flops_used": 27050655419,
+          "mlp_index": 1,
+          "mlp_name": "dustin-robinson",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 2.3469914248813759e-07,
+          "all_layers_mse": 7.702907169004902e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 27492583626.8743,
+          "final_layer_mse": 2.3220140974444803e-06,
+          "flops_used": 27050655419,
+          "mlp_index": 2,
+          "mlp_name": "cole-martin",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 7.574619998488653e-08,
+          "all_layers_mse": 5.307263563736342e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 27462432617.314667,
+          "final_layer_mse": 7.502236485379399e-07,
+          "flops_used": 27050655419,
+          "mlp_index": 3,
+          "mlp_name": "donna-clarke",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 8.702243179008716e-08,
+          "all_layers_mse": 4.50409424956888e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 27509291181.33387,
+          "final_layer_mse": 8.604402523815224e-07,
+          "flops_used": 27050655419,
+          "mlp_index": 4,
+          "mlp_name": "rebecca-walker",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.4219406650449882e-07,
+          "all_layers_mse": 6.179000592965167e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 27443181062.110275,
+          "final_layer_mse": 1.4093404843151802e-06,
+          "flops_used": 27050655419,
+          "mlp_index": 5,
+          "mlp_name": "monique-stevens",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 2.812712047864793e-07,
+          "all_layers_mse": 5.6244425650220364e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 27482844227.918,
+          "final_layer_mse": 2.783764557534596e-06,
+          "flops_used": 27050655419,
+          "mlp_index": 6,
+          "mlp_name": "keith-brock",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.0286167688445682e-07,
+          "all_layers_mse": 4.4589864955923986e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 27470259824.760765,
+          "final_layer_mse": 1.0184969596593874e-06,
+          "flops_used": 27050655419,
+          "mlp_index": 7,
+          "mlp_name": "robert-huff",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.1530374629287836e-07,
+          "all_layers_mse": 5.227449037192855e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 27480146000.154823,
+          "final_layer_mse": 1.1412828371248906e-06,
+          "flops_used": 27050655419,
+          "mlp_index": 8,
+          "mlp_name": "kimberly-caldwell",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.548153996635917e-07,
+          "all_layers_mse": 6.368551112245768e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 27448050761.588425,
+          "final_layer_mse": 1.534163175165304e-06,
+          "flops_used": 27050655419,
+          "mlp_index": 9,
+          "mlp_name": "annette-hansen",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        }
+      ],
+      "id": "9af1fe7b-019f-4ad2-8c7c-70120a2a2699",
+      "metadata": {},
+      "observation": "pass score=1.64322e-07",
+      "parent_values": [
+        -2.225493700203189e-07
+      ],
+      "parents": [
+        {
+          "id": "359b81d5-2c94-4eb8-a0eb-b42258b0c621",
+          "timestep": -1
+        }
+      ],
+      "timestep": 0,
+      "type": "State",
+      "value": -1.6432224780089276e-07
+    },
+    {
+      "code": "\"\"\"Estimator for ARC WhestBench public mini MLPs.\"\"\"\n\nfrom __future__ import annotations\n\nimport math\n\nimport flopscope as flops\nimport flopscope.numpy as fnp\nfrom whestbench import BaseEstimator\n\n\n_MAX_WORKING_SET_BYTES = 100 * 1024 * 1024\n_FLOAT64_ITEMSIZE = 8\n_TAIL_CLIP = 1e-11\n_MIN_ANTITHETIC_SAMPLES = 32\n_WHITENING_EIGENVALUE_FLOOR = 1e-8\n\n\ndef _sample_count(budget: int, width: int, depth: int, target_fraction: float) -> int:\n    half_lattice_per_sample = (89 * width + 3 * width + 2) // 2\n    layer_per_sample = depth * (2 * width * width + 2 * width)\n    covariance_per_sample = width * width\n    per_sample = half_lattice_per_sample + layer_per_sample + covariance_per_sample\n    fixed = 13 * width**3 + 8 * width\n    budget_limited = (int(float(target_fraction) * budget) - fixed) // max(\n        per_sample, 1\n    )\n    memory_limited = _MAX_WORKING_SET_BYTES // max(width * _FLOAT64_ITEMSIZE, 1)\n    count = int(\n        max(_MIN_ANTITHETIC_SAMPLES, min(budget_limited, memory_limited))\n    )\n    return count - (count & 1)\n\n\ndef _first_primes(count: int) -> tuple[int, ...]:\n    primes: list[int] = []\n    candidate = 2\n    while len(primes) < count:\n        is_prime = True\n        for prime in primes:\n            if prime * prime > candidate:\n                break\n            if candidate % prime == 0:\n                is_prime = False\n                break\n        if is_prime:\n            primes.append(candidate)\n        candidate += 1\n    return tuple(primes)\n\n\ndef _lattice_normal_samples(n_samples: int, width: int, rng) -> fnp.ndarray:\n    roots = fnp.sqrt(fnp.array(_first_primes(width), dtype=fnp.float64))\n    generator = roots - fnp.floor(roots)\n    shift = rng.random(width)\n    indices = fnp.arange(n_samples, dtype=fnp.float64)[:, None]\n    unwrapped = indices * generator[None, :] + shift[None, :]\n    uniforms = unwrapped - fnp.floor(unwrapped)\n    uniforms = fnp.clip(uniforms, _TAIL_CLIP, 1.0 - _TAIL_CLIP)\n    return flops.stats.norm.ppf(uniforms)\n\n\ndef _mean_chi(dimension: int) -> float:\n    half_dimension = 0.5 * float(dimension)\n    return math.sqrt(2.0) * math.exp(\n        math.lgamma(half_dimension + 0.5) - math.lgamma(half_dimension)\n    )\n\n\ndef _qmc_directions(n_samples: int, width: int, rng) -> fnp.ndarray:\n    normals = _lattice_normal_samples(n_samples, width, rng)\n    radii = fnp.sqrt(fnp.maximum(fnp.sum(normals * normals, axis=1), 1e-24))\n    return normals / radii[:, None]\n\n\ndef _angular_whitening_transform(directions: fnp.ndarray) -> fnp.ndarray:\n    n_samples, width = directions.shape\n    scaled_second_moment = (\n        directions.T @ directions\n    ) * (float(width) / float(n_samples))\n    eigenvalues, eigenvectors = fnp.linalg.eigh(scaled_second_moment)\n    eigenvalues = fnp.maximum(eigenvalues, _WHITENING_EIGENVALUE_FLOOR)\n    return (eigenvectors / fnp.sqrt(eigenvalues)) @ eigenvectors.T\n\n\ndef _exact_first_layer_mean(weights: fnp.ndarray) -> fnp.ndarray:\n    standard_deviation = fnp.sqrt(fnp.sum(weights * weights, axis=0))\n    return standard_deviation / fnp.sqrt(2.0 * fnp.pi)\n\n\nclass Estimator(BaseEstimator):\n    target_flop_fraction = 0.10\n    sample_delta = -24\n    whitening_strength = 1.010\n    final_scale = 0.99952\n    final_gaussian_blend = -0.03\n    final_nested_blend = 0.22\n\n    def predict(self, mlp, budget: int) -> fnp.ndarray:\n        n_samples = _sample_count(\n            budget,\n            mlp.width,\n            mlp.depth,\n            self.target_flop_fraction,\n        )\n        n_samples = max(_MIN_ANTITHETIC_SAMPLES, n_samples + self.sample_delta)\n        n_samples = n_samples - (n_samples & 1)\n        half_samples = n_samples // 2\n\n        rng = fnp.random.default_rng(mlp.seed)\n        half_directions = _qmc_directions(half_samples, mlp.width, rng)\n        whitening = _angular_whitening_transform(half_directions)\n        whitened_first_weight = whitening @ mlp.weights[0]\n        first_weight = (\n            (1.0 - self.whitening_strength) * mlp.weights[0]\n            + self.whitening_strength * whitened_first_weight\n        )\n\n        paired_directions = fnp.concatenate(\n            (half_directions, -half_directions),\n            axis=0,\n        )\n        activations = paired_directions * _mean_chi(mlp.width)\n\n        rows = []\n        activations = fnp.maximum(activations @ first_weight, 0.0)\n        rows.append(_exact_first_layer_mean(mlp.weights[0]))\n\n        for layer_index, weights in enumerate(mlp.weights[1:], start=1):\n            preactivations = activations @ weights\n            activations = fnp.maximum(preactivations, 0.0)\n            row = fnp.mean(activations, axis=0)\n\n            if layer_index == mlp.depth - 1:\n                pre_mean = fnp.mean(preactivations, axis=0)\n                pre_second = fnp.mean(preactivations * preactivations, axis=0)\n                pre_variance = fnp.maximum(\n                    pre_second - pre_mean * pre_mean,\n                    1e-12,\n                )\n                pre_sigma = fnp.sqrt(pre_variance)\n                alpha = pre_mean / pre_sigma\n                gaussian_row = (\n                    pre_mean * flops.stats.norm.cdf(alpha)\n                    + pre_sigma * flops.stats.norm.pdf(alpha)\n                )\n                row = row + self.final_gaussian_blend * (gaussian_row - row)\n\n                sub_count = half_samples // 2\n                sub_row = (\n                    fnp.sum(activations[:sub_count], axis=0)\n                    + fnp.sum(\n                        activations[half_samples:half_samples + sub_count],\n                        axis=0,\n                    )\n                ) / float(2 * sub_count)\n                row = row + self.final_nested_blend * (row - sub_row)\n\n            rows.append(row)\n\n        rows = fnp.asarray(fnp.stack(rows, axis=0), dtype=fnp.float32)\n        return fnp.concatenate(\n            (rows[:-1], rows[-1:] * self.final_scale),\n            axis=0,\n        )",
+      "construction": [
+        {
+          "adjusted_final_layer_score": 2.9875029753339985e-07,
+          "all_layers_mse": 5.713265636586584e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 28057401711.114258,
+          "final_layer_mse": 2.896208343372564e-06,
+          "flops_used": 27050655419,
+          "mlp_index": 0,
+          "mlp_name": "daniel-harrison",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.5099125043034426e-07,
+          "all_layers_mse": 6.170446795294993e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 27502400511.868805,
+          "final_layer_mse": 1.4933103784642299e-06,
+          "flops_used": 27050655419,
+          "mlp_index": 1,
+          "mlp_name": "dustin-robinson",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 2.3456021174750697e-07,
+          "all_layers_mse": 7.702907169004902e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 27476309323.676437,
+          "final_layer_mse": 2.3220140974444803e-06,
+          "flops_used": 27050655419,
+          "mlp_index": 2,
+          "mlp_name": "cole-martin",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 7.567288269931224e-08,
+          "all_layers_mse": 5.307263563736342e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 27435850808.38999,
+          "final_layer_mse": 7.502236485379399e-07,
+          "flops_used": 27050655419,
+          "mlp_index": 3,
+          "mlp_name": "donna-clarke",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 8.699880853919767e-08,
+          "all_layers_mse": 4.50409424956888e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 27501823464.401573,
+          "final_layer_mse": 8.604402523815224e-07,
+          "flops_used": 27050655419,
+          "mlp_index": 4,
+          "mlp_name": "rebecca-walker",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.4217227623417852e-07,
+          "all_layers_mse": 6.179000592965167e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 27438975581.89234,
+          "final_layer_mse": 1.4093404843151802e-06,
+          "flops_used": 27050655419,
+          "mlp_index": 5,
+          "mlp_name": "monique-stevens",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 2.8122168645547974e-07,
+          "all_layers_mse": 5.6244425650220364e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 27478005820.878357,
+          "final_layer_mse": 2.783764557534596e-06,
+          "flops_used": 27050655419,
+          "mlp_index": 6,
+          "mlp_name": "keith-brock",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.0302541321732875e-07,
+          "all_layers_mse": 4.4589864955923986e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 27513987282.28411,
+          "final_layer_mse": 1.0184969596593874e-06,
+          "flops_used": 27050655419,
+          "mlp_index": 7,
+          "mlp_name": "robert-huff",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.152891907814036e-07,
+          "all_layers_mse": 5.227449037192855e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 27476677009.828896,
+          "final_layer_mse": 1.1412828371248906e-06,
+          "flops_used": 27050655419,
+          "mlp_index": 8,
+          "mlp_name": "kimberly-caldwell",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.5503667888367613e-07,
+          "all_layers_mse": 6.368551112245768e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 27487282538.779587,
+          "final_layer_mse": 1.534163175165304e-06,
+          "flops_used": 27050655419,
+          "mlp_index": 9,
+          "mlp_name": "annette-hansen",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        }
+      ],
+      "id": "1816276a-c35f-4920-99bf-86db8a490c14",
+      "metadata": {},
+      "observation": "pass score=1.64372e-07",
+      "parent_values": [
+        -2.225493700203189e-07
+      ],
+      "parents": [
+        {
+          "id": "359b81d5-2c94-4eb8-a0eb-b42258b0c621",
+          "timestep": -1
+        }
+      ],
+      "timestep": 0,
+      "type": "State",
+      "value": -1.6437186965218274e-07
+    },
+    {
+      "code": "\"\"\"Estimator for ARC WhestBench public mini MLPs.\n\nThe estimator uses spherical randomized QMC with antithetic directions.  The\nGaussian radius is integrated analytically via positive homogeneity of\nbias-free ReLU networks.  A finite-sample angular whitening transform is folded\ninto the first weight matrix, and the final layer uses two cheap controls from\nthe already-forwarded samples.\n\"\"\"\n\nfrom __future__ import annotations\n\nimport math\n\nimport flopscope as flops\nimport flopscope.numpy as fnp\nfrom whestbench import BaseEstimator\n\n\n_MAX_WORKING_SET_BYTES = 100 * 1024 * 1024\n_FLOAT64_ITEMSIZE = 8\n_TAIL_CLIP = 1e-11\n_MIN_ANTITHETIC_SAMPLES = 32\n_WHITENING_EIGENVALUE_FLOOR = 1e-8\n\n\ndef _sample_count(\n    budget: int,\n    width: int,\n    depth: int,\n    target_fraction: float,\n) -> int:\n    half_lattice_per_sample = (89 * width + 3 * width + 2) // 2\n    layer_per_sample = depth * (2 * width * width + 2 * width)\n    covariance_per_sample = width * width\n    per_sample = (\n        half_lattice_per_sample + layer_per_sample + covariance_per_sample\n    )\n    fixed = 13 * width**3 + 8 * width\n    budget_limited = (\n        int(float(target_fraction) * budget) - fixed\n    ) // max(per_sample, 1)\n    memory_limited = _MAX_WORKING_SET_BYTES // max(\n        width * _FLOAT64_ITEMSIZE,\n        1,\n    )\n    count = int(\n        max(\n            _MIN_ANTITHETIC_SAMPLES,\n            min(budget_limited, memory_limited),\n        )\n    )\n    return count - (count & 1)\n\n\ndef _first_primes(count: int) -> tuple[int, ...]:\n    primes: list[int] = []\n    candidate = 2\n    while len(primes) < count:\n        is_prime = True\n        for prime in primes:\n            if prime * prime > candidate:\n                break\n            if candidate % prime == 0:\n                is_prime = False\n                break\n        if is_prime:\n            primes.append(candidate)\n        candidate += 1\n    return tuple(primes)\n\n\ndef _lattice_normal_samples(n_samples: int, width: int, rng) -> fnp.ndarray:\n    roots = fnp.sqrt(fnp.array(_first_primes(width), dtype=fnp.float64))\n    generator = roots - fnp.floor(roots)\n    shift = rng.random(width)\n    indices = fnp.arange(n_samples, dtype=fnp.float64)[:, None]\n    unwrapped = indices * generator[None, :] + shift[None, :]\n    uniforms = unwrapped - fnp.floor(unwrapped)\n    uniforms = fnp.clip(uniforms, _TAIL_CLIP, 1.0 - _TAIL_CLIP)\n    return flops.stats.norm.ppf(uniforms)\n\n\ndef _mean_chi(dimension: int) -> float:\n    half_dimension = 0.5 * float(dimension)\n    return math.sqrt(2.0) * math.exp(\n        math.lgamma(half_dimension + 0.5) - math.lgamma(half_dimension)\n    )\n\n\ndef _qmc_directions(n_samples: int, width: int, rng) -> fnp.ndarray:\n    normals = _lattice_normal_samples(n_samples, width, rng)\n    radii = fnp.sqrt(fnp.maximum(fnp.sum(normals * normals, axis=1), 1e-24))\n    return normals / radii[:, None]\n\n\ndef _angular_whitening_transform(directions: fnp.ndarray) -> fnp.ndarray:\n    n_samples, width = directions.shape\n    scaled_second_moment = (\n        directions.T @ directions\n    ) * (float(width) / float(n_samples))\n    eigenvalues, eigenvectors = fnp.linalg.eigh(scaled_second_moment)\n    eigenvalues = fnp.maximum(eigenvalues, _WHITENING_EIGENVALUE_FLOOR)\n    return (eigenvectors / fnp.sqrt(eigenvalues)) @ eigenvectors.T\n\n\ndef _exact_first_layer_mean(weights: fnp.ndarray) -> fnp.ndarray:\n    standard_deviation = fnp.sqrt(fnp.sum(weights * weights, axis=0))\n    return standard_deviation / fnp.sqrt(2.0 * fnp.pi)\n\n\nclass Estimator(BaseEstimator):\n    target_flop_fraction = 0.10\n    sample_delta = -4\n    whitening_strength = 1.024\n    final_scale = 0.99948\n    final_gaussian_blend = -0.03\n    final_nested_blend = 0.23\n    first_mean_match = -0.55\n\n    def predict(self, mlp, budget: int) -> fnp.ndarray:\n        n_samples = _sample_count(\n            budget,\n            mlp.width,\n            mlp.depth,\n            self.target_flop_fraction,\n        )\n        n_samples = max(_MIN_ANTITHETIC_SAMPLES, n_samples + self.sample_delta)\n        n_samples = n_samples - (n_samples & 1)\n        half_samples = n_samples // 2\n\n        rng = fnp.random.default_rng(mlp.seed)\n        half_directions = _qmc_directions(half_samples, mlp.width, rng)\n        whitening = _angular_whitening_transform(half_directions)\n        whitened_first_weight = whitening @ mlp.weights[0]\n        first_weight = (\n            (1.0 - self.whitening_strength) * mlp.weights[0]\n            + self.whitening_strength * whitened_first_weight\n        )\n        first_weight = fnp.asarray(first_weight, dtype=fnp.float32)\n\n        paired_directions = fnp.concatenate(\n            (half_directions, -half_directions),\n            axis=0,\n        )\n        activations = fnp.asarray(\n            paired_directions * _mean_chi(mlp.width),\n            dtype=fnp.float32,\n        )\n\n        rows = []\n        activations = fnp.maximum(activations @ first_weight, 0.0)\n        first_exact = _exact_first_layer_mean(mlp.weights[0])\n        first_sample = fnp.maximum(fnp.mean(activations, axis=0), 1e-12)\n        first_factor = first_exact / first_sample\n        activations = activations * (\n            1.0 + self.first_mean_match * (first_factor - 1.0)\n        )\n        rows.append(first_exact)\n\n        for layer_index, weights in enumerate(mlp.weights[1:], start=1):\n            preactivations = activations @ weights\n            activations = fnp.maximum(preactivations, 0.0)\n            row = fnp.mean(activations, axis=0)\n\n            if layer_index == mlp.depth - 1:\n                pre_mean = fnp.mean(preactivations, axis=0)\n                pre_second = fnp.mean(preactivations * preactivations, axis=0)\n                pre_variance = fnp.maximum(\n                    pre_second - pre_mean * pre_mean,\n                    1e-12,\n                )\n                pre_sigma = fnp.sqrt(pre_variance)\n                alpha = pre_mean / pre_sigma\n                gaussian_row = (\n                    pre_mean * flops.stats.norm.cdf(alpha)\n                    + pre_sigma * flops.stats.norm.pdf(alpha)\n                )\n                row = row + self.final_gaussian_blend * (gaussian_row - row)\n\n                sub_count = half_samples // 2\n                sub_row = (\n                    fnp.sum(activations[:sub_count], axis=0)\n                    + fnp.sum(\n                        activations[half_samples:half_samples + sub_count],\n                        axis=0,\n                    )\n                ) / float(2 * sub_count)\n                row = row + self.final_nested_blend * (row - sub_row)\n\n            rows.append(row)\n\n        rows = fnp.asarray(fnp.stack(rows, axis=0), dtype=fnp.float32)\n        return fnp.concatenate(\n            (rows[:-1], rows[-1:] * self.final_scale),\n            axis=0,\n        )\n",
+      "construction": [
+        {
+          "adjusted_final_layer_score": 3.0753063508101603e-07,
+          "all_layers_mse": 6.618289262405597e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 28101065501.89705,
+          "final_layer_mse": 2.976696123369038e-06,
+          "flops_used": 27139492825,
+          "mlp_index": 0,
+          "mlp_name": "daniel-harrison",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.1212565529925931e-07,
+          "all_layers_mse": 6.665811270067934e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 27591647327.272606,
+          "final_layer_mse": 1.1053409707528772e-06,
+          "flops_used": 27139492825,
+          "mlp_index": 1,
+          "mlp_name": "dustin-robinson",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 2.2016513759048745e-07,
+          "all_layers_mse": 8.12276266515255e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 27575097725.12169,
+          "final_layer_mse": 2.17170281757717e-06,
+          "flops_used": 27139492825,
+          "mlp_index": 2,
+          "mlp_name": "cole-martin",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 7.645832115120329e-08,
+          "all_layers_mse": 6.3457400756306015e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 27543639138.667297,
+          "final_layer_mse": 7.55044140987593e-07,
+          "flops_used": 27139492825,
+          "mlp_index": 3,
+          "mlp_name": "donna-clarke",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 9.082307315381222e-08,
+          "all_layers_mse": 5.071446594229201e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 27581895262.329292,
+          "final_layer_mse": 8.956554893302382e-07,
+          "flops_used": 27139492825,
+          "mlp_index": 4,
+          "mlp_name": "rebecca-walker",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.428722293586018e-07,
+          "all_layers_mse": 6.95143717166502e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 27577052757.47032,
+          "final_layer_mse": 1.40918780289212e-06,
+          "flops_used": 27139492825,
+          "mlp_index": 5,
+          "mlp_name": "monique-stevens",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 2.7137275187504184e-07,
+          "all_layers_mse": 6.035813839844195e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 27582256242.959213,
+          "final_layer_mse": 2.6761185836221557e-06,
+          "flops_used": 27139492825,
+          "mlp_index": 6,
+          "mlp_name": "keith-brock",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 8.644397993922128e-08,
+          "all_layers_mse": 5.571065230469685e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 27567528307.764244,
+          "final_layer_mse": 8.529151500624721e-07,
+          "flops_used": 27139492825,
+          "mlp_index": 7,
+          "mlp_name": "robert-huff",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.2045366381450796e-07,
+          "all_layers_mse": 6.1747491599817295e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 27571705103.24688,
+          "final_layer_mse": 1.1882978014909895e-06,
+          "flops_used": 27139492825,
+          "mlp_index": 8,
+          "mlp_name": "kimberly-caldwell",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.581726723708783e-07,
+          "all_layers_mse": 7.1341951297654305e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 27579655245.272827,
+          "final_layer_mse": 1.5599530343024526e-06,
+          "flops_used": 27139492825,
+          "mlp_index": 9,
+          "mlp_name": "annette-hansen",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        }
+      ],
+      "id": "045ad70f-06a0-4cb8-a29c-788d9c34962e",
+      "metadata": {},
+      "observation": "pass score=1.58642e-07",
+      "parent_values": [
+        -1.6432224780089276e-07,
+        -2.225493700203189e-07
+      ],
+      "parents": [
+        {
+          "id": "9af1fe7b-019f-4ad2-8c7c-70120a2a2699",
+          "timestep": 0
+        },
+        {
+          "id": "359b81d5-2c94-4eb8-a0eb-b42258b0c621",
+          "timestep": -1
+        }
+      ],
+      "timestep": 1,
+      "type": "State",
+      "value": -1.5864181196340294e-07
+    },
+    {
+      "code": "\"\"\"Estimator for ARC WhestBench public mini MLPs.\"\"\"\n\nfrom __future__ import annotations\n\nimport math\n\nimport flopscope as flops\nimport flopscope.numpy as fnp\nfrom whestbench import BaseEstimator\n\n\n_MAX_WORKING_SET_BYTES = 100 * 1024 * 1024\n_FLOAT64_ITEMSIZE = 8\n_TAIL_CLIP = 1e-11\n_MIN_ANTITHETIC_SAMPLES = 32\n_WHITENING_EIGENVALUE_FLOOR = 1e-8\n\n\ndef _sample_count(budget: int, width: int, depth: int, target_fraction: float) -> int:\n    half_lattice_per_sample = (89 * width + 3 * width + 2) // 2\n    layer_per_sample = depth * (2 * width * width + 2 * width)\n    covariance_per_sample = width * width\n    per_sample = half_lattice_per_sample + layer_per_sample + covariance_per_sample\n    fixed = 13 * width**3 + 8 * width\n    budget_limited = (int(float(target_fraction) * budget) - fixed) // max(per_sample, 1)\n    memory_limited = _MAX_WORKING_SET_BYTES // max(width * _FLOAT64_ITEMSIZE, 1)\n    count = int(max(_MIN_ANTITHETIC_SAMPLES, min(budget_limited, memory_limited)))\n    return count - (count & 1)\n\n\ndef _first_primes(count: int) -> tuple[int, ...]:\n    primes: list[int] = []\n    candidate = 2\n    while len(primes) < count:\n        is_prime = True\n        for prime in primes:\n            if prime * prime > candidate:\n                break\n            if candidate % prime == 0:\n                is_prime = False\n                break\n        if is_prime:\n            primes.append(candidate)\n        candidate += 1\n    return tuple(primes)\n\n\ndef _lattice_normal_samples(n_samples: int, width: int, rng) -> fnp.ndarray:\n    roots = fnp.sqrt(fnp.array(_first_primes(width), dtype=fnp.float64))\n    generator = roots - fnp.floor(roots)\n    shift = rng.random(width)\n    indices = fnp.arange(n_samples, dtype=fnp.float64)[:, None]\n    unwrapped = indices * generator[None, :] + shift[None, :]\n    uniforms = unwrapped - fnp.floor(unwrapped)\n    uniforms = fnp.clip(uniforms, _TAIL_CLIP, 1.0 - _TAIL_CLIP)\n    return flops.stats.norm.ppf(uniforms)\n\n\ndef _mean_chi(dimension: int) -> float:\n    half_dimension = 0.5 * float(dimension)\n    return math.sqrt(2.0) * math.exp(\n        math.lgamma(half_dimension + 0.5) - math.lgamma(half_dimension)\n    )\n\n\ndef _qmc_directions(n_samples: int, width: int, rng) -> fnp.ndarray:\n    normals = _lattice_normal_samples(n_samples, width, rng)\n    radii = fnp.sqrt(fnp.maximum(fnp.sum(normals * normals, axis=1), 1e-24))\n    return normals / radii[:, None]\n\n\ndef _angular_whitening_transform(directions: fnp.ndarray) -> fnp.ndarray:\n    n_samples, width = directions.shape\n    scaled_second_moment = (directions.T @ directions) * (float(width) / float(n_samples))\n    eigenvalues, eigenvectors = fnp.linalg.eigh(scaled_second_moment)\n    eigenvalues = fnp.maximum(eigenvalues, _WHITENING_EIGENVALUE_FLOOR)\n    return (eigenvectors / fnp.sqrt(eigenvalues)) @ eigenvectors.T\n\n\ndef _exact_first_layer_mean(weights: fnp.ndarray) -> fnp.ndarray:\n    standard_deviation = fnp.sqrt(fnp.sum(weights * weights, axis=0))\n    return standard_deviation / fnp.sqrt(2.0 * fnp.pi)\n\n\nclass Estimator(BaseEstimator):\n    target_flop_fraction = 0.10\n    sample_delta = -4\n    whitening_strength = 1.024\n    final_scale = 0.99948\n    final_gaussian_blend = -0.03\n    final_nested_blend = 0.23\n    first_mean_match = -0.55\n\n    def predict(self, mlp, budget: int) -> fnp.ndarray:\n        n_samples = _sample_count(\n            budget,\n            mlp.width,\n            mlp.depth,\n            self.target_flop_fraction,\n        )\n        n_samples = max(_MIN_ANTITHETIC_SAMPLES, n_samples + self.sample_delta)\n        n_samples = n_samples - (n_samples & 1)\n        half_samples = n_samples // 2\n\n        rng = fnp.random.default_rng(mlp.seed)\n        half_directions = _qmc_directions(half_samples, mlp.width, rng)\n        whitening = _angular_whitening_transform(half_directions)\n        whitened_first_weight = whitening @ mlp.weights[0]\n        first_weight = (\n            (1.0 - self.whitening_strength) * mlp.weights[0]\n            + self.whitening_strength * whitened_first_weight\n        )\n        first_weight = fnp.asarray(first_weight, dtype=fnp.float32)\n\n        paired_directions = fnp.concatenate((half_directions, -half_directions), axis=0)\n        activations = fnp.asarray(\n            paired_directions * _mean_chi(mlp.width),\n            dtype=fnp.float32,\n        )\n\n        rows = []\n        activations = fnp.maximum(activations @ first_weight, 0.0)\n        first_exact = _exact_first_layer_mean(mlp.weights[0])\n        first_sample = fnp.maximum(fnp.mean(activations, axis=0), 1e-12)\n        first_factor = first_exact / first_sample\n        activations = activations * (\n            1.0 + self.first_mean_match * (first_factor - 1.0)\n        )\n        rows.append(first_exact)\n\n        for layer_index, weights in enumerate(mlp.weights[1:], start=1):\n            preactivations = activations @ weights\n            activations = fnp.maximum(preactivations, 0.0)\n            row = fnp.mean(activations, axis=0)\n\n            if layer_index == mlp.depth - 1:\n                pre_mean = fnp.mean(preactivations, axis=0)\n                pre_second = fnp.mean(preactivations * preactivations, axis=0)\n                pre_variance = fnp.maximum(pre_second - pre_mean * pre_mean, 1e-12)\n                pre_sigma = fnp.sqrt(pre_variance)\n                alpha = pre_mean / pre_sigma\n                gaussian_row = (\n                    pre_mean * flops.stats.norm.cdf(alpha)\n                    + pre_sigma * flops.stats.norm.pdf(alpha)\n                )\n                row = row + self.final_gaussian_blend * (gaussian_row - row)\n\n                sub_count = half_samples // 2\n                sub_row = (\n                    fnp.sum(activations[:sub_count], axis=0)\n                    + fnp.sum(\n                        activations[half_samples : half_samples + sub_count],\n                        axis=0,\n                    )\n                ) / float(2 * sub_count)\n                row = row + self.final_nested_blend * (row - sub_row)\n\n            rows.append(row)\n\n        rows = fnp.asarray(fnp.stack(rows, axis=0), dtype=fnp.float32)\n        return fnp.concatenate((rows[:-1], rows[-1:] * self.final_scale), axis=0)",
+      "construction": [
+        {
+          "adjusted_final_layer_score": 3.074717366952727e-07,
+          "all_layers_mse": 6.618289262405597e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 28095683575.00286,
+          "final_layer_mse": 2.976696123369038e-06,
+          "flops_used": 27139492825,
+          "mlp_index": 0,
+          "mlp_name": "daniel-harrison",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.120672851611663e-07,
+          "all_layers_mse": 6.665811270067934e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 27577283725.468826,
+          "final_layer_mse": 1.1053409707528772e-06,
+          "flops_used": 27139492825,
+          "mlp_index": 1,
+          "mlp_name": "dustin-robinson",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 2.2029608618499398e-07,
+          "all_layers_mse": 8.12276266515255e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 27591498688.189697,
+          "final_layer_mse": 2.17170281757717e-06,
+          "flops_used": 27139492825,
+          "mlp_index": 2,
+          "mlp_name": "cole-martin",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 7.64406400678317e-08,
+          "all_layers_mse": 6.3457400756306015e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 27537269637.314987,
+          "final_layer_mse": 7.55044140987593e-07,
+          "flops_used": 27139492825,
+          "mlp_index": 3,
+          "mlp_name": "donna-clarke",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 9.077822686419303e-08,
+          "all_layers_mse": 5.071446594229201e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 27568275973.527145,
+          "final_layer_mse": 8.956554893302382e-07,
+          "flops_used": 27139492825,
+          "mlp_index": 4,
+          "mlp_name": "rebecca-walker",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.42881329366934e-07,
+          "all_layers_mse": 6.95143717166502e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 27578809231.846046,
+          "final_layer_mse": 1.40918780289212e-06,
+          "flops_used": 27139492825,
+          "mlp_index": 5,
+          "mlp_name": "monique-stevens",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 2.7134981511188714e-07,
+          "all_layers_mse": 6.035813839844195e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 27579924956.290436,
+          "final_layer_mse": 2.6761185836221557e-06,
+          "flops_used": 27139492825,
+          "mlp_index": 6,
+          "mlp_name": "keith-brock",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 8.643066541356913e-08,
+          "all_layers_mse": 5.571065230469685e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 27563282221.882057,
+          "final_layer_mse": 8.529151500624721e-07,
+          "flops_used": 27139492825,
+          "mlp_index": 7,
+          "mlp_name": "robert-huff",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.204852906953019e-07,
+          "all_layers_mse": 6.1747491599817295e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 27578944459.88388,
+          "final_layer_mse": 1.1882978014909895e-06,
+          "flops_used": 27139492825,
+          "mlp_index": 8,
+          "mlp_name": "kimberly-caldwell",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.5820749730832217e-07,
+          "all_layers_mse": 7.1341951297654305e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 27585727468.45932,
+          "final_layer_mse": 1.5599530343024526e-06,
+          "flops_used": 27139492825,
+          "mlp_index": 9,
+          "mlp_name": "annette-hansen",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        }
+      ],
+      "id": "ff0cc694-3874-4642-ae17-dc6d004aad9d",
+      "metadata": {},
+      "observation": "pass score=1.58641e-07",
+      "parent_values": [
+        -1.6432224780089276e-07,
+        -2.225493700203189e-07
+      ],
+      "parents": [
+        {
+          "id": "9af1fe7b-019f-4ad2-8c7c-70120a2a2699",
+          "timestep": 0
+        },
+        {
+          "id": "359b81d5-2c94-4eb8-a0eb-b42258b0c621",
+          "timestep": -1
+        }
+      ],
+      "timestep": 1,
+      "type": "State",
+      "value": -1.5864085728694722e-07
+    },
+    {
+      "code": "\"\"\"Estimator for ARC WhestBench public mini MLPs.\"\"\"\n\nfrom __future__ import annotations\n\nimport math\nfrom functools import lru_cache\n\nimport flopscope as flops\nimport flopscope.numpy as fnp\nfrom whestbench import BaseEstimator\n\n\n_MAX_WORKING_SET_BYTES = 100 * 1024 * 1024\n_FLOAT64_ITEMSIZE = 8\n_TAIL_CLIP = 1e-11\n_MIN_ANTITHETIC_SAMPLES = 32\n_WHITENING_EIGENVALUE_FLOOR = 1e-8\n\n\ndef _sample_count(budget: int, width: int, depth: int, target_fraction: float) -> int:\n    half_lattice_per_sample = (89 * width + 3 * width + 2) // 2\n    layer_per_sample = depth * (2 * width * width + 2 * width)\n    covariance_per_sample = width * width\n    per_sample = half_lattice_per_sample + layer_per_sample + covariance_per_sample\n    fixed = 13 * width**3 + 8 * width\n    budget_limited = (int(float(target_fraction) * budget) - fixed) // max(per_sample, 1)\n    memory_limited = _MAX_WORKING_SET_BYTES // max(width * _FLOAT64_ITEMSIZE, 1)\n    count = int(max(_MIN_ANTITHETIC_SAMPLES, min(budget_limited, memory_limited)))\n    return count - (count & 1)\n\n\n@lru_cache(maxsize=None)\ndef _first_primes(count: int) -> tuple[int, ...]:\n    primes: list[int] = []\n    candidate = 2\n    while len(primes) < count:\n        is_prime = True\n        for prime in primes:\n            if prime * prime > candidate:\n                break\n            if candidate % prime == 0:\n                is_prime = False\n                break\n        if is_prime:\n            primes.append(candidate)\n        candidate += 1\n    return tuple(primes)\n\n\ndef _lattice_normal_samples(n_samples: int, width: int, rng) -> fnp.ndarray:\n    roots = fnp.sqrt(fnp.array(_first_primes(width), dtype=fnp.float64))\n    generator = roots - fnp.floor(roots)\n    shift = rng.random(width)\n    indices = fnp.arange(n_samples, dtype=fnp.float64)[:, None]\n    unwrapped = indices * generator[None, :] + shift[None, :]\n    uniforms = unwrapped - fnp.floor(unwrapped)\n    uniforms = fnp.clip(uniforms, _TAIL_CLIP, 1.0 - _TAIL_CLIP)\n    return flops.stats.norm.ppf(uniforms)\n\n\ndef _mean_chi(dimension: int) -> float:\n    half_dimension = 0.5 * float(dimension)\n    return math.sqrt(2.0) * math.exp(\n        math.lgamma(half_dimension + 0.5) - math.lgamma(half_dimension)\n    )\n\n\ndef _qmc_directions(n_samples: int, width: int, rng) -> fnp.ndarray:\n    normals = _lattice_normal_samples(n_samples, width, rng)\n    radii = fnp.sqrt(fnp.maximum(fnp.sum(normals * normals, axis=1), 1e-24))\n    return normals / radii[:, None]\n\n\ndef _angular_whitening_transform(directions: fnp.ndarray) -> fnp.ndarray:\n    n_samples, width = directions.shape\n    scaled_second_moment = (directions.T @ directions) * (float(width) / float(n_samples))\n    eigenvalues, eigenvectors = fnp.linalg.eigh(scaled_second_moment)\n    eigenvalues = fnp.maximum(eigenvalues, _WHITENING_EIGENVALUE_FLOOR)\n    return (eigenvectors / fnp.sqrt(eigenvalues)) @ eigenvectors.T\n\n\ndef _exact_first_layer_mean(weights: fnp.ndarray) -> fnp.ndarray:\n    standard_deviation = fnp.sqrt(fnp.sum(weights * weights, axis=0))\n    return standard_deviation / fnp.sqrt(2.0 * fnp.pi)\n\n\ndef _exact_first_layer_second(weights: fnp.ndarray, width: int) -> fnp.ndarray:\n    squared_norm = fnp.sum(weights * weights, axis=0)\n    radius = _mean_chi(width)\n    return squared_norm * ((radius * radius) / (2.0 * float(width)))\n\n\ndef _gaussian_relu_moments(\n    mean: fnp.ndarray,\n    variance: fnp.ndarray,\n) -> tuple[fnp.ndarray, fnp.ndarray]:\n    sigma = fnp.sqrt(fnp.maximum(variance, 1e-12))\n    alpha = mean / sigma\n    cdf = flops.stats.norm.cdf(alpha)\n    pdf = flops.stats.norm.pdf(alpha)\n    first = mean * cdf + sigma * pdf\n    second = (mean * mean + variance) * cdf + mean * sigma * pdf\n    return first, second\n\n\nclass Estimator(BaseEstimator):\n    target_flop_fraction = 0.10\n    sample_delta = -4\n    whitening_strength = 1.027\n    final_scale = 0.99948\n    final_gaussian_blend = -0.08\n    final_nested_blend = 0.23\n    first_mean_match = -1.05\n    first_variance_match = 0.48\n\n    def predict(self, mlp, budget: int) -> fnp.ndarray:\n        n_samples = _sample_count(\n            budget,\n            mlp.width,\n            mlp.depth,\n            self.target_flop_fraction,\n        )\n        n_samples = max(_MIN_ANTITHETIC_SAMPLES, n_samples + self.sample_delta)\n        n_samples = n_samples - (n_samples & 1)\n        half_samples = n_samples // 2\n\n        rng = fnp.random.default_rng(mlp.seed)\n        half_directions = _qmc_directions(half_samples, mlp.width, rng)\n        whitening = _angular_whitening_transform(half_directions)\n        whitened_first_weight = whitening @ mlp.weights[0]\n        first_weight = (\n            (1.0 - self.whitening_strength) * mlp.weights[0]\n            + self.whitening_strength * whitened_first_weight\n        )\n        first_weight = fnp.asarray(first_weight, dtype=fnp.float32)\n\n        paired_directions = fnp.concatenate((half_directions, -half_directions), axis=0)\n        activations = fnp.asarray(\n            paired_directions * _mean_chi(mlp.width),\n            dtype=fnp.float32,\n        )\n\n        rows = []\n        activations = fnp.maximum(activations @ first_weight, 0.0)\n        first_exact = _exact_first_layer_mean(mlp.weights[0])\n        first_sample = fnp.maximum(fnp.mean(activations, axis=0), 1e-12)\n        first_factor = first_exact / first_sample\n        activations = activations * (\n            1.0 + self.first_mean_match * (first_factor - 1.0)\n        )\n        current_mean = fnp.mean(activations, axis=0)\n        current_second = fnp.mean(activations * activations, axis=0)\n        current_variance = fnp.maximum(\n            current_second - current_mean * current_mean,\n            1e-12,\n        )\n        first_second = _exact_first_layer_second(mlp.weights[0], mlp.width)\n        first_variance = fnp.maximum(first_second - first_exact * first_exact, 1e-12)\n        variance_factor = fnp.sqrt(first_variance / current_variance)\n        variance_matched = first_exact + (activations - current_mean) * variance_factor\n        activations = activations + self.first_variance_match * (\n            variance_matched - activations\n        )\n        rows.append(first_exact)\n\n        for layer_index, weights in enumerate(mlp.weights[1:], start=1):\n            preactivations = activations @ weights\n            activations = fnp.maximum(preactivations, 0.0)\n            row = fnp.mean(activations, axis=0)\n\n            if layer_index == mlp.depth - 1:\n                pre_mean = fnp.mean(preactivations, axis=0)\n                pre_second = fnp.mean(preactivations * preactivations, axis=0)\n                pre_variance = fnp.maximum(pre_second - pre_mean * pre_mean, 1e-12)\n                gaussian_row, _ = _gaussian_relu_moments(pre_mean, pre_variance)\n                row = row + self.final_gaussian_blend * (gaussian_row - row)\n\n                sub_count = half_samples // 2\n                sub_row = (\n                    fnp.sum(activations[:sub_count], axis=0)\n                    + fnp.sum(\n                        activations[half_samples : half_samples + sub_count],\n                        axis=0,\n                    )\n                ) / float(2 * sub_count)\n                row = row + self.final_nested_blend * (row - sub_row)\n\n            rows.append(row)\n\n        rows = fnp.asarray(fnp.stack(rows, axis=0), dtype=fnp.float32)\n        return fnp.concatenate((rows[:-1], rows[-1:] * self.final_scale), axis=0)\n",
+      "construction": [
+        {
+          "adjusted_final_layer_score": 2.683482502263827e-07,
+          "all_layers_mse": 5.570961548073683e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 28184672519.114937,
+          "final_layer_mse": 2.589731138868956e-06,
+          "flops_used": 27154115289,
+          "mlp_index": 0,
+          "mlp_name": "daniel-harrison",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.1035850622549727e-07,
+          "all_layers_mse": 6.0109236983407754e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 27640161364.820923,
+          "final_layer_mse": 1.0860107977350708e-06,
+          "flops_used": 27154115289,
+          "mlp_index": 1,
+          "mlp_name": "dustin-robinson",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 2.2091206400083441e-07,
+          "all_layers_mse": 7.699717571085785e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 27649079337.26641,
+          "final_layer_mse": 2.1732398636231665e-06,
+          "flops_used": 27154115289,
+          "mlp_index": 2,
+          "mlp_name": "cole-martin",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 7.729919848833308e-08,
+          "all_layers_mse": 5.632169177260948e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 27617639004.73448,
+          "final_layer_mse": 7.613026582475868e-07,
+          "flops_used": 27154115289,
+          "mlp_index": 3,
+          "mlp_name": "donna-clarke",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 9.256839353696736e-08,
+          "all_layers_mse": 4.640786755771842e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 27667056470.6597,
+          "final_layer_mse": 9.100571674025559e-07,
+          "flops_used": 27154115289,
+          "mlp_index": 4,
+          "mlp_name": "rebecca-walker",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.4471313559097112e-07,
+          "all_layers_mse": 6.373716132657137e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 27620234787.01445,
+          "final_layer_mse": 1.4251136235543527e-06,
+          "flops_used": 27154115289,
+          "mlp_index": 5,
+          "mlp_name": "monique-stevens",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 2.709072227712445e-07,
+          "all_layers_mse": 5.575466275331564e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 27626685499.695267,
+          "final_layer_mse": 2.6672314561437815e-06,
+          "flops_used": 27154115289,
+          "mlp_index": 6,
+          "mlp_name": "keith-brock",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.011390234917301e-07,
+          "all_layers_mse": 4.675451236835215e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 27648713513.7591,
+          "final_layer_mse": 9.949762898031622e-07,
+          "flops_used": 27154115289,
+          "mlp_index": 7,
+          "mlp_name": "robert-huff",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.1891604269525969e-07,
+          "all_layers_mse": 5.3559178923023865e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 27640171795.63376,
+          "final_layer_mse": 1.1702229585353052e-06,
+          "flops_used": 27154115289,
+          "mlp_index": 8,
+          "mlp_name": "kimberly-caldwell",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.4847140019689424e-07,
+          "all_layers_mse": 6.407152341125766e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 27649158313.42074,
+          "final_layer_mse": 1.4605949445467559e-06,
+          "flops_used": 27154115289,
+          "mlp_index": 9,
+          "mlp_name": "annette-hansen",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        }
+      ],
+      "id": "7a70da84-149e-4437-a771-f06594eddc6b",
+      "metadata": {},
+      "observation": "pass score=1.55363e-07",
+      "parent_values": [
+        -1.5864085728694722e-07,
+        -1.6432224780089276e-07,
+        -2.225493700203189e-07
+      ],
+      "parents": [
+        {
+          "id": "ff0cc694-3874-4642-ae17-dc6d004aad9d",
+          "timestep": 1
+        },
+        {
+          "id": "9af1fe7b-019f-4ad2-8c7c-70120a2a2699",
+          "timestep": 0
+        },
+        {
+          "id": "359b81d5-2c94-4eb8-a0eb-b42258b0c621",
+          "timestep": -1
+        }
+      ],
+      "timestep": 3,
+      "type": "State",
+      "value": -1.5536332372241144e-07
+    },
+    {
+      "code": "\"\"\"Estimator for ARC WhestBench public mini MLPs.\"\"\"\n\nfrom __future__ import annotations\n\nimport math\nfrom functools import lru_cache\n\nimport flopscope as flops\nimport flopscope.numpy as fnp\nfrom whestbench import BaseEstimator\n\n\n_MAX_WORKING_SET_BYTES = 100 * 1024 * 1024\n_FLOAT64_ITEMSIZE = 8\n_TAIL_CLIP = 1e-11\n_MIN_ANTITHETIC_SAMPLES = 32\n_WHITENING_EIGENVALUE_FLOOR = 1e-8\n\n\ndef _sample_count(budget: int, width: int, depth: int, target_fraction: float) -> int:\n    half_lattice_per_sample = (89 * width + 3 * width + 2) // 2\n    layer_per_sample = depth * (2 * width * width + 2 * width)\n    covariance_per_sample = width * width\n    per_sample = half_lattice_per_sample + layer_per_sample + covariance_per_sample\n    fixed = 13 * width**3 + 8 * width\n    budget_limited = (int(float(target_fraction) * budget) - fixed) // max(per_sample, 1)\n    memory_limited = _MAX_WORKING_SET_BYTES // max(width * _FLOAT64_ITEMSIZE, 1)\n    count = int(max(_MIN_ANTITHETIC_SAMPLES, min(budget_limited, memory_limited)))\n    return count - (count & 1)\n\n\n@lru_cache(maxsize=None)\ndef _first_primes(count: int) -> tuple[int, ...]:\n    primes: list[int] = []\n    candidate = 2\n    while len(primes) < count:\n        is_prime = True\n        for prime in primes:\n            if prime * prime > candidate:\n                break\n            if candidate % prime == 0:\n                is_prime = False\n                break\n        if is_prime:\n            primes.append(candidate)\n        candidate += 1\n    return tuple(primes)\n\n\ndef _lattice_normal_samples(n_samples: int, width: int, rng) -> fnp.ndarray:\n    roots = fnp.sqrt(fnp.array(_first_primes(width), dtype=fnp.float64))\n    generator = roots - fnp.floor(roots)\n    shift = rng.random(width)\n    indices = fnp.arange(n_samples, dtype=fnp.float64)[:, None]\n    unwrapped = indices * generator[None, :] + shift[None, :]\n    uniforms = unwrapped - fnp.floor(unwrapped)\n    uniforms = fnp.clip(uniforms, _TAIL_CLIP, 1.0 - _TAIL_CLIP)\n    return flops.stats.norm.ppf(uniforms)\n\n\ndef _mean_chi(dimension: int) -> float:\n    half_dimension = 0.5 * float(dimension)\n    return math.sqrt(2.0) * math.exp(\n        math.lgamma(half_dimension + 0.5) - math.lgamma(half_dimension)\n    )\n\n\ndef _qmc_directions(n_samples: int, width: int, rng) -> fnp.ndarray:\n    normals = _lattice_normal_samples(n_samples, width, rng)\n    radii = fnp.sqrt(fnp.maximum(fnp.sum(normals * normals, axis=1), 1e-24))\n    return normals / radii[:, None]\n\n\ndef _angular_whitening_transform(directions: fnp.ndarray) -> fnp.ndarray:\n    n_samples, width = directions.shape\n    scaled_second_moment = (directions.T @ directions) * (float(width) / float(n_samples))\n    eigenvalues, eigenvectors = fnp.linalg.eigh(scaled_second_moment)\n    eigenvalues = fnp.maximum(eigenvalues, _WHITENING_EIGENVALUE_FLOOR)\n    return (eigenvectors / fnp.sqrt(eigenvalues)) @ eigenvectors.T\n\n\ndef _exact_first_layer_mean(weights: fnp.ndarray) -> fnp.ndarray:\n    standard_deviation = fnp.sqrt(fnp.sum(weights * weights, axis=0))\n    return standard_deviation / fnp.sqrt(2.0 * fnp.pi)\n\n\ndef _exact_first_layer_second(weights: fnp.ndarray, width: int) -> fnp.ndarray:\n    squared_norm = fnp.sum(weights * weights, axis=0)\n    radius = _mean_chi(width)\n    return squared_norm * ((radius * radius) / (2.0 * float(width)))\n\n\ndef _gaussian_relu_moments(\n    mean: fnp.ndarray,\n    variance: fnp.ndarray,\n) -> tuple[fnp.ndarray, fnp.ndarray]:\n    sigma = fnp.sqrt(fnp.maximum(variance, 1e-12))\n    alpha = mean / sigma\n    cdf = flops.stats.norm.cdf(alpha)\n    pdf = flops.stats.norm.pdf(alpha)\n    first = mean * cdf + sigma * pdf\n    second = (mean * mean + variance) * cdf + mean * sigma * pdf\n    return first, second\n\n\nclass Estimator(BaseEstimator):\n    target_flop_fraction = 0.10\n    sample_delta = -4\n    whitening_strength = 1.027\n    final_scale = 0.99948\n    final_gaussian_blend = -0.08\n    final_nested_blend = 0.23\n    first_mean_match = -1.05\n    first_variance_match = 0.48\n\n    def predict(self, mlp, budget: int) -> fnp.ndarray:\n        n_samples = _sample_count(\n            budget,\n            mlp.width,\n            mlp.depth,\n            self.target_flop_fraction,\n        )\n        n_samples = max(_MIN_ANTITHETIC_SAMPLES, n_samples + self.sample_delta)\n        n_samples = n_samples - (n_samples & 1)\n        half_samples = n_samples // 2\n\n        rng = fnp.random.default_rng(mlp.seed)\n        half_directions = _qmc_directions(half_samples, mlp.width, rng)\n        whitening = _angular_whitening_transform(half_directions)\n        whitened_first_weight = whitening @ mlp.weights[0]\n        first_weight = (\n            (1.0 - self.whitening_strength) * mlp.weights[0]\n            + self.whitening_strength * whitened_first_weight\n        )\n        first_weight = fnp.asarray(first_weight, dtype=fnp.float32)\n\n        paired_directions = fnp.concatenate((half_directions, -half_directions), axis=0)\n        activations = fnp.asarray(\n            paired_directions * _mean_chi(mlp.width),\n            dtype=fnp.float32,\n        )\n\n        rows = []\n        activations = fnp.maximum(activations @ first_weight, 0.0)\n        first_exact = _exact_first_layer_mean(mlp.weights[0])\n        first_sample = fnp.maximum(fnp.mean(activations, axis=0), 1e-12)\n        first_factor = first_exact / first_sample\n        activations = activations * (\n            1.0 + self.first_mean_match * (first_factor - 1.0)\n        )\n\n        current_mean = fnp.mean(activations, axis=0)\n        current_second = fnp.mean(activations * activations, axis=0)\n        current_variance = fnp.maximum(\n            current_second - current_mean * current_mean,\n            1e-12,\n        )\n        first_second = _exact_first_layer_second(mlp.weights[0], mlp.width)\n        first_variance = fnp.maximum(first_second - first_exact * first_exact, 1e-12)\n        variance_factor = fnp.sqrt(first_variance / current_variance)\n        variance_matched = first_exact + (activations - current_mean) * variance_factor\n        activations = activations + self.first_variance_match * (\n            variance_matched - activations\n        )\n        rows.append(first_exact)\n\n        for layer_index, weights in enumerate(mlp.weights[1:], start=1):\n            preactivations = activations @ weights\n            activations = fnp.maximum(preactivations, 0.0)\n            row = fnp.mean(activations, axis=0)\n\n            if layer_index == mlp.depth - 1:\n                pre_mean = fnp.mean(preactivations, axis=0)\n                pre_second = fnp.mean(preactivations * preactivations, axis=0)\n                pre_variance = fnp.maximum(pre_second - pre_mean * pre_mean, 1e-12)\n                gaussian_row, _ = _gaussian_relu_moments(pre_mean, pre_variance)\n                row = row + self.final_gaussian_blend * (gaussian_row - row)\n\n                sub_count = half_samples // 2\n                sub_row = (\n                    fnp.sum(activations[:sub_count], axis=0)\n                    + fnp.sum(\n                        activations[half_samples : half_samples + sub_count],\n                        axis=0,\n                    )\n                ) / float(2 * sub_count)\n                row = row + self.final_nested_blend * (row - sub_row)\n\n            rows.append(row)\n\n        rows = fnp.asarray(fnp.stack(rows, axis=0), dtype=fnp.float32)\n        return fnp.concatenate((rows[:-1], rows[-1:] * self.final_scale), axis=0)",
+      "construction": [
+        {
+          "adjusted_final_layer_score": 2.683686270238644e-07,
+          "all_layers_mse": 5.570961548073683e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 28186812698.391403,
+          "final_layer_mse": 2.589731138868956e-06,
+          "flops_used": 27154115289,
+          "mlp_index": 0,
+          "mlp_name": "daniel-harrison",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.1037681006805075e-07,
+          "all_layers_mse": 6.0109236983407754e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 27644745707.06221,
+          "final_layer_mse": 1.0860107977350708e-06,
+          "flops_used": 27154115289,
+          "mlp_index": 1,
+          "mlp_name": "dustin-robinson",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 2.2121223620636472e-07,
+          "all_layers_mse": 7.699717571085785e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 27686648517.39737,
+          "final_layer_mse": 2.1732398636231665e-06,
+          "flops_used": 27154115289,
+          "mlp_index": 2,
+          "mlp_name": "cole-martin",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 7.728053462289755e-08,
+          "all_layers_mse": 5.632169177260948e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 27610970735.100235,
+          "final_layer_mse": 7.613026582475868e-07,
+          "flops_used": 27154115289,
+          "mlp_index": 3,
+          "mlp_name": "donna-clarke",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 9.244186826597183e-08,
+          "all_layers_mse": 4.640786755771842e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 27629240303.78195,
+          "final_layer_mse": 9.100571674025559e-07,
+          "flops_used": 27154115289,
+          "mlp_index": 4,
+          "mlp_name": "rebecca-walker",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.4458106540319357e-07,
+          "all_layers_mse": 6.373716132657137e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 27595027610.209908,
+          "final_layer_mse": 1.4251136235543527e-06,
+          "flops_used": 27154115289,
+          "mlp_index": 5,
+          "mlp_name": "monique-stevens",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 2.707285170855895e-07,
+          "all_layers_mse": 5.575466275331564e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 27608461379.55519,
+          "final_layer_mse": 2.6672314561437815e-06,
+          "flops_used": 27154115289,
+          "mlp_index": 6,
+          "mlp_name": "keith-brock",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.0111813857393103e-07,
+          "all_layers_mse": 4.675451236835215e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 27643004133.84768,
+          "final_layer_mse": 9.949762898031622e-07,
+          "flops_used": 27154115289,
+          "mlp_index": 7,
+          "mlp_name": "robert-huff",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.1888821613124835e-07,
+          "all_layers_mse": 5.3559178923023865e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 27633703946.61757,
+          "final_layer_mse": 1.1702229585353052e-06,
+          "flops_used": 27154115289,
+          "mlp_index": 8,
+          "mlp_name": "kimberly-caldwell",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.4834798633583769e-07,
+          "all_layers_mse": 6.407152341125766e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 27626175507.453407,
+          "final_layer_mse": 1.4605949445467559e-06,
+          "flops_used": 27154115289,
+          "mlp_index": 9,
+          "mlp_name": "annette-hansen",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        }
+      ],
+      "id": "6fec0212-fd0e-48d7-8096-80a568c3437d",
+      "metadata": {},
+      "observation": "pass score=1.55334e-07",
+      "parent_values": [
+        -1.5864085728694722e-07,
+        -1.6432224780089276e-07,
+        -2.225493700203189e-07
+      ],
+      "parents": [
+        {
+          "id": "ff0cc694-3874-4642-ae17-dc6d004aad9d",
+          "timestep": 1
+        },
+        {
+          "id": "9af1fe7b-019f-4ad2-8c7c-70120a2a2699",
+          "timestep": 0
+        },
+        {
+          "id": "359b81d5-2c94-4eb8-a0eb-b42258b0c621",
+          "timestep": -1
+        }
+      ],
+      "timestep": 3,
+      "type": "State",
+      "value": -1.5533439997169494e-07
+    },
+    {
+      "code": "\"\"\"Estimator for ARC WhestBench public mini MLPs.\"\"\"\n\nfrom __future__ import annotations\n\nimport math\nfrom functools import lru_cache\n\nimport flopscope as flops\nimport flopscope.numpy as fnp\nfrom whestbench import BaseEstimator\n\n\n_MAX_WORKING_SET_BYTES = 100 * 1024 * 1024\n_FLOAT64_ITEMSIZE = 8\n_TAIL_CLIP = 1e-11\n_MIN_ANTITHETIC_SAMPLES = 32\n_WHITENING_EIGENVALUE_FLOOR = 1e-8\n\n\ndef _sample_count(budget: int, width: int, depth: int, target_fraction: float) -> int:\n    half_lattice_per_sample = (89 * width + 3 * width + 2) // 2\n    layer_per_sample = depth * (2 * width * width + 2 * width)\n    covariance_per_sample = width * width\n    per_sample = half_lattice_per_sample + layer_per_sample + covariance_per_sample\n    fixed = 13 * width**3 + 8 * width\n    budget_limited = (int(float(target_fraction) * budget) - fixed) // max(per_sample, 1)\n    memory_limited = _MAX_WORKING_SET_BYTES // max(width * _FLOAT64_ITEMSIZE, 1)\n    count = int(max(_MIN_ANTITHETIC_SAMPLES, min(budget_limited, memory_limited)))\n    return count - (count & 1)\n\n\n@lru_cache(maxsize=None)\ndef _first_primes(count: int) -> tuple[int, ...]:\n    primes: list[int] = []\n    candidate = 2\n    while len(primes) < count:\n        is_prime = True\n        for prime in primes:\n            if prime * prime > candidate:\n                break\n            if candidate % prime == 0:\n                is_prime = False\n                break\n        if is_prime:\n            primes.append(candidate)\n        candidate += 1\n    return tuple(primes)\n\n\ndef _lattice_normal_samples(n_samples: int, width: int, rng) -> fnp.ndarray:\n    roots = fnp.sqrt(fnp.array(_first_primes(width), dtype=fnp.float64))\n    generator = roots - fnp.floor(roots)\n    shift = rng.random(width)\n    indices = fnp.arange(n_samples, dtype=fnp.float64)[:, None]\n    unwrapped = indices * generator[None, :] + shift[None, :]\n    uniforms = unwrapped - fnp.floor(unwrapped)\n    uniforms = fnp.clip(uniforms, _TAIL_CLIP, 1.0 - _TAIL_CLIP)\n    return flops.stats.norm.ppf(uniforms)\n\n\ndef _mean_chi(dimension: int) -> float:\n    half_dimension = 0.5 * float(dimension)\n    return math.sqrt(2.0) * math.exp(\n        math.lgamma(half_dimension + 0.5) - math.lgamma(half_dimension)\n    )\n\n\ndef _qmc_directions(n_samples: int, width: int, rng) -> fnp.ndarray:\n    normals = _lattice_normal_samples(n_samples, width, rng)\n    radii = fnp.sqrt(fnp.maximum(fnp.sum(normals * normals, axis=1), 1e-24))\n    return normals / radii[:, None]\n\n\ndef _angular_whitening_transform(directions: fnp.ndarray) -> fnp.ndarray:\n    n_samples, width = directions.shape\n    scaled_second_moment = (directions.T @ directions) * (float(width) / float(n_samples))\n    eigenvalues, eigenvectors = fnp.linalg.eigh(scaled_second_moment)\n    eigenvalues = fnp.maximum(eigenvalues, _WHITENING_EIGENVALUE_FLOOR)\n    return (eigenvectors / fnp.sqrt(eigenvalues)) @ eigenvectors.T\n\n\ndef _exact_first_layer_mean(weights: fnp.ndarray) -> fnp.ndarray:\n    standard_deviation = fnp.sqrt(fnp.sum(weights * weights, axis=0))\n    return standard_deviation / fnp.sqrt(2.0 * fnp.pi)\n\n\ndef _exact_first_layer_second(weights: fnp.ndarray, width: int) -> fnp.ndarray:\n    squared_norm = fnp.sum(weights * weights, axis=0)\n    radius = _mean_chi(width)\n    return squared_norm * ((radius * radius) / (2.0 * float(width)))\n\n\ndef _gaussian_relu_moments(\n    mean: fnp.ndarray,\n    variance: fnp.ndarray,\n) -> tuple[fnp.ndarray, fnp.ndarray]:\n    sigma = fnp.sqrt(fnp.maximum(variance, 1e-12))\n    alpha = mean / sigma\n    cdf = flops.stats.norm.cdf(alpha)\n    pdf = flops.stats.norm.pdf(alpha)\n    first = mean * cdf + sigma * pdf\n    second = (mean * mean + variance) * cdf + mean * sigma * pdf\n    return first, second\n\n\nclass Estimator(BaseEstimator):\n    target_flop_fraction = 0.10\n    sample_delta = -4\n    whitening_strength = 1.032\n    final_scale = 0.99938\n    final_gaussian_blend = -0.03\n    final_nested_blend = 0.23\n    final_tail_blend = -0.065\n    first_mean_match = -1.40\n    first_variance_match = 0.58\n\n    def predict(self, mlp, budget: int) -> fnp.ndarray:\n        n_samples = _sample_count(\n            budget,\n            mlp.width,\n            mlp.depth,\n            self.target_flop_fraction,\n        )\n        n_samples = max(_MIN_ANTITHETIC_SAMPLES, n_samples + self.sample_delta)\n        n_samples = n_samples - (n_samples & 1)\n        half_samples = n_samples // 2\n\n        rng = fnp.random.default_rng(mlp.seed)\n        half_directions = _qmc_directions(half_samples, mlp.width, rng)\n        whitening = _angular_whitening_transform(half_directions)\n        whitened_first_weight = whitening @ mlp.weights[0]\n        first_weight = (\n            (1.0 - self.whitening_strength) * mlp.weights[0]\n            + self.whitening_strength * whitened_first_weight\n        )\n        first_weight = fnp.asarray(first_weight, dtype=fnp.float32)\n\n        paired_directions = fnp.concatenate((half_directions, -half_directions), axis=0)\n        activations = fnp.asarray(\n            paired_directions * _mean_chi(mlp.width),\n            dtype=fnp.float32,\n        )\n\n        rows = []\n        activations = fnp.maximum(activations @ first_weight, 0.0)\n        first_exact = _exact_first_layer_mean(mlp.weights[0])\n        first_sample = fnp.maximum(fnp.mean(activations, axis=0), 1e-12)\n        first_factor = first_exact / first_sample\n        activations = activations * (\n            1.0 + self.first_mean_match * (first_factor - 1.0)\n        )\n\n        current_mean = fnp.mean(activations, axis=0)\n        current_second = fnp.mean(activations * activations, axis=0)\n        current_variance = fnp.maximum(\n            current_second - current_mean * current_mean,\n            1e-12,\n        )\n        first_second = _exact_first_layer_second(mlp.weights[0], mlp.width)\n        first_variance = fnp.maximum(first_second - first_exact * first_exact, 1e-12)\n        variance_factor = fnp.sqrt(first_variance / current_variance)\n        variance_matched = first_exact + (activations - current_mean) * variance_factor\n        activations = activations + self.first_variance_match * (\n            variance_matched - activations\n        )\n        rows.append(first_exact)\n\n        for layer_index, weights in enumerate(mlp.weights[1:], start=1):\n            preactivations = activations @ weights\n            activations = fnp.maximum(preactivations, 0.0)\n            row = fnp.mean(activations, axis=0)\n\n            if layer_index == mlp.depth - 1:\n                pre_mean = fnp.mean(preactivations, axis=0)\n                pre_second = fnp.mean(preactivations * preactivations, axis=0)\n                pre_variance = fnp.maximum(pre_second - pre_mean * pre_mean, 1e-12)\n                gaussian_row, _ = _gaussian_relu_moments(pre_mean, pre_variance)\n                row = row + self.final_gaussian_blend * (gaussian_row - row)\n\n                sub_count = half_samples // 2\n                sub_row = (\n                    fnp.sum(activations[:sub_count], axis=0)\n                    + fnp.sum(\n                        activations[half_samples : half_samples + sub_count],\n                        axis=0,\n                    )\n                ) / float(2 * sub_count)\n                full_row = row\n                row = row + self.final_nested_blend * (row - sub_row)\n\n                tail_count = half_samples // 5\n                tail_row = (\n                    fnp.sum(\n                        activations[half_samples - tail_count : half_samples],\n                        axis=0,\n                    )\n                    + fnp.sum(activations[n_samples - tail_count :], axis=0)\n                ) / float(2 * tail_count)\n                row = row + self.final_tail_blend * (tail_row - full_row)\n\n            rows.append(row)\n\n        rows = fnp.asarray(fnp.stack(rows, axis=0), dtype=fnp.float32)\n        return fnp.concatenate((rows[:-1], rows[-1:] * self.final_scale), axis=0)\n",
+      "construction": [
+        {
+          "adjusted_final_layer_score": 2.193269700239864e-07,
+          "all_layers_mse": 5.423564289230853e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 28186303145.067757,
+          "final_layer_mse": 2.1165221824048785e-06,
+          "flops_used": 27154437593,
+          "mlp_index": 0,
+          "mlp_name": "daniel-harrison",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.1308376439089684e-07,
+          "all_layers_mse": 5.9395647440396715e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 27637266880.6482,
+          "final_layer_mse": 1.112945938075427e-06,
+          "flops_used": 27154437593,
+          "mlp_index": 1,
+          "mlp_name": "dustin-robinson",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 2.0069530100872885e-07,
+          "all_layers_mse": 7.710681529715657e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 27644863865.153854,
+          "final_layer_mse": 1.9746569250855828e-06,
+          "flops_used": 27154437593,
+          "mlp_index": 2,
+          "mlp_name": "cole-martin",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 7.715630789541528e-08,
+          "all_layers_mse": 5.614966539724264e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 27609820804.374283,
+          "final_layer_mse": 7.601105380672379e-07,
+          "flops_used": 27154437593,
+          "mlp_index": 3,
+          "mlp_name": "donna-clarke",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 9.462829671416031e-08,
+          "all_layers_mse": 4.605946742231026e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 27630236512.796944,
+          "final_layer_mse": 9.315481861449371e-07,
+          "flops_used": 27154437593,
+          "mlp_index": 4,
+          "mlp_name": "rebecca-walker",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.472759547819969e-07,
+          "all_layers_mse": 6.337566446745768e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 27638975298.779076,
+          "final_layer_mse": 1.449368483008584e-06,
+          "flops_used": 27154437593,
+          "mlp_index": 5,
+          "mlp_name": "monique-stevens",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 2.3051104128344926e-07,
+          "all_layers_mse": 5.544697614823235e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 27635254106.299942,
+          "final_layer_mse": 2.268805019411957e-06,
+          "flops_used": 27154437593,
+          "mlp_index": 6,
+          "mlp_name": "keith-brock",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.1046968855885764e-07,
+          "all_layers_mse": 4.625099791155662e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 27627338982.0028,
+          "final_layer_mse": 1.0876094620471122e-06,
+          "flops_used": 27154437593,
+          "mlp_index": 7,
+          "mlp_name": "robert-huff",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.3892185078699008e-07,
+          "all_layers_mse": 5.306871116772527e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 27645835793.392723,
+          "final_layer_mse": 1.366815013170708e-06,
+          "flops_used": 27154437593,
+          "mlp_index": 8,
+          "mlp_name": "kimberly-caldwell",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.4993985194226922e-07,
+          "all_layers_mse": 6.336337719403673e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 27656412265.079086,
+          "final_layer_mse": 1.4746540273335995e-06,
+          "flops_used": 27154437593,
+          "mlp_index": 9,
+          "mlp_name": "annette-hansen",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        }
+      ],
+      "id": "02e2deff-8fb0-49ee-9a3f-f616fd4f396f",
+      "metadata": {},
+      "observation": "pass score=1.48201e-07",
+      "parent_values": [
+        -1.5533439997169494e-07,
+        -1.5864085728694722e-07,
+        -1.6432224780089276e-07,
+        -2.225493700203189e-07
+      ],
+      "parents": [
+        {
+          "id": "6fec0212-fd0e-48d7-8096-80a568c3437d",
+          "timestep": 3
+        },
+        {
+          "id": "ff0cc694-3874-4642-ae17-dc6d004aad9d",
+          "timestep": 1
+        },
+        {
+          "id": "9af1fe7b-019f-4ad2-8c7c-70120a2a2699",
+          "timestep": 0
+        },
+        {
+          "id": "359b81d5-2c94-4eb8-a0eb-b42258b0c621",
+          "timestep": -1
+        }
+      ],
+      "timestep": 4,
+      "type": "State",
+      "value": -1.4820090273867505e-07
+    },
+    {
+      "code": "\"\"\"Estimator for ARC WhestBench public mini MLPs.\"\"\"\n\nfrom __future__ import annotations\n\nimport math\nfrom functools import lru_cache\n\nimport flopscope as flops\nimport flopscope.numpy as fnp\nfrom whestbench import BaseEstimator\n\n\n_MAX_WORKING_SET_BYTES = 100 * 1024 * 1024\n_FLOAT64_ITEMSIZE = 8\n_TAIL_CLIP = 1e-11\n_MIN_ANTITHETIC_SAMPLES = 32\n_WHITENING_EIGENVALUE_FLOOR = 1e-8\n\n\ndef _sample_count(budget: int, width: int, depth: int, target_fraction: float) -> int:\n    half_lattice_per_sample = (89 * width + 3 * width + 2) // 2\n    layer_per_sample = depth * (2 * width * width + 2 * width)\n    covariance_per_sample = width * width\n    per_sample = half_lattice_per_sample + layer_per_sample + covariance_per_sample\n    fixed = 13 * width**3 + 8 * width\n    budget_limited = (int(float(target_fraction) * budget) - fixed) // max(per_sample, 1)\n    memory_limited = _MAX_WORKING_SET_BYTES // max(width * _FLOAT64_ITEMSIZE, 1)\n    count = int(max(_MIN_ANTITHETIC_SAMPLES, min(budget_limited, memory_limited)))\n    return count - (count & 1)\n\n\n@lru_cache(maxsize=None)\ndef _first_primes(count: int) -> tuple[int, ...]:\n    primes: list[int] = []\n    candidate = 2\n    while len(primes) < count:\n        is_prime = True\n        for prime in primes:\n            if prime * prime > candidate:\n                break\n            if candidate % prime == 0:\n                is_prime = False\n                break\n        if is_prime:\n            primes.append(candidate)\n        candidate += 1\n    return tuple(primes)\n\n\ndef _lattice_normal_samples(n_samples: int, width: int, rng) -> fnp.ndarray:\n    roots = fnp.sqrt(fnp.array(_first_primes(width), dtype=fnp.float64))\n    generator = roots - fnp.floor(roots)\n    shift = rng.random(width)\n    indices = fnp.arange(n_samples, dtype=fnp.float64)[:, None]\n    unwrapped = indices * generator[None, :] + shift[None, :]\n    uniforms = unwrapped - fnp.floor(unwrapped)\n    uniforms = fnp.clip(uniforms, _TAIL_CLIP, 1.0 - _TAIL_CLIP)\n    return flops.stats.norm.ppf(uniforms)\n\n\ndef _mean_chi(dimension: int) -> float:\n    half_dimension = 0.5 * float(dimension)\n    return math.sqrt(2.0) * math.exp(\n        math.lgamma(half_dimension + 0.5) - math.lgamma(half_dimension)\n    )\n\n\ndef _qmc_directions(n_samples: int, width: int, rng) -> fnp.ndarray:\n    normals = _lattice_normal_samples(n_samples, width, rng)\n    radii = fnp.sqrt(fnp.maximum(fnp.sum(normals * normals, axis=1), 1e-24))\n    return normals / radii[:, None]\n\n\ndef _angular_whitening_transform(directions: fnp.ndarray) -> fnp.ndarray:\n    n_samples, width = directions.shape\n    scaled_second_moment = (directions.T @ directions) * (float(width) / float(n_samples))\n    eigenvalues, eigenvectors = fnp.linalg.eigh(scaled_second_moment)\n    eigenvalues = fnp.maximum(eigenvalues, _WHITENING_EIGENVALUE_FLOOR)\n    return (eigenvectors / fnp.sqrt(eigenvalues)) @ eigenvectors.T\n\n\ndef _exact_first_layer_mean(weights: fnp.ndarray) -> fnp.ndarray:\n    standard_deviation = fnp.sqrt(fnp.sum(weights * weights, axis=0))\n    return standard_deviation / fnp.sqrt(2.0 * fnp.pi)\n\n\ndef _exact_first_layer_second(weights: fnp.ndarray, width: int) -> fnp.ndarray:\n    squared_norm = fnp.sum(weights * weights, axis=0)\n    radius = _mean_chi(width)\n    return squared_norm * ((radius * radius) / (2.0 * float(width)))\n\n\ndef _gaussian_relu_moments(\n    mean: fnp.ndarray,\n    variance: fnp.ndarray,\n) -> tuple[fnp.ndarray, fnp.ndarray]:\n    sigma = fnp.sqrt(fnp.maximum(variance, 1e-12))\n    alpha = mean / sigma\n    cdf = flops.stats.norm.cdf(alpha)\n    pdf = flops.stats.norm.pdf(alpha)\n    first = mean * cdf + sigma * pdf\n    second = (mean * mean + variance) * cdf + mean * sigma * pdf\n    return first, second\n\n\nclass Estimator(BaseEstimator):\n    target_flop_fraction = 0.10\n    sample_delta = -4\n    whitening_strength = 1.032\n    final_scale = 0.99938\n    final_gaussian_blend = -0.03\n    final_nested_blend = 0.23\n    final_tail_blend = -0.065\n    first_mean_match = -1.40\n    first_variance_match = 0.58\n\n    def predict(self, mlp, budget: int) -> fnp.ndarray:\n        n_samples = _sample_count(\n            budget,\n            mlp.width,\n            mlp.depth,\n            self.target_flop_fraction,\n        )\n        n_samples = max(_MIN_ANTITHETIC_SAMPLES, n_samples + self.sample_delta)\n        n_samples = n_samples - (n_samples & 1)\n        half_samples = n_samples // 2\n\n        rng = fnp.random.default_rng(mlp.seed)\n        half_directions = _qmc_directions(half_samples, mlp.width, rng)\n        whitening = _angular_whitening_transform(half_directions)\n        whitened_first_weight = whitening @ mlp.weights[0]\n        first_weight = (\n            (1.0 - self.whitening_strength) * mlp.weights[0]\n            + self.whitening_strength * whitened_first_weight\n        )\n        first_weight = fnp.asarray(first_weight, dtype=fnp.float32)\n\n        paired_directions = fnp.concatenate((half_directions, -half_directions), axis=0)\n        activations = fnp.asarray(\n            paired_directions * _mean_chi(mlp.width),\n            dtype=fnp.float32,\n        )\n\n        rows = []\n        activations = fnp.maximum(activations @ first_weight, 0.0)\n        first_exact = _exact_first_layer_mean(mlp.weights[0])\n        first_sample = fnp.maximum(fnp.mean(activations, axis=0), 1e-12)\n        first_factor = first_exact / first_sample\n        activations = activations * (\n            1.0 + self.first_mean_match * (first_factor - 1.0)\n        )\n\n        current_mean = fnp.mean(activations, axis=0)\n        current_second = fnp.mean(activations * activations, axis=0)\n        current_variance = fnp.maximum(\n            current_second - current_mean * current_mean,\n            1e-12,\n        )\n        first_second = _exact_first_layer_second(mlp.weights[0], mlp.width)\n        first_variance = fnp.maximum(first_second - first_exact * first_exact, 1e-12)\n        variance_factor = fnp.sqrt(first_variance / current_variance)\n        variance_matched = first_exact + (activations - current_mean) * variance_factor\n        activations = activations + self.first_variance_match * (\n            variance_matched - activations\n        )\n        rows.append(first_exact)\n\n        for layer_index, weights in enumerate(mlp.weights[1:], start=1):\n            preactivations = activations @ weights\n            activations = fnp.maximum(preactivations, 0.0)\n            row = fnp.mean(activations, axis=0)\n\n            if layer_index == mlp.depth - 1:\n                pre_mean = fnp.mean(preactivations, axis=0)\n                pre_second = fnp.mean(preactivations * preactivations, axis=0)\n                pre_variance = fnp.maximum(pre_second - pre_mean * pre_mean, 1e-12)\n                gaussian_row, _ = _gaussian_relu_moments(pre_mean, pre_variance)\n                row = row + self.final_gaussian_blend * (gaussian_row - row)\n\n                sub_count = half_samples // 2\n                sub_row = (\n                    fnp.sum(activations[:sub_count], axis=0)\n                    + fnp.sum(\n                        activations[half_samples : half_samples + sub_count],\n                        axis=0,\n                    )\n                ) / float(2 * sub_count)\n                full_row = row\n                row = row + self.final_nested_blend * (row - sub_row)\n\n                tail_count = half_samples // 5\n                tail_row = (\n                    fnp.sum(\n                        activations[half_samples - tail_count : half_samples],\n                        axis=0,\n                    )\n                    + fnp.sum(activations[n_samples - tail_count :], axis=0)\n                ) / float(2 * tail_count)\n                row = row + self.final_tail_blend * (tail_row - full_row)\n\n            rows.append(row)\n\n        rows = fnp.asarray(fnp.stack(rows, axis=0), dtype=fnp.float32)\n        return fnp.concatenate((rows[:-1], rows[-1:] * self.final_scale), axis=0)",
+      "construction": [
+        {
+          "adjusted_final_layer_score": 2.193230740745604e-07,
+          "all_layers_mse": 5.423564289230853e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 28185802466.051643,
+          "final_layer_mse": 2.1165221824048785e-06,
+          "flops_used": 27154437593,
+          "mlp_index": 0,
+          "mlp_name": "daniel-harrison",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.1302930027514469e-07,
+          "all_layers_mse": 5.9395647440396715e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 27623956045.882767,
+          "final_layer_mse": 1.112945938075427e-06,
+          "flops_used": 27154437593,
+          "mlp_index": 1,
+          "mlp_name": "dustin-robinson",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 2.0060069308632508e-07,
+          "all_layers_mse": 7.710681529715657e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 27631832054.631775,
+          "final_layer_mse": 1.9746569250855828e-06,
+          "flops_used": 27154437593,
+          "mlp_index": 2,
+          "mlp_name": "cole-martin",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 7.760970637892097e-08,
+          "all_layers_mse": 5.614966539724264e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 27772066137.569016,
+          "final_layer_mse": 7.601105380672379e-07,
+          "flops_used": 27154437593,
+          "mlp_index": 3,
+          "mlp_name": "donna-clarke",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 9.459254254700253e-08,
+          "all_layers_mse": 4.605946742231026e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 27619796759.264534,
+          "final_layer_mse": 9.315481861449371e-07,
+          "flops_used": 27154437593,
+          "mlp_index": 4,
+          "mlp_name": "rebecca-walker",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.4710670203211486e-07,
+          "all_layers_mse": 6.337566446745768e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 27607211983.57827,
+          "final_layer_mse": 1.449368483008584e-06,
+          "flops_used": 27154437593,
+          "mlp_index": 5,
+          "mlp_name": "monique-stevens",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 2.3036994952814362e-07,
+          "all_layers_mse": 5.544697614823235e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 27618339053.170746,
+          "final_layer_mse": 2.268805019411957e-06,
+          "flops_used": 27154437593,
+          "mlp_index": 6,
+          "mlp_name": "keith-brock",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.1053817503560823e-07,
+          "all_layers_mse": 4.625099791155662e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 27644466749.20804,
+          "final_layer_mse": 1.0876094620471122e-06,
+          "flops_used": 27154437593,
+          "mlp_index": 7,
+          "mlp_name": "robert-huff",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.38872728187707e-07,
+          "all_layers_mse": 5.306871116772527e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 27636060259.12053,
+          "final_layer_mse": 1.366815013170708e-06,
+          "flops_used": 27154437593,
+          "mlp_index": 8,
+          "mlp_name": "kimberly-caldwell",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.4987425897709548e-07,
+          "all_layers_mse": 6.336337719403673e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 27644313639.77677,
+          "final_layer_mse": 1.4746540273335995e-06,
+          "flops_used": 27154437593,
+          "mlp_index": 9,
+          "mlp_name": "annette-hansen",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        }
+      ],
+      "id": "bc4f7a3d-6eea-47bf-a7df-f28819d470b6",
+      "metadata": {},
+      "observation": "pass score=1.48192e-07",
+      "parent_values": [
+        -1.5533439997169494e-07,
+        -1.5864085728694722e-07,
+        -1.6432224780089276e-07,
+        -2.225493700203189e-07
+      ],
+      "parents": [
+        {
+          "id": "6fec0212-fd0e-48d7-8096-80a568c3437d",
+          "timestep": 3
+        },
+        {
+          "id": "ff0cc694-3874-4642-ae17-dc6d004aad9d",
+          "timestep": 1
+        },
+        {
+          "id": "9af1fe7b-019f-4ad2-8c7c-70120a2a2699",
+          "timestep": 0
+        },
+        {
+          "id": "359b81d5-2c94-4eb8-a0eb-b42258b0c621",
+          "timestep": -1
+        }
+      ],
+      "timestep": 4,
+      "type": "State",
+      "value": -1.4819171301226228e-07
+    },
+    {
+      "code": "\"\"\"Estimator for ARC WhestBench public mini MLPs.\"\"\"\n\nfrom __future__ import annotations\n\nimport math\nfrom functools import lru_cache\n\nimport flopscope as flops\nimport flopscope.numpy as fnp\nfrom whestbench import BaseEstimator\n\n\n_MAX_WORKING_SET_BYTES = 100 * 1024 * 1024\n_FLOAT64_ITEMSIZE = 8\n_TAIL_CLIP = 1e-11\n_MIN_ANTITHETIC_SAMPLES = 32\n_WHITENING_EIGENVALUE_FLOOR = 1e-8\n\n\ndef _sample_count(budget: int, width: int, depth: int, target_fraction: float) -> int:\n    half_lattice_per_sample = (89 * width + 3 * width + 2) // 2\n    layer_per_sample = depth * (2 * width * width + 2 * width)\n    covariance_per_sample = width * width\n    per_sample = half_lattice_per_sample + layer_per_sample + covariance_per_sample\n    fixed = 13 * width**3 + 8 * width\n    budget_limited = (int(float(target_fraction) * budget) - fixed) // max(per_sample, 1)\n    memory_limited = _MAX_WORKING_SET_BYTES // max(width * _FLOAT64_ITEMSIZE, 1)\n    count = int(max(_MIN_ANTITHETIC_SAMPLES, min(budget_limited, memory_limited)))\n    return count - (count & 1)\n\n\n@lru_cache(maxsize=None)\ndef _first_primes(count: int) -> tuple[int, ...]:\n    primes: list[int] = []\n    candidate = 2\n    while len(primes) < count:\n        is_prime = True\n        for prime in primes:\n            if prime * prime > candidate:\n                break\n            if candidate % prime == 0:\n                is_prime = False\n                break\n        if is_prime:\n            primes.append(candidate)\n        candidate += 1\n    return tuple(primes)\n\n\ndef _lattice_normal_samples(n_samples: int, width: int, rng) -> fnp.ndarray:\n    roots = fnp.sqrt(fnp.array(_first_primes(width), dtype=fnp.float64))\n    generator = roots - fnp.floor(roots)\n    shift = rng.random(width)\n    indices = fnp.arange(n_samples, dtype=fnp.float64)[:, None]\n    unwrapped = indices * generator[None, :] + shift[None, :]\n    uniforms = unwrapped - fnp.floor(unwrapped)\n    uniforms = fnp.clip(uniforms, _TAIL_CLIP, 1.0 - _TAIL_CLIP)\n    return flops.stats.norm.ppf(uniforms)\n\n\ndef _mean_chi(dimension: int) -> float:\n    half_dimension = 0.5 * float(dimension)\n    return math.sqrt(2.0) * math.exp(\n        math.lgamma(half_dimension + 0.5) - math.lgamma(half_dimension)\n    )\n\n\ndef _qmc_directions(n_samples: int, width: int, rng) -> fnp.ndarray:\n    normals = _lattice_normal_samples(n_samples, width, rng)\n    radii = fnp.sqrt(fnp.maximum(fnp.sum(normals * normals, axis=1), 1e-24))\n    return normals / radii[:, None]\n\n\ndef _angular_whitening_transform(directions: fnp.ndarray) -> fnp.ndarray:\n    n_samples, width = directions.shape\n    scaled_second_moment = (directions.T @ directions) * (float(width) / float(n_samples))\n    eigenvalues, eigenvectors = fnp.linalg.eigh(scaled_second_moment)\n    eigenvalues = fnp.maximum(eigenvalues, _WHITENING_EIGENVALUE_FLOOR)\n    return (eigenvectors / fnp.sqrt(eigenvalues)) @ eigenvectors.T\n\n\ndef _exact_first_layer_mean(weights: fnp.ndarray) -> fnp.ndarray:\n    standard_deviation = fnp.sqrt(fnp.sum(weights * weights, axis=0))\n    return standard_deviation / fnp.sqrt(2.0 * fnp.pi)\n\n\ndef _exact_first_layer_second(weights: fnp.ndarray, width: int) -> fnp.ndarray:\n    squared_norm = fnp.sum(weights * weights, axis=0)\n    radius = _mean_chi(width)\n    return squared_norm * ((radius * radius) / (2.0 * float(width)))\n\n\ndef _gaussian_relu_moments(\n    mean: fnp.ndarray,\n    variance: fnp.ndarray,\n) -> tuple[fnp.ndarray, fnp.ndarray]:\n    sigma = fnp.sqrt(fnp.maximum(variance, 1e-12))\n    alpha = mean / sigma\n    cdf = flops.stats.norm.cdf(alpha)\n    pdf = flops.stats.norm.pdf(alpha)\n    first = mean * cdf + sigma * pdf\n    second = (mean * mean + variance) * cdf + mean * sigma * pdf\n    return first, second\n\n\nclass Estimator(BaseEstimator):\n    target_flop_fraction = 0.10\n    sample_delta = -4\n    whitening_strength = 1.04\n    final_scale = 0.99938\n    final_gaussian_blend = -0.03\n    final_nested_blend = 0.23\n    final_quarter_blend = 0.012\n    final_eighth_blend = 0.03\n    final_sixteenth_blend = -0.022\n    final_thirtysecond_blend = 0.02\n    final_sixtyfourth_blend = 0.010\n    final_one28_blend = -0.0055\n    final_tail_blend = -0.065\n    final_middle_blend = 0.005\n    first_mean_match = -1.40\n    first_variance_match = 0.58\n\n    def predict(self, mlp, budget: int) -> fnp.ndarray:\n        n_samples = _sample_count(\n            budget,\n            mlp.width,\n            mlp.depth,\n            self.target_flop_fraction,\n        )\n        n_samples = max(_MIN_ANTITHETIC_SAMPLES, n_samples + self.sample_delta)\n        n_samples = n_samples - (n_samples & 1)\n        half_samples = n_samples // 2\n\n        rng = fnp.random.default_rng(mlp.seed)\n        half_directions = _qmc_directions(half_samples, mlp.width, rng)\n        whitening = _angular_whitening_transform(half_directions)\n        whitened_first_weight = whitening @ mlp.weights[0]\n        first_weight = (\n            (1.0 - self.whitening_strength) * mlp.weights[0]\n            + self.whitening_strength * whitened_first_weight\n        )\n        first_weight = fnp.asarray(first_weight, dtype=fnp.float32)\n\n        paired_directions = fnp.concatenate((half_directions, -half_directions), axis=0)\n        activations = fnp.asarray(\n            paired_directions * _mean_chi(mlp.width),\n            dtype=fnp.float32,\n        )\n\n        rows = []\n        activations = fnp.maximum(activations @ first_weight, 0.0)\n        first_exact = _exact_first_layer_mean(mlp.weights[0])\n        first_sample = fnp.maximum(fnp.mean(activations, axis=0), 1e-12)\n        first_factor = first_exact / first_sample\n        activations = activations * (\n            1.0 + self.first_mean_match * (first_factor - 1.0)\n        )\n\n        current_mean = fnp.mean(activations, axis=0)\n        current_second = fnp.mean(activations * activations, axis=0)\n        current_variance = fnp.maximum(\n            current_second - current_mean * current_mean,\n            1e-12,\n        )\n        first_second = _exact_first_layer_second(mlp.weights[0], mlp.width)\n        first_variance = fnp.maximum(first_second - first_exact * first_exact, 1e-12)\n        variance_factor = fnp.sqrt(first_variance / current_variance)\n        variance_matched = first_exact + (activations - current_mean) * variance_factor\n        activations = activations + self.first_variance_match * (\n            variance_matched - activations\n        )\n        rows.append(first_exact)\n\n        for layer_index, weights in enumerate(mlp.weights[1:], start=1):\n            preactivations = activations @ weights\n            activations = fnp.maximum(preactivations, 0.0)\n            row = fnp.mean(activations, axis=0)\n\n            if layer_index == mlp.depth - 1:\n                pre_mean = fnp.mean(preactivations, axis=0)\n                pre_second = fnp.mean(preactivations * preactivations, axis=0)\n                pre_variance = fnp.maximum(pre_second - pre_mean * pre_mean, 1e-12)\n                gaussian_row, _ = _gaussian_relu_moments(pre_mean, pre_variance)\n                row = row + self.final_gaussian_blend * (gaussian_row - row)\n\n                sub_count = half_samples // 2\n                sub_row = (\n                    fnp.sum(activations[:sub_count], axis=0)\n                    + fnp.sum(\n                        activations[half_samples : half_samples + sub_count],\n                        axis=0,\n                    )\n                ) / float(2 * sub_count)\n                full_row = row\n                row = row + self.final_nested_blend * (row - sub_row)\n\n                quarter_count = max(1, half_samples // 4)\n                quarter_row = (\n                    fnp.sum(activations[:quarter_count], axis=0)\n                    + fnp.sum(\n                        activations[half_samples : half_samples + quarter_count],\n                        axis=0,\n                    )\n                ) / float(2 * quarter_count)\n                row = row + self.final_quarter_blend * (sub_row - quarter_row)\n\n                eighth_count = max(1, half_samples // 8)\n                eighth_row = (\n                    fnp.sum(activations[:eighth_count], axis=0)\n                    + fnp.sum(\n                        activations[half_samples : half_samples + eighth_count],\n                        axis=0,\n                    )\n                ) / float(2 * eighth_count)\n                row = row + self.final_eighth_blend * (quarter_row - eighth_row)\n\n                sixteenth_count = max(1, half_samples // 16)\n                sixteenth_row = (\n                    fnp.sum(activations[:sixteenth_count], axis=0)\n                    + fnp.sum(\n                        activations[half_samples : half_samples + sixteenth_count],\n                        axis=0,\n                    )\n                ) / float(2 * sixteenth_count)\n                row = row + self.final_sixteenth_blend * (eighth_row - sixteenth_row)\n\n                thirtysecond_count = max(1, half_samples // 32)\n                thirtysecond_row = (\n                    fnp.sum(activations[:thirtysecond_count], axis=0)\n                    + fnp.sum(\n                        activations[half_samples : half_samples + thirtysecond_count],\n                        axis=0,\n                    )\n                ) / float(2 * thirtysecond_count)\n                row = row + self.final_thirtysecond_blend * (\n                    sixteenth_row - thirtysecond_row\n                )\n\n                sixtyfourth_count = max(1, half_samples // 64)\n                sixtyfourth_row = (\n                    fnp.sum(activations[:sixtyfourth_count], axis=0)\n                    + fnp.sum(\n                        activations[half_samples : half_samples + sixtyfourth_count],\n                        axis=0,\n                    )\n                ) / float(2 * sixtyfourth_count)\n                row = row + self.final_sixtyfourth_blend * (\n                    thirtysecond_row - sixtyfourth_row\n                )\n\n                one28_count = max(1, half_samples // 128)\n                one28_row = (\n                    fnp.sum(activations[:one28_count], axis=0)\n                    + fnp.sum(\n                        activations[half_samples : half_samples + one28_count],\n                        axis=0,\n                    )\n                ) / float(2 * one28_count)\n                row = row + self.final_one28_blend * (\n                    sixtyfourth_row - one28_row\n                )\n\n                middle_count = max(1, half_samples // 128)\n                middle_start = max(0, half_samples // 2 - middle_count // 2)\n                middle_row = (\n                    fnp.sum(\n                        activations[middle_start : middle_start + middle_count],\n                        axis=0,\n                    )\n                    + fnp.sum(\n                        activations[\n                            half_samples\n                            + middle_start : half_samples\n                            + middle_start\n                            + middle_count\n                        ],\n                        axis=0,\n                    )\n                ) / float(2 * middle_count)\n                row = row + self.final_middle_blend * (middle_row - full_row)\n\n                tail_count = half_samples // 5\n                tail_row = (\n                    fnp.sum(\n                        activations[half_samples - tail_count : half_samples],\n                        axis=0,\n                    )\n                    + fnp.sum(activations[n_samples - tail_count :], axis=0)\n                ) / float(2 * tail_count)\n                row = row + self.final_tail_blend * (tail_row - full_row)\n\n            rows.append(row)\n\n        rows = fnp.asarray(fnp.stack(rows, axis=0), dtype=fnp.float32)\n        return fnp.concatenate((rows[:-1], rows[-1:] * self.final_scale), axis=0)\n",
+      "construction": [
+        {
+          "adjusted_final_layer_score": 1.9262938212361904e-07,
+          "all_layers_mse": 5.377974048315082e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 28179787322.75389,
+          "final_layer_mse": 1.8593182176118717e-06,
+          "flops_used": 27155246809,
+          "mlp_index": 0,
+          "mlp_name": "daniel-harrison",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.1536750793069511e-07,
+          "all_layers_mse": 5.926684934820514e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 27670458182.56758,
+          "final_layer_mse": 1.134060084950761e-06,
+          "flops_used": 27155246809,
+          "mlp_index": 1,
+          "mlp_name": "dustin-robinson",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.5607216772444686e-07,
+          "all_layers_mse": 7.873092727095354e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 27668011784.42858,
+          "final_layer_mse": 1.534321654617088e-06,
+          "flops_used": 27155246809,
+          "mlp_index": 2,
+          "mlp_name": "cole-martin",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 7.56864728818741e-08,
+          "all_layers_mse": 5.675160537066404e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 27634790018.075928,
+          "final_layer_mse": 7.449566510331351e-07,
+          "flops_used": 27155246809,
+          "mlp_index": 3,
+          "mlp_name": "donna-clarke",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.0376642227928954e-07,
+          "all_layers_mse": 4.601469754561549e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 27655427008.742317,
+          "final_layer_mse": 1.0205760645476403e-06,
+          "flops_used": 27155246809,
+          "mlp_index": 4,
+          "mlp_name": "rebecca-walker",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.4136289584208321e-07,
+          "all_layers_mse": 6.332747489068424e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 27695082351.440414,
+          "final_layer_mse": 1.3883586689189542e-06,
+          "flops_used": 27155246809,
+          "mlp_index": 5,
+          "mlp_name": "monique-stevens",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 2.0223512261528865e-07,
+          "all_layers_mse": 5.589037300524069e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 27732709273.571,
+          "final_layer_mse": 1.98350448954443e-06,
+          "flops_used": 27155246809,
+          "mlp_index": 6,
+          "mlp_name": "keith-brock",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 9.352513579595906e-08,
+          "all_layers_mse": 4.681267455453053e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 27681365832.561478,
+          "final_layer_mse": 9.189877800963586e-07,
+          "flops_used": 27155246809,
+          "mlp_index": 7,
+          "mlp_name": "robert-huff",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.0389382823526166e-07,
+          "all_layers_mse": 5.341372343536932e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 27701553180.688843,
+          "final_layer_mse": 1.0201276836596662e-06,
+          "flops_used": 27155246809,
+          "mlp_index": 8,
+          "mlp_name": "kimberly-caldwell",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.50773177462908e-07,
+          "all_layers_mse": 6.362166459439322e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 27622694000.47682,
+          "final_layer_mse": 1.4846598332951544e-06,
+          "flops_used": 27155246809,
+          "mlp_index": 9,
+          "mlp_name": "annette-hansen",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        }
+      ],
+      "id": "087d225c-86c4-4503-843a-ed58100e8943",
+      "metadata": {},
+      "observation": "pass score=1.33531e-07",
+      "parent_values": [
+        -1.4819171301226228e-07,
+        -1.5533439997169494e-07,
+        -1.5864085728694722e-07,
+        -1.6432224780089276e-07,
+        -2.225493700203189e-07
+      ],
+      "parents": [
+        {
+          "id": "bc4f7a3d-6eea-47bf-a7df-f28819d470b6",
+          "timestep": 4
+        },
+        {
+          "id": "6fec0212-fd0e-48d7-8096-80a568c3437d",
+          "timestep": 3
+        },
+        {
+          "id": "ff0cc694-3874-4642-ae17-dc6d004aad9d",
+          "timestep": 1
+        },
+        {
+          "id": "9af1fe7b-019f-4ad2-8c7c-70120a2a2699",
+          "timestep": 0
+        },
+        {
+          "id": "359b81d5-2c94-4eb8-a0eb-b42258b0c621",
+          "timestep": -1
+        }
+      ],
+      "timestep": 6,
+      "type": "State",
+      "value": -1.3353121128914254e-07
+    },
+    {
+      "code": "\"\"\"Estimator for ARC WhestBench public mini MLPs.\"\"\"\n\nfrom __future__ import annotations\n\nimport math\nfrom functools import lru_cache\n\nimport flopscope as flops\nimport flopscope.numpy as fnp\nfrom whestbench import BaseEstimator\n\n\n_MAX_WORKING_SET_BYTES = 100 * 1024 * 1024\n_FLOAT64_ITEMSIZE = 8\n_TAIL_CLIP = 1e-11\n_MIN_ANTITHETIC_SAMPLES = 32\n_WHITENING_EIGENVALUE_FLOOR = 1e-8\n\n\ndef _sample_count(budget: int, width: int, depth: int, target_fraction: float) -> int:\n    half_lattice_per_sample = (89 * width + 3 * width + 2) // 2\n    layer_per_sample = depth * (2 * width * width + 2 * width)\n    covariance_per_sample = width * width\n    per_sample = half_lattice_per_sample + layer_per_sample + covariance_per_sample\n    fixed = 13 * width**3 + 8 * width\n    budget_limited = (int(float(target_fraction) * budget) - fixed) // max(per_sample, 1)\n    memory_limited = _MAX_WORKING_SET_BYTES // max(width * _FLOAT64_ITEMSIZE, 1)\n    count = int(max(_MIN_ANTITHETIC_SAMPLES, min(budget_limited, memory_limited)))\n    return count - (count & 1)\n\n\n@lru_cache(maxsize=None)\ndef _first_primes(count: int) -> tuple[int, ...]:\n    primes: list[int] = []\n    candidate = 2\n    while len(primes) < count:\n        is_prime = True\n        for prime in primes:\n            if prime * prime > candidate:\n                break\n            if candidate % prime == 0:\n                is_prime = False\n                break\n        if is_prime:\n            primes.append(candidate)\n        candidate += 1\n    return tuple(primes)\n\n\ndef _lattice_normal_samples(n_samples: int, width: int, rng) -> fnp.ndarray:\n    roots = fnp.sqrt(fnp.array(_first_primes(width), dtype=fnp.float64))\n    generator = roots - fnp.floor(roots)\n    shift = rng.random(width)\n    indices = fnp.arange(n_samples, dtype=fnp.float64)[:, None]\n    unwrapped = indices * generator[None, :] + shift[None, :]\n    uniforms = unwrapped - fnp.floor(unwrapped)\n    uniforms = fnp.clip(uniforms, _TAIL_CLIP, 1.0 - _TAIL_CLIP)\n    return flops.stats.norm.ppf(uniforms)\n\n\ndef _mean_chi(dimension: int) -> float:\n    half_dimension = 0.5 * float(dimension)\n    return math.sqrt(2.0) * math.exp(\n        math.lgamma(half_dimension + 0.5) - math.lgamma(half_dimension)\n    )\n\n\ndef _qmc_directions(n_samples: int, width: int, rng) -> fnp.ndarray:\n    normals = _lattice_normal_samples(n_samples, width, rng)\n    radii = fnp.sqrt(fnp.maximum(fnp.sum(normals * normals, axis=1), 1e-24))\n    return normals / radii[:, None]\n\n\ndef _angular_whitening_transform(directions: fnp.ndarray) -> fnp.ndarray:\n    n_samples, width = directions.shape\n    scaled_second_moment = (directions.T @ directions) * (float(width) / float(n_samples))\n    eigenvalues, eigenvectors = fnp.linalg.eigh(scaled_second_moment)\n    eigenvalues = fnp.maximum(eigenvalues, _WHITENING_EIGENVALUE_FLOOR)\n    return (eigenvectors / fnp.sqrt(eigenvalues)) @ eigenvectors.T\n\n\ndef _exact_first_layer_mean(weights: fnp.ndarray) -> fnp.ndarray:\n    standard_deviation = fnp.sqrt(fnp.sum(weights * weights, axis=0))\n    return standard_deviation / fnp.sqrt(2.0 * fnp.pi)\n\n\ndef _exact_first_layer_second(weights: fnp.ndarray, width: int) -> fnp.ndarray:\n    squared_norm = fnp.sum(weights * weights, axis=0)\n    radius = _mean_chi(width)\n    return squared_norm * ((radius * radius) / (2.0 * float(width)))\n\n\ndef _gaussian_relu_moments(\n    mean: fnp.ndarray,\n    variance: fnp.ndarray,\n) -> tuple[fnp.ndarray, fnp.ndarray]:\n    sigma = fnp.sqrt(fnp.maximum(variance, 1e-12))\n    alpha = mean / sigma\n    cdf = flops.stats.norm.cdf(alpha)\n    pdf = flops.stats.norm.pdf(alpha)\n    first = mean * cdf + sigma * pdf\n    second = (mean * mean + variance) * cdf + mean * sigma * pdf\n    return first, second\n\n\nclass Estimator(BaseEstimator):\n    target_flop_fraction = 0.10\n    sample_delta = -4\n    whitening_strength = 1.04\n    final_scale = 0.99938\n    final_gaussian_blend = -0.03\n    final_nested_blend = 0.23\n    final_quarter_blend = 0.012\n    final_eighth_blend = 0.03\n    final_sixteenth_blend = -0.022\n    final_thirtysecond_blend = 0.02\n    final_sixtyfourth_blend = 0.010\n    final_one28_blend = -0.0055\n    final_tail_blend = -0.065\n    final_middle_blend = 0.005\n    first_mean_match = -1.40\n    first_variance_match = 0.58\n\n    def predict(self, mlp, budget: int) -> fnp.ndarray:\n        n_samples = _sample_count(\n            budget,\n            mlp.width,\n            mlp.depth,\n            self.target_flop_fraction,\n        )\n        n_samples = max(_MIN_ANTITHETIC_SAMPLES, n_samples + self.sample_delta)\n        n_samples = n_samples - (n_samples & 1)\n        half_samples = n_samples // 2\n\n        rng = fnp.random.default_rng(mlp.seed)\n        half_directions = _qmc_directions(half_samples, mlp.width, rng)\n        whitening = _angular_whitening_transform(half_directions)\n        whitened_first_weight = whitening @ mlp.weights[0]\n        first_weight = (\n            (1.0 - self.whitening_strength) * mlp.weights[0]\n            + self.whitening_strength * whitened_first_weight\n        )\n        first_weight = fnp.asarray(first_weight, dtype=fnp.float32)\n\n        paired_directions = fnp.concatenate((half_directions, -half_directions), axis=0)\n        activations = fnp.asarray(\n            paired_directions * _mean_chi(mlp.width),\n            dtype=fnp.float32,\n        )\n\n        rows = []\n        activations = fnp.maximum(activations @ first_weight, 0.0)\n        first_exact = _exact_first_layer_mean(mlp.weights[0])\n        first_sample = fnp.maximum(fnp.mean(activations, axis=0), 1e-12)\n        first_factor = first_exact / first_sample\n        activations = activations * (\n            1.0 + self.first_mean_match * (first_factor - 1.0)\n        )\n\n        current_mean = fnp.mean(activations, axis=0)\n        current_second = fnp.mean(activations * activations, axis=0)\n        current_variance = fnp.maximum(\n            current_second - current_mean * current_mean,\n            1e-12,\n        )\n        first_second = _exact_first_layer_second(mlp.weights[0], mlp.width)\n        first_variance = fnp.maximum(first_second - first_exact * first_exact, 1e-12)\n        variance_factor = fnp.sqrt(first_variance / current_variance)\n        variance_matched = first_exact + (activations - current_mean) * variance_factor\n        activations = activations + self.first_variance_match * (\n            variance_matched - activations\n        )\n        rows.append(first_exact)\n\n        for layer_index, weights in enumerate(mlp.weights[1:], start=1):\n            preactivations = activations @ weights\n            activations = fnp.maximum(preactivations, 0.0)\n            row = fnp.mean(activations, axis=0)\n\n            if layer_index == mlp.depth - 1:\n                pre_mean = fnp.mean(preactivations, axis=0)\n                pre_second = fnp.mean(preactivations * preactivations, axis=0)\n                pre_variance = fnp.maximum(pre_second - pre_mean * pre_mean, 1e-12)\n                gaussian_row, _ = _gaussian_relu_moments(pre_mean, pre_variance)\n                row = row + self.final_gaussian_blend * (gaussian_row - row)\n\n                sub_count = half_samples // 2\n                sub_row = (\n                    fnp.sum(activations[:sub_count], axis=0)\n                    + fnp.sum(\n                        activations[half_samples : half_samples + sub_count],\n                        axis=0,\n                    )\n                ) / float(2 * sub_count)\n                full_row = row\n                row = row + self.final_nested_blend * (row - sub_row)\n\n                quarter_count = max(1, half_samples // 4)\n                quarter_row = (\n                    fnp.sum(activations[:quarter_count], axis=0)\n                    + fnp.sum(\n                        activations[half_samples : half_samples + quarter_count],\n                        axis=0,\n                    )\n                ) / float(2 * quarter_count)\n                row = row + self.final_quarter_blend * (sub_row - quarter_row)\n\n                eighth_count = max(1, half_samples // 8)\n                eighth_row = (\n                    fnp.sum(activations[:eighth_count], axis=0)\n                    + fnp.sum(\n                        activations[half_samples : half_samples + eighth_count],\n                        axis=0,\n                    )\n                ) / float(2 * eighth_count)\n                row = row + self.final_eighth_blend * (quarter_row - eighth_row)\n\n                sixteenth_count = max(1, half_samples // 16)\n                sixteenth_row = (\n                    fnp.sum(activations[:sixteenth_count], axis=0)\n                    + fnp.sum(\n                        activations[half_samples : half_samples + sixteenth_count],\n                        axis=0,\n                    )\n                ) / float(2 * sixteenth_count)\n                row = row + self.final_sixteenth_blend * (eighth_row - sixteenth_row)\n\n                thirtysecond_count = max(1, half_samples // 32)\n                thirtysecond_row = (\n                    fnp.sum(activations[:thirtysecond_count], axis=0)\n                    + fnp.sum(\n                        activations[half_samples : half_samples + thirtysecond_count],\n                        axis=0,\n                    )\n                ) / float(2 * thirtysecond_count)\n                row = row + self.final_thirtysecond_blend * (\n                    sixteenth_row - thirtysecond_row\n                )\n\n                sixtyfourth_count = max(1, half_samples // 64)\n                sixtyfourth_row = (\n                    fnp.sum(activations[:sixtyfourth_count], axis=0)\n                    + fnp.sum(\n                        activations[half_samples : half_samples + sixtyfourth_count],\n                        axis=0,\n                    )\n                ) / float(2 * sixtyfourth_count)\n                row = row + self.final_sixtyfourth_blend * (\n                    thirtysecond_row - sixtyfourth_row\n                )\n\n                one28_count = max(1, half_samples // 128)\n                one28_row = (\n                    fnp.sum(activations[:one28_count], axis=0)\n                    + fnp.sum(\n                        activations[half_samples : half_samples + one28_count],\n                        axis=0,\n                    )\n                ) / float(2 * one28_count)\n                row = row + self.final_one28_blend * (\n                    sixtyfourth_row - one28_row\n                )\n\n                middle_count = max(1, half_samples // 128)\n                middle_start = max(0, half_samples // 2 - middle_count // 2)\n                middle_row = (\n                    fnp.sum(\n                        activations[middle_start : middle_start + middle_count],\n                        axis=0,\n                    )\n                    + fnp.sum(\n                        activations[\n                            half_samples\n                            + middle_start : half_samples\n                            + middle_start\n                            + middle_count\n                        ],\n                        axis=0,\n                    )\n                ) / float(2 * middle_count)\n                row = row + self.final_middle_blend * (middle_row - full_row)\n\n                tail_count = half_samples // 5\n                tail_row = (\n                    fnp.sum(\n                        activations[half_samples - tail_count : half_samples],\n                        axis=0,\n                    )\n                    + fnp.sum(activations[n_samples - tail_count :], axis=0)\n                ) / float(2 * tail_count)\n                row = row + self.final_tail_blend * (tail_row - full_row)\n\n            rows.append(row)\n\n        rows = fnp.asarray(fnp.stack(rows, axis=0), dtype=fnp.float32)\n        return fnp.concatenate((rows[:-1], rows[-1:] * self.final_scale), axis=0)",
+      "construction": [
+        {
+          "adjusted_final_layer_score": 1.9289861161808847e-07,
+          "all_layers_mse": 5.377974048315082e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 28219172954.43438,
+          "final_layer_mse": 1.8593182176118717e-06,
+          "flops_used": 27155246809,
+          "mlp_index": 0,
+          "mlp_name": "daniel-harrison",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.1541020228251605e-07,
+          "all_layers_mse": 5.926684934820514e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 27680698260.539993,
+          "final_layer_mse": 1.134060084950761e-06,
+          "flops_used": 27155246809,
+          "mlp_index": 1,
+          "mlp_name": "dustin-robinson",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.5609869152830693e-07,
+          "all_layers_mse": 7.873092727095354e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 27672713845.8433,
+          "final_layer_mse": 1.534321654617088e-06,
+          "flops_used": 27155246809,
+          "mlp_index": 2,
+          "mlp_name": "cole-martin",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 7.57157336837308e-08,
+          "all_layers_mse": 5.675160537066404e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 27645473778.122887,
+          "final_layer_mse": 7.449566510331351e-07,
+          "flops_used": 27155246809,
+          "mlp_index": 3,
+          "mlp_name": "donna-clarke",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.0379342026160395e-07,
+          "all_layers_mse": 4.601469754561549e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 27662622406.953796,
+          "final_layer_mse": 1.0205760645476403e-06,
+          "flops_used": 27155246809,
+          "mlp_index": 4,
+          "mlp_name": "rebecca-walker",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.4103729696714077e-07,
+          "all_layers_mse": 6.332747489068424e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 27631292715.54373,
+          "final_layer_mse": 1.3883586689189542e-06,
+          "flops_used": 27155246809,
+          "mlp_index": 5,
+          "mlp_name": "monique-stevens",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 2.0165834668446388e-07,
+          "all_layers_mse": 5.589037300524069e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 27653615400.070175,
+          "final_layer_mse": 1.98350448954443e-06,
+          "flops_used": 27155246809,
+          "mlp_index": 6,
+          "mlp_name": "keith-brock",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 9.342111185513973e-08,
+          "all_layers_mse": 4.681267455453053e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 27650577053.30275,
+          "final_layer_mse": 9.189877800963586e-07,
+          "flops_used": 27155246809,
+          "mlp_index": 7,
+          "mlp_name": "robert-huff",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.0381048631947399e-07,
+          "all_layers_mse": 5.341372343536932e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 27679331451.529488,
+          "final_layer_mse": 1.0201276836596662e-06,
+          "flops_used": 27155246809,
+          "mlp_index": 8,
+          "mlp_name": "kimberly-caldwell",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.5095335104397503e-07,
+          "all_layers_mse": 6.362166459439322e-06,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 27655703052.753433,
+          "final_layer_mse": 1.4846598332951544e-06,
+          "flops_used": 27155246809,
+          "mlp_index": 9,
+          "mlp_name": "annette-hansen",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        }
+      ],
+      "id": "ed72e0ba-f3f6-477d-80c2-7fae8616c882",
+      "metadata": {},
+      "observation": "pass score=1.3348e-07",
+      "parent_values": [
+        -1.4819171301226228e-07,
+        -1.5533439997169494e-07,
+        -1.5864085728694722e-07,
+        -1.6432224780089276e-07,
+        -2.225493700203189e-07
+      ],
+      "parents": [
+        {
+          "id": "bc4f7a3d-6eea-47bf-a7df-f28819d470b6",
+          "timestep": 4
+        },
+        {
+          "id": "6fec0212-fd0e-48d7-8096-80a568c3437d",
+          "timestep": 3
+        },
+        {
+          "id": "ff0cc694-3874-4642-ae17-dc6d004aad9d",
+          "timestep": 1
+        },
+        {
+          "id": "9af1fe7b-019f-4ad2-8c7c-70120a2a2699",
+          "timestep": 0
+        },
+        {
+          "id": "359b81d5-2c94-4eb8-a0eb-b42258b0c621",
+          "timestep": -1
+        }
+      ],
+      "timestep": 6,
+      "type": "State",
+      "value": -1.3347972522444397e-07
+    }
+  ],
+  "step": 8
+}

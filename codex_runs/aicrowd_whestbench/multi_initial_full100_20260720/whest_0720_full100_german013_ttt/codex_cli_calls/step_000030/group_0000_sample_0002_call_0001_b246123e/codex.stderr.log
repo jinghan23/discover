@@ -1,0 +1,247 @@
+OpenAI Codex v0.144.3
+--------
+workdir: /opt/tiger/discover
+model: gpt-5.5
+provider: openai
+approval: never
+sandbox: read-only
+reasoning effort: xhigh
+reasoning summaries: none
+session id: 019f7cef-a717-7ea2-b7dd-9d87be5934bd
+--------
+user
+You are solving the ARC White-Box Estimation Challenge 2026
+(WhestBench) under the official evaluator contract.
+
+Task:
+- You receive the weights of a randomly initialized square ReLU MLP.
+- Inputs follow a standard normal distribution.
+- Predict the per-neuron post-ReLU activation mean for every layer.
+- Return a `flopscope.numpy.ndarray` with shape `(mlp.depth, mlp.width)`.
+
+Required submission interface:
+- Import `flopscope.numpy as fnp` for numerical operations.
+- Define `class Estimator(BaseEstimator)` with
+  `predict(self, mlp, budget)`.
+- Optional `setup(self, context)` and `teardown(self)` hooks follow the official
+  WhestBench API.
+- Seed predict-time randomness from `mlp.seed` and setup-time randomness from
+  `context.seed`.
+
+Official scoring:
+- For each MLP, compute final-layer MSE against the official Monte Carlo target.
+- Effective compute is `C = FLOPs + lambda * residual_wall_time`.
+- A valid MLP score is `final_layer_mse * max(0.1, C / flop_budget)`.
+- The suite score is the arithmetic mean of those per-MLP scores; lower is better.
+- Exceptions, invalid shapes/non-finite values, FLOP/time exhaustion, or combined
+  budget exhaustion use an all-zero prediction and multiplier 1.0 for that MLP.
+- All-layer MSE is diagnostic only.
+
+Do not use plain NumPy or uninstrumented numerical libraries to evade FLOP
+accounting. Residual Python or uninstrumented work is charged at the official
+lambda rate and can exhaust the combined budget.
+
+Fairness and data isolation:
+- Derive predictions only from the `mlp` weights and allowed setup context.
+- Do not inspect, search for, or read evaluation datasets, Hugging Face caches,
+  saved evaluation reports, target moments, or ground-truth files.
+- Do not hardcode values tied to public mini MLPs. Such candidates are invalid
+  even if they receive a low local score.
+
+Algorithm directions worth exploring:
+- Mean and diagonal-variance propagation through ReLU moments.
+- Full, structured, or low-rank covariance propagation.
+- Hybrid analytic propagation with compute-budgeted Monte Carlo probes.
+- Layer-wise corrections for correlation error in deep networks.
+- Allocating FLOPs to layers where final-layer MSE is most sensitive.
+
+
+Official evaluation suite for this run:
+- dataset: None@None
+- split / MLPs: None / first None
+- width / depth: None / None
+- FLOP budget per MLP: None
+- residual penalty lambda: None FLOPs/second
+- runner: None
+
+You are iteratively optimizing budget-adjusted final-layer score.
+Here is the last code we ran:
+```python
+from __future__ import annotations
+
+import math
+
+import flopscope.numpy as fnp
+from whestbench import BaseEstimator
+
+
+_BUDGET_FRACTION = 0.18
+_MIN_SAMPLES = 64
+_MAX_SAMPLES = 1_000_000
+_ARRAY_BYTES_LIMIT = 192 * 1024 * 1024
+_WORST_CASE_ITEMSIZE = 8
+_EPS = 1e-6
+_INV_SQRT_2PI = 0.3989422804014327
+_CONTROL_GAIN = 0.75
+_FINAL_GAUSS_BLEND = 0.35
+_QMC_SE_SCALE = 0.25
+
+
+def _chi_mean(dim: int) -> float:
+    return math.sqrt(2.0) * math.exp(
+        math.lgamma(0.5 * (float(dim) + 1.0)) - math.lgamma(0.5 * float(dim))
+    )
+
+
+def _sample_count(budget, width: int, depth: int) -> int:
+    per_sample = depth * (2 * width * width + width)
+    max_k_by_bytes = _ARRAY_BYTES_LIMIT // max(width * _WORST_CASE_ITEMSIZE, 1)
+
+    if budget is None:
+        k = min(_MAX_SAMPLES, max_k_by_bytes, 4096)
+    else:
+        k = int(_BUDGET_FRACTION * float(budget)) // max(per_sample, 1)
+        k = min(_MAX_SAMPLES, max_k_by_bytes, max(_MIN_SAMPLES, k))
+
+    return max(2, int(k) - (int(k) & 1))
+
+
+def _orthogonal_antithetic_sphere(rng, half: int, width: int):
+    u = rng.standard_normal((half, width), dtype=fnp.float32)
+
+    if half < width:
+        gram = u @ u.T
+        eigval, eigvec = fnp.linalg.eigh(gram)
+        eigval = fnp.maximum(eigval, _EPS)
+        inv_sqrt = (eigvec / fnp.sqrt(eigval)) @ eigvec.T
+        x = (inv_sqrt @ u) * fnp.sqrt(float(width))
+    else:
+        cov = (u.T @ u) / float(half)
+        eigval, eigvec = fnp.linalg.eigh(cov)
+        eigval = fnp.maximum(eigval, _EPS)
+        inv_sqrt = (eigvec / fnp.sqrt(eigval)) @ eigvec.T
+        x = u @ inv_sqrt
+
+    radius = _chi_mean(width)
+    norm = fnp.sqrt(fnp.sum(x * x, axis=1, keepdims=True))
+    x = x * (radius / fnp.maximum(norm, _EPS))
+    return fnp.concatenate([x, -x], axis=0)
+
+
+def _normal_cdf(x):
+    ax = fnp.maximum(x, -x)
+    t = 1.0 / (1.0 + 0.2316419 * ax)
+    poly = (
+        (
+            (((1.330274429 * t - 1.821255978) * t + 1.781477937) * t - 0.356563782)
+            * t
+            + 0.319381530
+        )
+        * t
+    )
+    phi = _INV_SQRT_2PI * fnp.exp(-0.5 * ax * ax)
+    c = 1.0 - phi * poly
+    return fnp.where(x >= 0.0, c, 1.0 - c)
+
+
+def _gaussian_relu_mean(mu, var):
+    sigma = fnp.sqrt(fnp.maximum(var, _EPS))
+    alpha = mu / sigma
+    phi = _INV_SQRT_2PI * fnp.exp(-0.5 * alpha * alpha)
+    return sigma * phi + mu * _normal_cdf(alpha)
+
+
+def _final_smooth(cv_mean, gauss_mean, relu_second, sample_mean, k: int):
+    diff = fnp.maximum(gauss_mean - cv_mean, cv_mean - gauss_mean)
+    relu_var = fnp.maximum(relu_second - sample_mean * sample_mean, _EPS)
+    se = _QMC_SE_SCALE * fnp.sqrt(relu_var / float(max(k, 1))) + _EPS
+    se2 = se * se
+    trust = se2 / (se2 + diff * diff + _EPS)
+    return cv_mean + (_FINAL_GAUSS_BLEND * trust) * (gauss_mean - cv_mean)
+
+
+class Estimator(BaseEstimator):
+    def setup(self, context):
+        self._setup_seed = context.seed
+
+    def teardown(self):
+        pass
+
+    def predict(self, mlp, budget):
+        width = mlp.width
+        depth = mlp.depth
+        k = _sample_count(budget, width, depth)
+        half = k // 2
+
+        rng = fnp.random.default_rng(mlp.seed)
+        x = _orthogonal_antithetic_sphere(rng, half, width)
+
+        means = []
+        correction = None
+
+        for layer, weight in enumerate(mlp.weights):
+            z = x @ weight
+            gate = fnp.mean(z > 0.0, axis=0)
+            x = fnp.maximum(z, 0.0)
+            sample_mean = fnp.mean(x, axis=0)
+
+            if layer == 0:
+                exact_mean = fnp.sqrt(fnp.sum(weight * weight, axis=0)) * _INV_SQRT_2PI
+                correction = exact_mean - sample_mean
+                mean = exact_mean
+            else:
+                pre_correction = correction @ weight
+                correction = pre_correction * gate
+                mean = fnp.maximum(sample_mean + _CONTROL_GAIN * correction, 0.0)
+
+                if layer == depth - 1:
+                    z_mu = fnp.mean(z, axis=0) + _CONTROL_GAIN * pre_correction
+                    z_second = fnp.mean(z * z, axis=0)
+                    z_var = fnp.maximum(z_second - z_mu * z_mu, _EPS)
+                    gauss_mean = _gaussian_relu_mean(z_mu, z_var)
+                    relu_second = fnp.mean(x * x, axis=0)
+                    mean = fnp.maximum(
+                        _final_smooth(mean, gauss_mean, relu_second, sample_mean, k),
+                        0.0,
+                    )
+
+            means.append(mean)
+
+        return fnp.stack(means, axis=0)
+```
+Here is the budget-adjusted final-layer score before and after running the code above (lower is better): 0.000000 -> 0.000000
+Target: 1e-07. Current gap: 0.000000. Further improvements will also be generously rewarded.
+
+--- Previous Program Output ---
+
+
+		 ...(TRUNCATED)...
+6e-06 | 5.1375878e+10 | ok
+benjamin-dean | 3.0375802e-07 | 1.608255e-06 | 5.1373804e+10 | ok
+michele-galvan | 4.0780006e-07 | 2.1595629e-06 | 5.1362994e+10 | ok
+cathy-butler | 1.3302495e-06 | 7.0472984e-06 | 5.1342775e+10 | ok
+lindsey-chase | 3.1864315e-07 | 1.6874757e-06 | 5.1361296e+10 | ok
+kenneth-hernandez | 6.9544427e-07 | 3.6869681e-06 | 5.1305256e+10 | ok
+lauren-flowers | 2.3875136e-07 | 1.2646115e-06 | 5.1352033e+10 | ok
+kristi-johnson | 3.0589661e-07 | 1.6202523e-06 | 5.1352421e+10 | ok
+--- End Output ---
+
+Return one final Python code block containing an official `Estimator` class.
+
+
+Return only the final answer content. Do not edit files or run tools.
+warning: Codex could not find bubblewrap on PATH. Install bubblewrap with your OS package manager. See the sandbox prerequisites: https://developers.openai.com/codex/concepts/sandboxing#prerequisites. Codex will use the bundled bubblewrap in the meantime.
+2026-07-20T00:31:50.421421Z ERROR codex_api::endpoint::responses_websocket: failed to connect to websocket: HTTP error: 403 Forbidden, url: wss://chatgpt.com/backend-api/codex/responses
+2026-07-20T00:31:51.273675Z ERROR codex_api::endpoint::responses_websocket: failed to connect to websocket: HTTP error: 403 Forbidden, url: wss://chatgpt.com/backend-api/codex/responses
+2026-07-20T00:31:52.314701Z ERROR codex_api::endpoint::responses_websocket: failed to connect to websocket: HTTP error: 403 Forbidden, url: wss://chatgpt.com/backend-api/codex/responses
+ERROR: Reconnecting... 2/5
+2026-07-20T00:31:53.241716Z ERROR codex_api::endpoint::responses_websocket: failed to connect to websocket: HTTP error: 403 Forbidden, url: wss://chatgpt.com/backend-api/codex/responses
+ERROR: Reconnecting... 3/5
+2026-07-20T00:31:54.900453Z ERROR codex_api::endpoint::responses_websocket: failed to connect to websocket: HTTP error: 403 Forbidden, url: wss://chatgpt.com/backend-api/codex/responses
+ERROR: Reconnecting... 4/5
+2026-07-20T00:31:57.440330Z ERROR codex_api::endpoint::responses_websocket: failed to connect to websocket: HTTP error: 403 Forbidden, url: wss://chatgpt.com/backend-api/codex/responses
+ERROR: Reconnecting... 5/5
+2026-07-20T00:32:01.284263Z ERROR codex_api::endpoint::responses_websocket: failed to connect to websocket: HTTP error: 403 Forbidden, url: wss://chatgpt.com/backend-api/codex/responses
+warning: Falling back from WebSockets to HTTPS transport. unexpected status 403 Forbidden: Unknown error, url: wss://chatgpt.com/backend-api/codex/responses, cf-ray: a1ddddc56f869b8b-SIN
+ERROR: You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at Jul 25th, 2026 7:20 PM.
+ERROR: You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at Jul 25th, 2026 7:20 PM.

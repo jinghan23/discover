@@ -1,0 +1,177 @@
+```python
+from __future__ import annotations
+
+import math
+from functools import lru_cache
+
+import flopscope as flops
+import flopscope.numpy as fnp
+from whestbench import BaseEstimator
+
+
+_MAX_WORKING_SET_BYTES = 96 * 1024 * 1024
+_FLOAT64_ITEMSIZE = 8
+_TAIL_CLIP = 1e-11
+_EPS = 1e-12
+_MIN_MC_SAMPLES = 16
+_MC_FLOP_FRACTION = 0.55
+
+_SQRT_2PI = math.sqrt(2.0 * math.pi)
+_INV_SQRT_2PI = 1.0 / _SQRT_2PI
+_RELU_ZERO_MEAN_VAR_FACTOR = 0.5 - 0.5 / math.pi
+
+
+@lru_cache(maxsize=None)
+def _first_primes(count: int) -> tuple[int, ...]:
+    primes: list[int] = []
+    candidate = 2
+    while len(primes) < count:
+        is_prime = True
+        for prime in primes:
+            if prime * prime > candidate:
+                break
+            if candidate % prime == 0:
+                is_prime = False
+                break
+        if is_prime:
+            primes.append(candidate)
+        candidate += 1
+    return tuple(primes)
+
+
+@lru_cache(maxsize=None)
+def _mean_chi(dimension: int) -> float:
+    half_dimension = 0.5 * float(dimension)
+    return math.sqrt(2.0) * math.exp(
+        math.lgamma(half_dimension + 0.5) - math.lgamma(half_dimension)
+    )
+
+
+def _mc_sample_count(budget: int, width: int, depth: int) -> int:
+    budget = max(int(budget or 0), 0)
+    analytic_fixed = depth * (5 * width * width + 32 * width)
+    per_sample = depth * (2 * width * width + 4 * width) + 96 * width + 16
+    usable = int(_MC_FLOP_FRACTION * float(budget)) - analytic_fixed
+
+    if usable < _MIN_MC_SAMPLES * per_sample:
+        return 0
+
+    memory_limited = _MAX_WORKING_SET_BYTES // max(width * _FLOAT64_ITEMSIZE, 1)
+    count = min(usable // max(per_sample, 1), memory_limited)
+    count = int(max(_MIN_MC_SAMPLES, count))
+    return count - (count & 1)
+
+
+def _normal_relu_mean_var(mean: fnp.ndarray, variance: fnp.ndarray):
+    variance = fnp.maximum(variance, _EPS)
+    sigma = fnp.sqrt(variance)
+    alpha = mean / sigma
+    cdf = flops.stats.norm.cdf(alpha)
+    pdf = fnp.exp(-0.5 * alpha * alpha) * _INV_SQRT_2PI
+
+    relu_mean = sigma * pdf + mean * cdf
+    second = (mean * mean + variance) * cdf + mean * sigma * pdf
+    relu_var = fnp.maximum(second - relu_mean * relu_mean, 0.0)
+    return relu_mean, relu_var
+
+
+def _diagonal_moment_rows(weights) -> tuple[list[fnp.ndarray], list[fnp.ndarray]]:
+    first_weight = weights[0]
+    pre_var = fnp.sum(first_weight * first_weight, axis=0)
+    mean = fnp.sqrt(fnp.maximum(pre_var, 0.0)) * _INV_SQRT_2PI
+    variance = pre_var * _RELU_ZERO_MEAN_VAR_FACTOR
+
+    rows = [mean]
+    variances = [variance]
+
+    for weight in weights[1:]:
+        pre_mean = mean @ weight
+        pre_var = variance @ (weight * weight)
+        mean, variance = _normal_relu_mean_var(pre_mean, pre_var)
+        rows.append(mean)
+        variances.append(variance)
+
+    return rows, variances
+
+
+def _lattice_normal_samples(n_samples: int, width: int, rng) -> fnp.ndarray:
+    roots = fnp.sqrt(fnp.array(_first_primes(width), dtype=fnp.float64))
+    generator = roots - fnp.floor(roots)
+    shift = rng.random(width)
+
+    indices = fnp.arange(n_samples, dtype=fnp.float64)[:, None]
+    uniforms = indices * generator[None, :] + shift[None, :]
+    uniforms = uniforms - fnp.floor(uniforms)
+    uniforms = fnp.clip(uniforms, _TAIL_CLIP, 1.0 - _TAIL_CLIP)
+    return flops.stats.norm.ppf(uniforms)
+
+
+def _qmc_directions(n_samples: int, width: int, rng) -> fnp.ndarray:
+    normals = _lattice_normal_samples(n_samples, width, rng)
+    radii = fnp.sqrt(fnp.maximum(fnp.sum(normals * normals, axis=1), _EPS))
+    return normals / radii[:, None]
+
+
+def _orthogonalize_rows(directions: fnp.ndarray) -> fnp.ndarray:
+    n_samples, width = directions.shape
+    if n_samples <= 1 or n_samples > width:
+        return directions
+
+    gram = directions @ directions.T
+    eigenvalues, eigenvectors = fnp.linalg.eigh(gram)
+    inv_sqrt = (eigenvectors / fnp.sqrt(fnp.maximum(eigenvalues, 1e-10))) @ eigenvectors.T
+    directions = inv_sqrt @ directions
+
+    norms = fnp.sqrt(fnp.maximum(fnp.sum(directions * directions, axis=1), _EPS))
+    return directions / norms[:, None]
+
+
+def _mc_rows(mlp, n_samples: int, analytic_rows: list[fnp.ndarray]) -> list[fnp.ndarray]:
+    width = mlp.width
+    half_samples = n_samples // 2
+    rng = fnp.random.default_rng(mlp.seed)
+
+    directions = _qmc_directions(half_samples, width, rng)
+    directions = _orthogonalize_rows(directions)
+    directions = fnp.concatenate((directions, -directions), axis=0)
+
+    activations = directions * _mean_chi(width)
+    rows = []
+
+    activations = fnp.maximum(activations @ mlp.weights[0], 0.0)
+    exact_first_mean = analytic_rows[0]
+    rows.append(exact_first_mean)
+
+    sample_first_mean = fnp.mean(activations, axis=0)
+    first_scale = exact_first_mean / fnp.maximum(sample_first_mean, _EPS)
+    first_scale = fnp.clip(first_scale, 0.25, 4.0)
+    activations = activations * first_scale[None, :]
+
+    for weight in mlp.weights[1:]:
+        activations = fnp.maximum(activations @ weight, 0.0)
+        rows.append(fnp.mean(activations, axis=0))
+
+    return rows
+
+
+class Estimator(BaseEstimator):
+    def predict(self, mlp, budget: int) -> fnp.ndarray:
+        analytic_rows, _ = _diagonal_moment_rows(mlp.weights)
+        n_samples = _mc_sample_count(budget, mlp.width, mlp.depth)
+
+        if n_samples >= _MIN_MC_SAMPLES:
+            sampled_rows = _mc_rows(mlp, n_samples, analytic_rows)
+            if n_samples >= 64:
+                rows = sampled_rows
+            else:
+                blend = float(n_samples) / 64.0
+                rows = [
+                    blend * sampled + (1.0 - blend) * analytic
+                    for sampled, analytic in zip(sampled_rows, analytic_rows)
+                ]
+            rows[0] = analytic_rows[0]
+        else:
+            rows = analytic_rows
+
+        return fnp.asarray(fnp.stack(rows, axis=0), dtype=fnp.float32)
+```

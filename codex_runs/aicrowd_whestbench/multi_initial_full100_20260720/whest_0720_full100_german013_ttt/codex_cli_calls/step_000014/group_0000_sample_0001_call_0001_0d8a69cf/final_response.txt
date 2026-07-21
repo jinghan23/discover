@@ -1,0 +1,81 @@
+```python
+from __future__ import annotations
+
+import flopscope.numpy as fnp
+from whestbench import BaseEstimator
+
+
+_BUDGET_FRACTION = 0.24
+_MIN_SAMPLES = 96
+_MAX_SAMPLES = 1_000_000
+_ARRAY_BYTES_LIMIT = 224 * 1024 * 1024
+_WORST_CASE_ITEMSIZE = 8
+_EPS = 1e-6
+_INV_SQRT_2PI = 0.3989422804014327
+
+
+def _sample_count(budget, width: int, depth: int) -> int:
+    per_sample = depth * (2 * width * width + width)
+    max_k_by_bytes = _ARRAY_BYTES_LIMIT // max(width * _WORST_CASE_ITEMSIZE, 1)
+
+    if budget is None:
+        k = min(_MAX_SAMPLES, max_k_by_bytes, 8192)
+    else:
+        k = int(_BUDGET_FRACTION * float(budget)) // max(per_sample, 1)
+        k = max(_MIN_SAMPLES, min(_MAX_SAMPLES, max_k_by_bytes, k))
+
+    return max(2, int(k) - (int(k) & 1))
+
+
+def _orthogonal_antithetic_normal(rng, half: int, width: int):
+    u = rng.standard_normal((half, width), dtype=fnp.float32)
+
+    if half < width:
+        gram = u @ u.T
+        eigval, eigvec = fnp.linalg.eigh(gram)
+        eigval = fnp.maximum(eigval, _EPS)
+        inv_sqrt = (eigvec / fnp.sqrt(eigval)) @ eigvec.T
+        x = (inv_sqrt @ u) * fnp.sqrt(float(width))
+    else:
+        cov = (u.T @ u) / float(half)
+        eigval, eigvec = fnp.linalg.eigh(cov)
+        eigval = fnp.maximum(eigval, _EPS)
+        inv_sqrt = (eigvec / fnp.sqrt(eigval)) @ eigvec.T
+        x = u @ inv_sqrt
+
+    return fnp.concatenate([x, -x], axis=0)
+
+
+def _relu_mean_from_var(var):
+    return fnp.sqrt(fnp.maximum(var, 0.0)) * _INV_SQRT_2PI
+
+
+class Estimator(BaseEstimator):
+    def setup(self, context):
+        self._setup_seed = context.seed
+
+    def teardown(self):
+        pass
+
+    def predict(self, mlp, budget):
+        width = mlp.width
+        depth = mlp.depth
+        k = _sample_count(budget, width, depth)
+        half = k // 2
+
+        rng = fnp.random.default_rng(mlp.seed)
+        x = _orthogonal_antithetic_normal(rng, half, width)
+
+        means = []
+        for layer, weight in enumerate(mlp.weights):
+            z = x @ weight
+            x = fnp.maximum(z, 0.0)
+            mean = fnp.mean(x, axis=0)
+
+            if layer == 0:
+                mean = _relu_mean_from_var(fnp.sum(weight * weight, axis=0))
+
+            means.append(mean)
+
+        return fnp.stack(means, axis=0)
+```

@@ -1,0 +1,102 @@
+```python
+from __future__ import annotations
+
+import flopscope as flops
+import flopscope.numpy as fnp
+from whestbench import BaseEstimator
+
+
+class Estimator(BaseEstimator):
+    def _phi2_cdf(self, a, b, rho):
+        rho = fnp.minimum(fnp.maximum(rho, -0.995), 0.995)
+        base = flops.stats.norm.cdf(a) * flops.stats.norm.cdf(b)
+
+        nodes = (-0.9602898565, -0.7966664774, -0.5255324099, -0.1834346425,
+                 0.1834346425, 0.5255324099, 0.7966664774, 0.9602898565)
+        weights = (0.1012285363, 0.2223810345, 0.3137066459, 0.3626837834,
+                   0.3626837834, 0.3137066459, 0.2223810345, 0.1012285363)
+
+        total = 0.0
+        half = 0.5 * rho
+        ab = a * b
+        aa = a * a
+        bb = b * b
+        for x, wt in zip(nodes, weights):
+            r = half * (x + 1.0)
+            omr2 = fnp.maximum(1.0 - r * r, 1e-8)
+            expo = -(aa - 2.0 * r * ab + bb) / (2.0 * omr2)
+            total = total + wt * fnp.exp(expo) / (6.283185307179586 * fnp.sqrt(omr2))
+
+        return fnp.minimum(fnp.maximum(base + half * total, 0.0), 1.0)
+
+    def _relu_full(self, mu, cov):
+        var = fnp.maximum(fnp.diag(cov), 1e-12)
+        sd = fnp.sqrt(var)
+        alpha = mu / sd
+        phi = flops.stats.norm.pdf(alpha)
+        cdf = flops.stats.norm.cdf(alpha)
+
+        out_mu = mu * cdf + sd * phi
+        out_e2 = (mu * mu + var) * cdf + mu * sd * phi
+        out_var = fnp.maximum(out_e2 - out_mu * out_mu, 0.0)
+
+        si = sd[:, None]
+        sj = sd[None, :]
+        ai = alpha[:, None]
+        aj = alpha[None, :]
+        mui = mu[:, None]
+        muj = mu[None, :]
+
+        rho = cov / fnp.maximum(si * sj, 1e-12)
+        rho = fnp.minimum(fnp.maximum(rho, -0.995), 0.995)
+        s2 = fnp.maximum(1.0 - rho * rho, 1e-8)
+        s = fnp.sqrt(s2)
+
+        phii = flops.stats.norm.pdf(ai)
+        phij = flops.stats.norm.pdf(aj)
+        pa = phii * flops.stats.norm.cdf((aj - rho * ai) / s)
+        pb = phij * flops.stats.norm.cdf((ai - rho * aj) / s)
+
+        p = self._phi2_cdf(ai, aj, rho)
+        f2 = fnp.exp(-(ai * ai - 2.0 * rho * ai * aj + aj * aj) / (2.0 * s2)) / (
+            6.283185307179586 * s
+        )
+
+        iu = pa + rho * pb
+        iv = pb + rho * pa
+        iuv = rho * p + s2 * f2 - rho * (ai * pa + aj * pb)
+
+        raw = mui * muj * p + mui * sj * iv + muj * si * iu + si * sj * iuv
+        out_cov = raw - out_mu[:, None] * out_mu[None, :]
+        out_cov = out_cov + fnp.diag(out_var - fnp.diag(out_cov))
+        return out_mu, out_cov
+
+    def predict(self, mlp, budget):
+        width = int(mlp.width)
+        means = []
+
+        mu = fnp.zeros(width)
+        cov = None
+
+        for i, w in enumerate(mlp.weights):
+            if i == 0:
+                pre_mu = w.T @ mu
+                pre_cov = w.T @ w
+            else:
+                pre_mu = w.T @ mu
+                tmp = cov @ w
+                pre_cov = w.T @ tmp
+
+            pre_var = fnp.maximum(fnp.diag(pre_cov), 1e-12)
+            pre_sd = fnp.sqrt(pre_var)
+            alpha = pre_mu / pre_sd
+            phi = flops.stats.norm.pdf(alpha)
+            cdf = flops.stats.norm.cdf(alpha)
+            layer_mu = pre_mu * cdf + pre_sd * phi
+            means.append(layer_mu)
+
+            if i + 1 < int(mlp.depth):
+                mu, cov = self._relu_full(pre_mu, pre_cov)
+
+        return fnp.asarray(fnp.stack(means, axis=0), dtype=fnp.float32)
+```

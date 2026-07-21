@@ -1,0 +1,228 @@
+You are solving the ARC White-Box Estimation Challenge 2026
+(WhestBench) under the official evaluator contract.
+
+Task:
+- You receive the weights of a randomly initialized square ReLU MLP.
+- Inputs follow a standard normal distribution.
+- Predict the per-neuron post-ReLU activation mean for every layer.
+- Return a `flopscope.numpy.ndarray` with shape `(mlp.depth, mlp.width)`.
+
+Required submission interface:
+- Import `flopscope.numpy as fnp` for numerical operations.
+- Define `class Estimator(BaseEstimator)` with
+  `predict(self, mlp, budget)`.
+- Optional `setup(self, context)` and `teardown(self)` hooks follow the official
+  WhestBench API.
+- Seed predict-time randomness from `mlp.seed` and setup-time randomness from
+  `context.seed`.
+
+Official scoring:
+- For each MLP, compute final-layer MSE against the official Monte Carlo target.
+- Effective compute is `C = FLOPs + lambda * residual_wall_time`.
+- A valid MLP score is `final_layer_mse * max(0.1, C / flop_budget)`.
+- The suite score is the arithmetic mean of those per-MLP scores; lower is better.
+- Exceptions, invalid shapes/non-finite values, FLOP/time exhaustion, or combined
+  budget exhaustion use an all-zero prediction and multiplier 1.0 for that MLP.
+- All-layer MSE is diagnostic only.
+
+Do not use plain NumPy or uninstrumented numerical libraries to evade FLOP
+accounting. Residual Python or uninstrumented work is charged at the official
+lambda rate and can exhaust the combined budget.
+
+Fairness and data isolation:
+- Derive predictions only from the `mlp` weights and allowed setup context.
+- Do not inspect, search for, or read evaluation datasets, Hugging Face caches,
+  saved evaluation reports, target moments, or ground-truth files.
+- Do not hardcode values tied to public mini MLPs. Such candidates are invalid
+  even if they receive a low local score.
+
+Algorithm directions worth exploring:
+- Mean and diagonal-variance propagation through ReLU moments.
+- Full, structured, or low-rank covariance propagation.
+- Hybrid analytic propagation with compute-budgeted Monte Carlo probes.
+- Layer-wise corrections for correlation error in deep networks.
+- Allocating FLOPs to layers where final-layer MSE is most sensitive.
+
+
+Official evaluation suite for this run:
+- dataset: None@None
+- split / MLPs: None / first None
+- width / depth: None / None
+- FLOP budget per MLP: None
+- residual penalty lambda: None FLOPs/second
+- runner: None
+
+You are iteratively optimizing budget-adjusted final-layer score.
+Here is the last code we ran:
+```python
+"""Whitened antithetic estimator with a tuned hidden mean correction."""
+
+from __future__ import annotations
+
+import flopscope.numpy as fnp
+from whestbench import BaseEstimator
+
+
+_BUDGET_FRACTION = 0.1131
+_MIN_SAMPLES = 32
+_MAX_SAMPLES = 1_000_000
+_ARRAY_BYTES_LIMIT = 100 * 1024 * 1024
+_WORST_CASE_ITEMSIZE = 8
+_SETUP_SEED_OFFSET = 3
+
+_INV_SQRT_2PI = 0.3989422804014327
+_CDF_POLY_P = 0.2316419
+_CDF_POLY_B1 = 0.319381530
+_CDF_POLY_B2 = -0.356563782
+_CDF_POLY_B3 = 1.781477937
+_CDF_POLY_B4 = -1.821255978
+_CDF_POLY_B5 = 1.330274429
+
+_HIDDEN_BLEND_START = 2
+_HIDDEN_BLEND_STOP = 12
+_HIDDEN_BLEND_FIRST = -0.135
+_HIDDEN_BLEND_LAST = 0.320
+_HIDDEN_BLEND_STEP = (_HIDDEN_BLEND_LAST - _HIDDEN_BLEND_FIRST) / (
+    _HIDDEN_BLEND_STOP - _HIDDEN_BLEND_START
+)
+
+
+def _sample_count(budget: int, width: int, depth: int) -> int:
+    per_sample = depth * (2 * width * width + width) + width * width
+    fixed = 9 * width**3 + 2 * (2 * width**3)
+    k = (int(_BUDGET_FRACTION * budget) - fixed) // max(per_sample, 1)
+    max_k_by_bytes = _ARRAY_BYTES_LIMIT // max(width * _WORST_CASE_ITEMSIZE, 1)
+    k = int(max(_MIN_SAMPLES, min(_MAX_SAMPLES, max_k_by_bytes, k)))
+    return k - (k & 1)
+
+
+def _gaussian_relu_mean(mean, variance):
+    std = fnp.sqrt(fnp.maximum(variance, 1e-12))
+    alpha = fnp.clip(mean / std, -8.0, 8.0)
+    density = _INV_SQRT_2PI * fnp.exp(-0.5 * alpha * alpha)
+    abs_alpha = fnp.abs(alpha)
+    t = 1.0 / (1.0 + _CDF_POLY_P * abs_alpha)
+    tail = density * (
+        t
+        * (
+            _CDF_POLY_B1
+            + t
+            * (
+                _CDF_POLY_B2
+                + t
+                * (_CDF_POLY_B3 + t * (_CDF_POLY_B4 + t * _CDF_POLY_B5))
+            )
+        )
+    )
+    cdf = fnp.where(alpha >= 0.0, 1.0 - tail, tail)
+    return std * density + mean * cdf
+
+
+class Estimator(BaseEstimator):
+    def setup(self, context):
+        self._width = int(context.width)
+        self._depth = int(context.depth)
+        self._samples = self._make_samples(
+            self._width,
+            _sample_count(int(context.flop_budget), self._width, self._depth),
+            int(context.seed) + _SETUP_SEED_OFFSET,
+        )
+
+    def _make_samples(self, width, k, seed):
+        rng = fnp.random.default_rng(seed)
+        half_count = k // 2
+        u = rng.standard_normal((half_count, width), dtype=fnp.float32)
+        raw_u = u
+        u = u - fnp.mean(u, axis=0)
+        covariance = (u.T @ u) / float(half_count)
+        eigenvalues, eigenvectors = fnp.linalg.eigh(covariance)
+        eigenvalues = fnp.maximum(eigenvalues, 1e-6)
+        inverse_sqrt = (eigenvectors / fnp.sqrt(eigenvalues)) @ eigenvectors.T
+        whitened = u @ inverse_sqrt
+        raw_radius = fnp.sum(raw_u * raw_u, axis=1)
+        white_radius = fnp.maximum(fnp.sum(whitened * whitened, axis=1), 1e-8)
+        half = fnp.asarray(
+            whitened * fnp.sqrt(raw_radius / white_radius)[:, None],
+            dtype=fnp.float32,
+        )
+        return fnp.concatenate([half, -half], axis=0)
+
+    def predict(self, mlp, budget):
+        width = mlp.width
+        depth = mlp.depth
+        if (
+            not hasattr(self, "_samples")
+            or self._samples.shape[1] != width
+            or getattr(self, "_depth", depth) != depth
+        ):
+            self._samples = self._make_samples(width, _sample_count(budget, width, depth), mlp.seed)
+            self._depth = depth
+
+        first_weight = mlp.weights[0]
+        first_variance = fnp.sum(first_weight * first_weight, axis=0)
+        first_mean = fnp.sqrt(first_variance) * _INV_SQRT_2PI
+        if depth == 1:
+            zero_rows = fnp.zeros((depth - 1, width), dtype=fnp.float32)
+            return fnp.concatenate([zero_rows, first_mean[None, :]], axis=0)
+
+        target_variance = first_variance * (0.5 - _INV_SQRT_2PI * _INV_SQRT_2PI)
+        x = fnp.maximum(self._samples @ first_weight, 0.0)
+        sample_mean = fnp.mean(x, axis=0)
+        sample_second = fnp.mean(x * x, axis=0)
+        sample_variance = fnp.maximum(sample_second - sample_mean * sample_mean, 1e-6)
+        x = (x - sample_mean) * fnp.sqrt(target_variance / sample_variance) + first_mean
+
+        for layer_index, weight in enumerate(mlp.weights[1:-1], start=1):
+            z = x @ weight
+            x = fnp.maximum(z, 0.0)
+            if _HIDDEN_BLEND_START <= layer_index <= _HIDDEN_BLEND_STOP:
+                x_mean = fnp.mean(x, axis=0)
+                z_mean = fnp.mean(z, axis=0)
+                z_second = fnp.mean(z * z, axis=0)
+                z_variance = fnp.maximum(z_second - z_mean * z_mean, 1e-8)
+                gaussian_mean = _gaussian_relu_mean(z_mean, z_variance)
+                blend = _HIDDEN_BLEND_FIRST + _HIDDEN_BLEND_STEP * (
+                    layer_index - _HIDDEN_BLEND_START
+                )
+                x = x + (gaussian_mean - x_mean) * blend
+
+        z = x @ mlp.weights[-1]
+        x = fnp.maximum(z, 0.0)
+        sampled_mean = fnp.asarray(
+            fnp.mean(fnp.asarray(x, dtype=fnp.float64), axis=0),
+            dtype=fnp.float32,
+        )
+        final_mean = sampled_mean
+        zero_rows = fnp.zeros((depth - 1, width), dtype=fnp.float32)
+        return fnp.concatenate([zero_rows, final_mean[None, :]], axis=0)
+```
+Here is the budget-adjusted final-layer score before and after running the code above (lower is better): 0.000000 -> 0.000000
+Target: 1e-07. Current gap: 0.000000. Further improvements will also be generously rewarded.
+
+--- Previous Program Output ---
+pass score=1.63839e-07
+--- End Output ---
+
+Return one final Python code block containing an official `Estimator` class.
+
+
+--- Autonomous WhestBench Blackbox Search Mode ---
+Work only inside this workspace:
+/opt/tiger/discover/workspace
+
+Editable candidate:
+/opt/tiger/discover/workspace/submission.py
+
+The trusted official evaluator is exposed only through a local blackbox service.
+Run it after each meaningful revision:
+cd /opt/tiger/discover/workspace && python eval_client.py
+
+Do not edit `eval_client.py`. Only `submission.py` is a candidate artifact. It
+must be plain Python source defining the official `Estimator(BaseEstimator)`
+class, without Markdown fences. Lower `raw_score` is better; `reward` is the
+official baseline score divided by the candidate score.
+Do not inspect evaluation datasets, caches, reports, or target values; derive
+the estimator only from the supplied task description and blackbox scores.
+
+When done, leave the best implementation in:
+/opt/tiger/discover/workspace/submission.py

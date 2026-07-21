@@ -1,0 +1,138 @@
+```python
+from __future__ import annotations
+
+import math
+
+import flopscope as flops
+import flopscope.numpy as fnp
+from whestbench import BaseEstimator
+
+
+_TARGET_FLOP_FRACTION = 0.90
+_TAIL_CLIP = 1e-12
+_NORM_FLOOR = 1e-30
+_ARRAY_BYTES_LIMIT = 96 * 1024 * 1024
+_FLOAT64_ITEMSIZE = 8
+_PRIME_CACHE: dict[int, tuple[int, ...]] = {}
+
+
+def _first_primes(count: int) -> tuple[int, ...]:
+    cached = _PRIME_CACHE.get(count)
+    if cached is not None:
+        return cached
+
+    primes = []
+    candidate = 2
+    while len(primes) < count:
+        ok = True
+        for prime in primes:
+            if prime * prime > candidate:
+                break
+            if candidate % prime == 0:
+                ok = False
+                break
+        if ok:
+            primes.append(candidate)
+        candidate += 1
+
+    result = tuple(primes)
+    _PRIME_CACHE[count] = result
+    return result
+
+
+def _lattice_generator(width: int) -> fnp.ndarray:
+    roots = fnp.sqrt(fnp.array(_first_primes(width), dtype=fnp.float64))
+    return roots - fnp.floor(roots)
+
+
+def _lattice_uniforms(n_samples: int, generator: fnp.ndarray, shift: fnp.ndarray) -> fnp.ndarray:
+    indices = fnp.arange(n_samples, dtype=fnp.float64)[:, None]
+    values = indices * generator[None, :] + shift[None, :]
+    return values - fnp.floor(values)
+
+
+def _mean_chi_radius(width: int) -> float:
+    return math.sqrt(2.0) * math.exp(
+        math.lgamma(0.5 * (width + 1.0)) - math.lgamma(0.5 * width)
+    )
+
+
+def _exact_first_layer_mean(weight: fnp.ndarray) -> fnp.ndarray:
+    variance = fnp.sum(weight * weight, axis=0)
+    return fnp.sqrt(variance) / fnp.sqrt(2.0 * fnp.pi)
+
+
+def _sample_count(budget, width: int, depth: int) -> int:
+    try:
+        budget_value = int(budget)
+    except Exception:
+        budget_value = depth * (2 * width * width + width) * 256
+
+    radial_qmc_per_sample = 58 * width
+    forward_per_sample = depth * (2 * width * width + width)
+    moment_per_sample = max(depth - 1, 0) * 7 * width
+    per_sample = radial_qmc_per_sample + forward_per_sample + moment_per_sample
+
+    fixed = 2 * width * width + 16 * width
+    tracked = int(_TARGET_FLOP_FRACTION * budget_value)
+    n_samples = (tracked - fixed) // max(per_sample, 1)
+
+    max_samples_by_bytes = _ARRAY_BYTES_LIMIT // max(width * _FLOAT64_ITEMSIZE, 1)
+    max_samples_by_bytes = max(2, int(max_samples_by_bytes))
+    if max_samples_by_bytes % 2:
+        max_samples_by_bytes -= 1
+
+    n_samples = int(max(2, min(n_samples, max_samples_by_bytes)))
+    if n_samples % 2:
+        n_samples -= 1
+    return max(2, n_samples)
+
+
+class Estimator(BaseEstimator):
+    def predict(self, mlp, budget):
+        width = mlp.width
+        depth = mlp.depth
+        n_samples = _sample_count(budget, width, depth)
+        n_pairs = max(1, n_samples // 2)
+
+        rng = fnp.random.default_rng(mlp.seed)
+        generator = _lattice_generator(width)
+        shift = rng.random(width)
+
+        uniforms = _lattice_uniforms(n_pairs, generator, shift)
+        uniforms = fnp.clip(uniforms, _TAIL_CLIP, 1.0 - _TAIL_CLIP)
+
+        normals = flops.stats.norm.ppf(uniforms)
+        row_norms = fnp.sqrt(fnp.sum(normals * normals, axis=1))
+        directions = normals / fnp.maximum(row_norms, _NORM_FLOOR)[:, None]
+        activations = fnp.concatenate((directions, -directions), axis=0)
+        activations = activations * _mean_chi_radius(width)
+
+        rows = []
+        control = None
+        control_centered = None
+        control_delta = None
+        control_var = None
+
+        for layer_index, weight in enumerate(mlp.weights):
+            activations = fnp.maximum(activations @ weight, 0.0)
+
+            if layer_index == 0:
+                first_mean = _exact_first_layer_mean(weight)
+                rows.append(first_mean)
+
+                control = fnp.sum(activations, axis=1)
+                control_mean = fnp.mean(control)
+                control_centered = control - control_mean
+                control_delta = control_mean - fnp.sum(first_mean)
+                control_var = fnp.mean(control_centered * control_centered) + _NORM_FLOOR
+            else:
+                layer_mean = fnp.mean(activations, axis=0)
+
+                centered = activations - layer_mean[None, :]
+                cov = fnp.mean(control_centered[:, None] * centered, axis=0)
+                layer_mean = layer_mean - (cov / control_var) * control_delta
+                rows.append(fnp.maximum(layer_mean, 0.0))
+
+        return fnp.stack(rows, axis=0)
+```

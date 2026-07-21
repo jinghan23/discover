@@ -1,0 +1,277 @@
+OpenAI Codex v0.144.3
+--------
+workdir: /opt/tiger/discover
+model: gpt-5.5
+provider: openai
+approval: never
+sandbox: read-only
+reasoning effort: xhigh
+reasoning summaries: none
+session id: 019f75d0-e6ad-7bb1-87c5-922a2ca7fed3
+--------
+user
+You are solving the ARC White-Box Estimation Challenge 2026
+(WhestBench) under the official evaluator contract.
+
+Task:
+- You receive the weights of a randomly initialized square ReLU MLP.
+- Inputs follow a standard normal distribution.
+- Predict the per-neuron post-ReLU activation mean for every layer.
+- Return a `flopscope.numpy.ndarray` with shape `(mlp.depth, mlp.width)`.
+
+Required submission interface:
+- Import `flopscope.numpy as fnp` for numerical operations.
+- Define `class Estimator(BaseEstimator)` with
+  `predict(self, mlp, budget)`.
+- Optional `setup(self, context)` and `teardown(self)` hooks follow the official
+  WhestBench API.
+- Seed predict-time randomness from `mlp.seed` and setup-time randomness from
+  `context.seed`.
+
+Official scoring:
+- For each MLP, compute final-layer MSE against the official Monte Carlo target.
+- Effective compute is `C = FLOPs + lambda * residual_wall_time`.
+- A valid MLP score is `final_layer_mse * max(0.1, C / flop_budget)`.
+- The suite score is the arithmetic mean of those per-MLP scores; lower is better.
+- Exceptions, invalid shapes/non-finite values, FLOP/time exhaustion, or combined
+  budget exhaustion use an all-zero prediction and multiplier 1.0 for that MLP.
+- All-layer MSE is diagnostic only.
+
+Do not use plain NumPy or uninstrumented numerical libraries to evade FLOP
+accounting. Residual Python or uninstrumented work is charged at the official
+lambda rate and can exhaust the combined budget.
+
+Fairness and data isolation:
+- Derive predictions only from the `mlp` weights and allowed setup context.
+- Do not inspect, search for, or read evaluation datasets, Hugging Face caches,
+  saved evaluation reports, target moments, or ground-truth files.
+- Do not hardcode values tied to public mini MLPs. Such candidates are invalid
+  even if they receive a low local score.
+
+Algorithm directions worth exploring:
+- Mean and diagonal-variance propagation through ReLU moments.
+- Full, structured, or low-rank covariance propagation.
+- Hybrid analytic propagation with compute-budgeted Monte Carlo probes.
+- Layer-wise corrections for correlation error in deep networks.
+- Allocating FLOPs to layers where final-layer MSE is most sensitive.
+
+
+Official evaluation suite for this run:
+- dataset: None@None
+- split / MLPs: None / first None
+- width / depth: None / None
+- FLOP budget per MLP: None
+- residual penalty lambda: None FLOPs/second
+- runner: None
+
+You are iteratively optimizing budget-adjusted final-layer score.
+Here is the last code we ran:
+```python
+from __future__ import annotations
+
+import flopscope as flops
+import flopscope.numpy as fnp
+from whestbench import BaseEstimator
+
+
+class Estimator(BaseEstimator):
+    def predict(self, mlp, budget):
+        width = int(mlp.width)
+        depth = int(mlp.depth)
+        rng = fnp.random.default_rng(int(mlp.seed))
+
+        per_sample = max(1, depth * (2 * width * width + 4 * width))
+        n_samples = max(1024, int((0.0909908329 * float(budget)) / float(per_sample)))
+        n_samples = min(n_samples, 8192)
+        n_samples = max(2, 2 * (n_samples // 2))
+
+        mu = fnp.zeros(width)
+        var = fnp.ones(width)
+        diag_rows = []
+        diag_vars = []
+
+        for w in mlp.weights:
+            mu_pre = w.T @ mu
+            var_pre = fnp.maximum((w * w).T @ var, 1e-12)
+            sigma = fnp.sqrt(var_pre)
+            alpha = mu_pre / sigma
+            phi = flops.stats.norm.pdf(alpha)
+            cdf = flops.stats.norm.cdf(alpha)
+
+            mu = mu_pre * cdf + sigma * phi
+            ez2 = (mu_pre * mu_pre + var_pre) * cdf + mu_pre * sigma * phi
+            var = fnp.maximum(ez2 - mu * mu, 0.0)
+
+            diag_rows.append(mu)
+            diag_vars.append(var)
+
+        half = n_samples // 2
+        base = fnp.asarray(rng.standard_normal((half, width), dtype=fnp.float32))
+        x = fnp.concatenate((base, -base), axis=0)
+        x = x - fnp.mean(x, axis=0)
+
+        cov = (x.T @ x) / float(n_samples)
+        vals, vecs = fnp.linalg.eigh(cov)
+        inv_sqrt = vecs @ (fnp.diag(1.0 / fnp.sqrt(fnp.maximum(vals, 1e-12))) @ vecs.T)
+        x = x @ inv_sqrt
+
+        for i, w in enumerate(mlp.weights[:-1]):
+            x = fnp.maximum(x @ w, 0.0)
+
+            if i == 0:
+                xc = x - fnp.mean(x, axis=0)
+                xv = fnp.maximum(fnp.mean(xc * xc, axis=0), 1e-12)
+                xm = xc * fnp.sqrt(fnp.maximum(diag_vars[i], 1e-12) / xv) + diag_rows[i]
+                x = -0.5 * x + 1.5 * xm
+            elif i == 1:
+                xc = x - fnp.mean(x, axis=0)
+                xv = fnp.maximum(fnp.mean(xc * xc, axis=0), 1e-12)
+                xm = xc * fnp.sqrt(fnp.maximum(diag_vars[i], 1e-12) / xv) + diag_rows[i]
+                x = 0.83 * x + 0.17 * xm
+            elif i == 3:
+                xc = x - fnp.mean(x, axis=0)
+                xv = fnp.maximum(fnp.mean(xc * xc, axis=0), 1e-12)
+                xm = xc * fnp.sqrt(fnp.maximum(diag_vars[i], 1e-12) / xv) + diag_rows[i]
+                x = 1.035 * x - 0.035 * xm
+
+        z = x @ mlp.weights[-1]
+
+        final_mc = fnp.asarray(fnp.mean(fnp.maximum(z, 0.0), axis=0), dtype=fnp.float32)
+
+        z_mu = fnp.mean(z, axis=0)
+        zc = z - z_mu
+        z_sigma = fnp.sqrt(fnp.maximum(fnp.mean(zc * zc, axis=0), 1e-12))
+        z_alpha = z_mu / z_sigma
+        final_norm = fnp.asarray(
+            z_mu * flops.stats.norm.cdf(z_alpha) + z_sigma * flops.stats.norm.pdf(z_alpha),
+            dtype=fnp.float32,
+        )
+
+        diag = fnp.asarray(fnp.stack(diag_rows, axis=0), dtype=fnp.float32)
+        final_pred = fnp.asarray(
+            0.955 * final_mc + 0.04 * final_norm + 0.005 * diag[-1],
+            dtype=fnp.float32,
+        )
+
+        return fnp.asarray(
+            fnp.concatenate((diag[:-1], final_pred[None, :]), axis=0),
+            dtype=fnp.float32,
+        )
+```
+Here is the budget-adjusted final-layer score before and after running the code above (lower is better): 0.000000 -> 0.000000
+Target: 1e-07. Current gap: 0.000000. Further improvements will also be generously rewarded.
+
+--- Previous Program Output ---
+
+
+		 ...(TRUNCATED)...
+483e-06 | 2.7249014e+10 | ok
+donna-clarke | 1.5009713e-07 | 1.4987675e-06 | 2.7239995e+10 | ok
+rebecca-walker | 2.0543327e-07 | 2.0502337e-06 | 2.7254382e+10 | ok
+monique-stevens | 3.5368474e-07 | 3.5344556e-06 | 2.7218407e+10 | ok
+keith-brock | 2.6698713e-07 | 2.6658324e-06 | 2.7241209e+10 | ok
+robert-huff | 1.5137816e-07 | 1.5111634e-06 | 2.7247126e+10 | ok
+kimberly-caldwell | 9.0918053e-08 | 9.0918053e-07 | 2.7167784e+10 | ok
+annette-hansen | 1.1064881e-07 | 1.1064881e-06 | 2.7199679e+10 | ok
+--- End Output ---
+
+Return one final Python code block containing an official `Estimator` class.
+
+
+Return only the final answer content. Do not edit files or run tools.
+warning: Codex could not find bubblewrap on PATH. Install bubblewrap with your OS package manager. See the sandbox prerequisites: https://developers.openai.com/codex/concepts/sandboxing#prerequisites. Codex will use the bundled bubblewrap in the meantime.
+codex
+```python
+from __future__ import annotations
+
+import flopscope as flops
+import flopscope.numpy as fnp
+from whestbench import BaseEstimator
+
+
+class Estimator(BaseEstimator):
+    def predict(self, mlp, budget):
+        width = int(mlp.width)
+        depth = int(mlp.depth)
+        rng = fnp.random.default_rng(int(mlp.seed))
+
+        per_sample = max(1, depth * (2 * width * width + 4 * width))
+        n_samples = max(1024, int((0.0909908329 * float(budget)) / float(per_sample)))
+        n_samples = min(n_samples, 8192)
+        n_samples = max(2, 2 * (n_samples // 2))
+
+        mu = fnp.zeros(width)
+        var = fnp.ones(width)
+        diag_rows = []
+        diag_vars = []
+
+        for w in mlp.weights:
+            mu_pre = w.T @ mu
+            var_pre = fnp.maximum((w * w).T @ var, 1e-12)
+            sigma = fnp.sqrt(var_pre)
+            alpha = mu_pre / sigma
+            phi = flops.stats.norm.pdf(alpha)
+            cdf = flops.stats.norm.cdf(alpha)
+
+            mu = mu_pre * cdf + sigma * phi
+            ez2 = (mu_pre * mu_pre + var_pre) * cdf + mu_pre * sigma * phi
+            var = fnp.maximum(ez2 - mu * mu, 0.0)
+
+            diag_rows.append(mu)
+            diag_vars.append(var)
+
+        half = n_samples // 2
+        base = fnp.asarray(rng.standard_normal((half, width), dtype=fnp.float32))
+        x = fnp.concatenate((base, -base), axis=0)
+        x = x - fnp.mean(x, axis=0)
+
+        cov = (x.T @ x) / float(n_samples)
+        vals, vecs = fnp.linalg.eigh(cov)
+        inv_sqrt = vecs @ (fnp.diag(1.0 / fnp.sqrt(fnp.maximum(vals, 1e-12))) @ vecs.T)
+        x = x @ inv_sqrt
+
+        for i, w in enumerate(mlp.weights[:-1]):
+            x = fnp.maximum(x @ w, 0.0)
+
+            if i == 0:
+                xc = x - fnp.mean(x, axis=0)
+                xv = fnp.maximum(fnp.mean(xc * xc, axis=0), 1e-12)
+                xm = xc * fnp.sqrt(fnp.maximum(diag_vars[i], 1e-12) / xv) + diag_rows[i]
+                x = -0.5 * x + 1.5 * xm
+            elif i == 1:
+                xc = x - fnp.mean(x, axis=0)
+                xv = fnp.maximum(fnp.mean(xc * xc, axis=0), 1e-12)
+                xm = xc * fnp.sqrt(fnp.maximum(diag_vars[i], 1e-12) / xv) + diag_rows[i]
+                x = 0.83 * x + 0.17 * xm
+            elif i == 3:
+                xc = x - fnp.mean(x, axis=0)
+                xv = fnp.maximum(fnp.mean(xc * xc, axis=0), 1e-12)
+                xm = xc * fnp.sqrt(fnp.maximum(diag_vars[i], 1e-12) / xv) + diag_rows[i]
+                x = 1.035 * x - 0.035 * xm
+
+        z = x @ mlp.weights[-1]
+
+        final_mc = fnp.asarray(fnp.mean(fnp.maximum(z, 0.0), axis=0), dtype=fnp.float32)
+
+        z_mu = fnp.mean(z, axis=0)
+        zc = z - z_mu
+        z_sigma = fnp.sqrt(fnp.maximum(fnp.mean(zc * zc, axis=0), 1e-12))
+        z_alpha = z_mu / z_sigma
+        final_norm = fnp.asarray(
+            z_mu * flops.stats.norm.cdf(z_alpha) + z_sigma * flops.stats.norm.pdf(z_alpha),
+            dtype=fnp.float32,
+        )
+
+        diag = fnp.asarray(fnp.stack(diag_rows, axis=0), dtype=fnp.float32)
+        final_pred = fnp.asarray(
+            0.955 * final_mc + 0.04 * final_norm + 0.005 * diag[-1],
+            dtype=fnp.float32,
+        )
+
+        return fnp.asarray(
+            fnp.concatenate((diag[:-1], final_pred[None, :]), axis=0),
+            dtype=fnp.float32,
+        )
+```
+tokens used
+5,736

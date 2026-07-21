@@ -1,0 +1,101 @@
+```python
+from __future__ import annotations
+
+import flopscope as flops
+import flopscope.numpy as fnp
+from whestbench import BaseEstimator
+
+
+class Estimator(BaseEstimator):
+    def predict(self, mlp, budget):
+        width = int(mlp.width)
+        depth = int(mlp.depth)
+
+        mu = fnp.zeros(width)
+        var = fnp.ones(width)
+        rows = []
+        vars_ = []
+
+        for w in mlp.weights:
+            mu_pre = w.T @ mu
+            var_pre = fnp.maximum((w * w).T @ var, 1e-12)
+            sig = fnp.sqrt(var_pre)
+            a = mu_pre / sig
+            p = flops.stats.norm.pdf(a)
+            c = flops.stats.norm.cdf(a)
+
+            mu = mu_pre * c + sig * p
+            ez2 = (mu_pre * mu_pre + var_pre) * c + mu_pre * sig * p
+            var = fnp.maximum(ez2 - mu * mu, 0.0)
+
+            rows.append(mu)
+            vars_.append(var)
+
+        diag = fnp.asarray(fnp.stack(rows, axis=0), dtype=fnp.float32)
+        diag_vars = fnp.stack(vars_, axis=0)
+
+        if depth <= 1:
+            return diag
+
+        rng = fnp.random.default_rng(int(mlp.seed))
+
+        if budget is None:
+            n = 4096
+        else:
+            per = max(1, depth * (2 * width * width + 4 * width))
+            n = int(0.085 * float(budget) / float(per))
+            n = max(768, min(8192, n))
+
+        n = max(2, 2 * (n // 2))
+        half = n // 2
+
+        base = fnp.asarray(rng.standard_normal((half, width), dtype=fnp.float32))
+        x = fnp.concatenate((base, -base), axis=0)
+        x = x - fnp.mean(x, axis=0)
+
+        cov = (x.T @ x) / float(n)
+        vals, vecs = fnp.linalg.eigh(cov)
+        inv = (vecs * (1.0 / fnp.sqrt(fnp.maximum(vals, 1e-12)))[None, :]) @ vecs.T
+        x = x @ inv
+
+        for i, w in enumerate(mlp.weights[:-1]):
+            x = fnp.maximum(x @ w, 0.0)
+
+            if i == 0:
+                xc = x - fnp.mean(x, axis=0)
+                xv = fnp.maximum(fnp.mean(xc * xc, axis=0), 1e-12)
+                xm = xc * fnp.sqrt(fnp.maximum(diag_vars[i], 1e-12) / xv) + rows[i]
+                x = -0.5 * x + 1.5 * xm
+            elif i == 1:
+                xc = x - fnp.mean(x, axis=0)
+                xv = fnp.maximum(fnp.mean(xc * xc, axis=0), 1e-12)
+                xm = xc * fnp.sqrt(fnp.maximum(diag_vars[i], 1e-12) / xv) + rows[i]
+                x = 0.83 * x + 0.17 * xm
+            elif i == 3:
+                xc = x - fnp.mean(x, axis=0)
+                xv = fnp.maximum(fnp.mean(xc * xc, axis=0), 1e-12)
+                xm = xc * fnp.sqrt(fnp.maximum(diag_vars[i], 1e-12) / xv) + rows[i]
+                x = 1.035 * x - 0.035 * xm
+
+        z = x @ mlp.weights[-1]
+        mc = fnp.asarray(fnp.mean(fnp.maximum(z, 0.0), axis=0), dtype=fnp.float32)
+
+        zm = fnp.mean(z, axis=0)
+        zc = z - zm
+        zs = fnp.sqrt(fnp.maximum(fnp.mean(zc * zc, axis=0), 1e-12))
+        za = zm / zs
+        norm = fnp.asarray(
+            zm * flops.stats.norm.cdf(za) + zs * flops.stats.norm.pdf(za),
+            dtype=fnp.float32,
+        )
+
+        final = fnp.asarray(
+            0.955 * mc + 0.04 * norm + 0.005 * diag[-1],
+            dtype=fnp.float32,
+        )
+
+        return fnp.asarray(
+            fnp.concatenate((diag[:-1], final[None, :]), axis=0),
+            dtype=fnp.float32,
+        )
+```

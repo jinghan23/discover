@@ -1,0 +1,77 @@
+from __future__ import annotations
+
+import flopscope.numpy as fnp
+from whestbench import BaseEstimator
+
+
+_SAMPLE_FRACTION = 0.10
+_FINAL_NORMAL_BLEND = 0.02
+_INV_SQRT_2PI = 0.3989422804014327
+_SQRT_2_OVER_PI = 0.7978845608028654
+_CDF_CUBIC = 0.044715
+_MIN_SAMPLES = 32
+_MAX_SAMPLES = 1_000_000
+_ARRAY_BYTES_LIMIT = 100 * 1024 * 1024
+_WORST_CASE_ITEMSIZE = 8
+
+
+def _sample_count(fraction: float, budget: int, width: int, depth: int) -> int:
+    per_sample = depth * (2 * width * width + width) + width * width
+    fixed = 9 * width**3 + 2 * (2 * width**3)
+    k = (int(fraction * budget) - fixed) // max(per_sample, 1)
+    max_k_by_bytes = _ARRAY_BYTES_LIMIT // max(width * _WORST_CASE_ITEMSIZE, 1)
+    min_k = max(_MIN_SAMPLES, 2 * width + 2)
+    k = int(max(min_k, min(_MAX_SAMPLES, max_k_by_bytes, k)))
+    return k - (k & 1)
+
+
+def _normal_relu_mean(mu, var):
+    var = fnp.maximum(var, 1e-12)
+    sigma = fnp.sqrt(var)
+    alpha = mu / sigma
+    pdf = _INV_SQRT_2PI * fnp.exp(-0.5 * alpha * alpha)
+    cdf = 0.5 * (
+        1.0
+        + fnp.tanh(_SQRT_2_OVER_PI * (alpha + _CDF_CUBIC * alpha * alpha * alpha))
+    )
+    return sigma * pdf + mu * cdf
+
+
+def _estimate_block(mlp, rng, k: int):
+    width = mlp.width
+    u = rng.standard_normal((k // 2, width), dtype=fnp.float32)
+    u = u[:, ::-1]
+    x = fnp.concatenate([u, -u], axis=0)
+
+    covariance = (u.T @ u) / float(k // 2)
+    cholesky = fnp.linalg.cholesky(covariance)
+    folded_first_weight = fnp.linalg.solve(cholesky.T, mlp.weights[0])
+
+    if mlp.depth == 1:
+        z = x @ folded_first_weight
+    else:
+        x = fnp.maximum(x @ folded_first_weight, 0.0)
+        for weight in mlp.weights[1:-1]:
+            x = fnp.maximum(x @ weight, 0.0)
+        z = x @ mlp.weights[-1]
+    sampled_final_mean = fnp.mean(fnp.maximum(z, 0.0), axis=0)
+    mu = fnp.mean(z, axis=0)
+    second = fnp.mean(z * z, axis=0)
+    normal_final_mean = _normal_relu_mean(mu, second - mu * mu)
+    return (
+        (1.0 - _FINAL_NORMAL_BLEND) * sampled_final_mean
+        + _FINAL_NORMAL_BLEND * normal_final_mean
+    )
+
+
+class Estimator(BaseEstimator):
+    def predict(self, mlp, budget):
+        width = mlp.width
+        depth = mlp.depth
+        rng = fnp.random.default_rng(mlp.seed)
+
+        k = _sample_count(_SAMPLE_FRACTION, budget, width, depth)
+        final_mean = _estimate_block(mlp, rng, k)
+
+        zero_rows = fnp.zeros((depth - 1, width), dtype=fnp.float32)
+        return fnp.concatenate([zero_rows, final_mean[None, :]], axis=0)

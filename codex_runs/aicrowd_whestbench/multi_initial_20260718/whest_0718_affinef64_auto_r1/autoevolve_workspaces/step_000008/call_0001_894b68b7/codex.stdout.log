@@ -1,0 +1,169 @@
+```python
+"""Whitened antithetic estimator with a tuned hidden mean correction."""
+
+from __future__ import annotations
+
+import flopscope.numpy as fnp
+from whestbench import BaseEstimator
+
+
+_BUDGET_FRACTION = 0.1714
+_MIN_SAMPLES = 32
+_MAX_SAMPLES = 1_000_000
+_ARRAY_BYTES_LIMIT = 100 * 1024 * 1024
+_WORST_CASE_ITEMSIZE = 8
+_SETUP_SEED_OFFSET = 3
+_FIRST_MEAN_BLEND = 1.240
+
+_INV_SQRT_2PI = 0.3989422804014327
+_CDF_POLY_P = 0.2316419
+_CDF_POLY_B1 = 0.319381530
+_CDF_POLY_B2 = -0.356563782
+_CDF_POLY_B3 = 1.781477937
+_CDF_POLY_B4 = -1.821255978
+_CDF_POLY_B5 = 1.330274429
+
+_HIDDEN_BLEND_START = 2
+_HIDDEN_BLEND_STOP = 12
+_HIDDEN_BLEND_FIRST = -0.150
+_HIDDEN_BLEND_LAST = 0.305
+_HIDDEN_BLEND_STEP = (_HIDDEN_BLEND_LAST - _HIDDEN_BLEND_FIRST) / (
+    _HIDDEN_BLEND_STOP - _HIDDEN_BLEND_START
+)
+_FIRST_HIDDEN_BLEND = 0.180
+_STOP_HIDDEN_BLEND = 0.360
+_POST_RAMP_BLEND = 0.020
+_POST_RAMP2_BLEND = -0.040
+
+
+def _sample_count(budget: int, width: int, depth: int) -> int:
+    per_sample = depth * (2 * width * width + width) + width * width
+    fixed = 9 * width**3 + 2 * (2 * width**3)
+    k = (int(_BUDGET_FRACTION * budget) - fixed) // max(per_sample, 1)
+    max_k_by_bytes = _ARRAY_BYTES_LIMIT // max(width * _WORST_CASE_ITEMSIZE, 1)
+    k = int(max(_MIN_SAMPLES, min(_MAX_SAMPLES, max_k_by_bytes, k)))
+    return k - (k & 1)
+
+
+def _gaussian_relu_mean(mean, variance):
+    std = fnp.sqrt(fnp.maximum(variance, 1e-12))
+    alpha = fnp.clip(mean / std, -8.0, 8.0)
+    density = _INV_SQRT_2PI * fnp.exp(-0.5 * alpha * alpha)
+    abs_alpha = fnp.abs(alpha)
+    t = 1.0 / (1.0 + _CDF_POLY_P * abs_alpha)
+    tail = density * (
+        t
+        * (
+            _CDF_POLY_B1
+            + t
+            * (
+                _CDF_POLY_B2
+                + t
+                * (_CDF_POLY_B3 + t * (_CDF_POLY_B4 + t * _CDF_POLY_B5))
+            )
+        )
+    )
+    cdf = fnp.where(alpha >= 0.0, 1.0 - tail, tail)
+    return std * density + mean * cdf
+
+
+class Estimator(BaseEstimator):
+    def setup(self, context):
+        self._width = int(context.width)
+        self._depth = int(context.depth)
+        self._samples = self._make_samples(
+            self._width,
+            _sample_count(int(context.flop_budget), self._width, self._depth),
+            int(context.seed) + _SETUP_SEED_OFFSET,
+        )
+
+    def _make_samples(self, width, k, seed):
+        rng = fnp.random.default_rng(seed)
+        half_count = k // 2
+        u = rng.standard_normal((half_count, width), dtype=fnp.float32)
+        raw_u = u
+        u = u - fnp.mean(u, axis=0)
+        covariance = (u.T @ u) / float(half_count)
+        eigenvalues, eigenvectors = fnp.linalg.eigh(covariance)
+        eigenvalues = fnp.maximum(eigenvalues, 1e-6)
+        inverse_sqrt = (eigenvectors / fnp.sqrt(eigenvalues)) @ eigenvectors.T
+        whitened = u @ inverse_sqrt
+        raw_radius = fnp.sum(raw_u * raw_u, axis=1)
+        white_radius = fnp.maximum(fnp.sum(whitened * whitened, axis=1), 1e-8)
+        half = fnp.asarray(
+            whitened * fnp.sqrt(raw_radius / white_radius)[:, None],
+            dtype=fnp.float32,
+        )
+        return fnp.concatenate([half, -half], axis=0)
+
+    def predict(self, mlp, budget):
+        width = mlp.width
+        depth = mlp.depth
+        if (
+            not hasattr(self, "_samples")
+            or self._samples.shape[1] != width
+            or getattr(self, "_depth", depth) != depth
+        ):
+            self._samples = self._make_samples(
+                width,
+                _sample_count(budget, width, depth),
+                mlp.seed,
+            )
+            self._depth = depth
+
+        first_weight = mlp.weights[0]
+        first_variance = fnp.sum(first_weight * first_weight, axis=0)
+        first_mean = fnp.sqrt(first_variance) * _INV_SQRT_2PI
+        if depth == 1:
+            zero_rows = fnp.zeros((depth - 1, width), dtype=fnp.float32)
+            return fnp.concatenate([zero_rows, first_mean[None, :]], axis=0)
+
+        target_variance = first_variance * (0.5 - _INV_SQRT_2PI * _INV_SQRT_2PI)
+        x = fnp.maximum(self._samples @ first_weight, 0.0)
+        sample_mean = fnp.mean(x, axis=0)
+        sample_second = fnp.mean(x * x, axis=0)
+        sample_variance = fnp.maximum(sample_second - sample_mean * sample_mean, 1e-6)
+        adjusted_mean = sample_mean + (first_mean - sample_mean) * _FIRST_MEAN_BLEND
+        x = (
+            (x - sample_mean)
+            * fnp.sqrt(target_variance / sample_variance)
+            + adjusted_mean
+        )
+
+        for layer_index, weight in enumerate(mlp.weights[1:-1], start=1):
+            z = x @ weight
+            x = fnp.maximum(z, 0.0)
+            if (
+                1 <= layer_index <= _HIDDEN_BLEND_STOP
+                or layer_index == _HIDDEN_BLEND_STOP + 1
+                or layer_index == _HIDDEN_BLEND_STOP + 2
+            ):
+                x_mean = fnp.mean(x, axis=0)
+                z_mean = fnp.mean(z, axis=0)
+                z_second = fnp.mean(z * z, axis=0)
+                z_variance = fnp.maximum(z_second - z_mean * z_mean, 1e-8)
+                gaussian_mean = _gaussian_relu_mean(z_mean, z_variance)
+                if layer_index == 1:
+                    blend = _FIRST_HIDDEN_BLEND
+                elif layer_index == _HIDDEN_BLEND_STOP:
+                    blend = _STOP_HIDDEN_BLEND
+                elif layer_index == _HIDDEN_BLEND_STOP + 1:
+                    blend = _POST_RAMP_BLEND
+                elif layer_index == _HIDDEN_BLEND_STOP + 2:
+                    blend = _POST_RAMP2_BLEND
+                else:
+                    blend = _HIDDEN_BLEND_FIRST + _HIDDEN_BLEND_STEP * (
+                        layer_index - _HIDDEN_BLEND_START
+                    )
+                x = x + (gaussian_mean - x_mean) * blend
+
+        z = x @ mlp.weights[-1]
+        x = fnp.maximum(z, 0.0)
+        sampled_mean = fnp.asarray(
+            fnp.mean(fnp.asarray(x, dtype=fnp.float64), axis=0),
+            dtype=fnp.float32,
+        )
+        final_mean = sampled_mean
+        zero_rows = fnp.zeros((depth - 1, width), dtype=fnp.float32)
+        return fnp.concatenate([zero_rows, final_mean[None, :]], axis=0)
+```

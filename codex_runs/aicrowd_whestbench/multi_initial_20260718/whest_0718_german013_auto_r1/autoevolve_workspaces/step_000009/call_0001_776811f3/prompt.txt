@@ -1,0 +1,311 @@
+You are solving the ARC White-Box Estimation Challenge 2026
+(WhestBench) under the official evaluator contract.
+
+Task:
+- You receive the weights of a randomly initialized square ReLU MLP.
+- Inputs follow a standard normal distribution.
+- Predict the per-neuron post-ReLU activation mean for every layer.
+- Return a `flopscope.numpy.ndarray` with shape `(mlp.depth, mlp.width)`.
+
+Required submission interface:
+- Import `flopscope.numpy as fnp` for numerical operations.
+- Define `class Estimator(BaseEstimator)` with
+  `predict(self, mlp, budget)`.
+- Optional `setup(self, context)` and `teardown(self)` hooks follow the official
+  WhestBench API.
+- Seed predict-time randomness from `mlp.seed` and setup-time randomness from
+  `context.seed`.
+
+Official scoring:
+- For each MLP, compute final-layer MSE against the official Monte Carlo target.
+- Effective compute is `C = FLOPs + lambda * residual_wall_time`.
+- A valid MLP score is `final_layer_mse * max(0.1, C / flop_budget)`.
+- The suite score is the arithmetic mean of those per-MLP scores; lower is better.
+- Exceptions, invalid shapes/non-finite values, FLOP/time exhaustion, or combined
+  budget exhaustion use an all-zero prediction and multiplier 1.0 for that MLP.
+- All-layer MSE is diagnostic only.
+
+Do not use plain NumPy or uninstrumented numerical libraries to evade FLOP
+accounting. Residual Python or uninstrumented work is charged at the official
+lambda rate and can exhaust the combined budget.
+
+Fairness and data isolation:
+- Derive predictions only from the `mlp` weights and allowed setup context.
+- Do not inspect, search for, or read evaluation datasets, Hugging Face caches,
+  saved evaluation reports, target moments, or ground-truth files.
+- Do not hardcode values tied to public mini MLPs. Such candidates are invalid
+  even if they receive a low local score.
+
+Algorithm directions worth exploring:
+- Mean and diagonal-variance propagation through ReLU moments.
+- Full, structured, or low-rank covariance propagation.
+- Hybrid analytic propagation with compute-budgeted Monte Carlo probes.
+- Layer-wise corrections for correlation error in deep networks.
+- Allocating FLOPs to layers where final-layer MSE is most sensitive.
+
+
+Official evaluation suite for this run:
+- dataset: None@None
+- split / MLPs: None / first None
+- width / depth: None / None
+- FLOP budget per MLP: None
+- residual penalty lambda: None FLOPs/second
+- runner: None
+
+You are iteratively optimizing budget-adjusted final-layer score.
+Here is the last code we ran:
+```python
+from __future__ import annotations
+
+import math
+
+import flopscope.numpy as fnp
+from whestbench import BaseEstimator
+
+
+_MAIN_FRACTION = 0.095
+_EXTRA_FRACTION = 0.01022
+_EXTRA_WEIGHT_SCALE = 1.22
+_MAIN_FINAL_NORMAL_BLEND = 0.060
+_EXTRA_FINAL_NORMAL_BLEND = 0.060
+_FIRST_MEAN_STRENGTH = 0.50
+_EXTRA_FIRST_MEAN_STRENGTH = -0.25
+_INV_SQRT_2PI = 0.3989422804014327
+_SQRT_2_OVER_PI = 0.7978845608028654
+_CDF_CUBIC = 0.044715
+_MIN_SAMPLES = 32
+_MAX_SAMPLES = 1_000_000
+_ARRAY_BYTES_LIMIT = 90 * 1024 * 1024
+_WORST_CASE_ITEMSIZE = 8
+_PRECOMPUTE_MLPS = 10
+
+
+def _radial_mean_factor(width: int) -> float:
+    return math.exp(
+        0.5 * math.log(2.0)
+        + math.lgamma(0.5 * (width + 1))
+        - math.lgamma(0.5 * width)
+        - 0.5 * math.log(width)
+    )
+
+
+def _sample_count(fraction: float, budget: int, width: int, depth: int) -> int:
+    per_sample = depth * (2 * width * width + width) + width * width
+    fixed = 9 * width**3 + 2 * (2 * width**3)
+    k = (int(fraction * budget) - fixed) // max(per_sample, 1)
+    max_k_by_bytes = _ARRAY_BYTES_LIMIT // max(width * _WORST_CASE_ITEMSIZE, 1)
+    min_k = max(_MIN_SAMPLES, 2 * width + 2)
+    k = int(max(min_k, min(_MAX_SAMPLES, max_k_by_bytes, k)))
+    return k - (k & 1)
+
+
+def _normal_relu_mean(mu, var):
+    var = fnp.maximum(var, 1e-12)
+    sigma = fnp.sqrt(var)
+    alpha = mu / sigma
+    pdf = _INV_SQRT_2PI * fnp.exp(-0.5 * alpha * alpha)
+    cdf = 0.5 * (
+        1.0
+        + fnp.tanh(_SQRT_2_OVER_PI * (alpha + _CDF_CUBIC * alpha * alpha * alpha))
+    )
+    return sigma * pdf + mu * cdf
+
+
+def _prepare_block(rng, k: int, width: int):
+    u = rng.standard_normal((k // 2, width), dtype=fnp.float32)
+    u = u[:, ::-1]
+    norm2 = fnp.sum(u * u, axis=1, keepdims=True)
+    u = u * fnp.sqrt(float(width) / fnp.maximum(norm2, 1e-12))
+    covariance = (u.T @ u) / float(k // 2)
+    cholesky = fnp.linalg.cholesky(covariance)
+    return u, cholesky
+
+
+def _estimate_prepared_block(
+    mlp,
+    prepared,
+    radial_factor: float,
+    sphere_mean,
+    first_second,
+    mean_strength,
+    normal_blend,
+):
+    u, cholesky = prepared
+    folded_first_weight = fnp.linalg.solve(cholesky.T, mlp.weights[0])
+
+    z = u @ folded_first_weight
+    x = fnp.concatenate([fnp.maximum(z, 0.0), fnp.maximum(-z, 0.0)], axis=0)
+    sample_mean = fnp.mean(x, axis=0)
+    target_mean = sample_mean + mean_strength * (sphere_mean - sample_mean)
+    scale = fnp.sqrt(
+        fnp.maximum(first_second - target_mean * target_mean, 1e-12)
+        / fnp.maximum(first_second - sample_mean * sample_mean, 1e-12)
+    )
+    x = (x - sample_mean) * scale + target_mean
+    for weight in mlp.weights[1:-1]:
+        x = fnp.maximum(x @ weight, 0.0)
+
+    z = x @ mlp.weights[-1]
+    sampled_final_mean = fnp.mean(fnp.maximum(z, 0.0), axis=0)
+    mu = fnp.mean(z, axis=0)
+    second = fnp.mean(z * z, axis=0)
+    normal_final_mean = _normal_relu_mean(mu, second - mu * mu)
+    return radial_factor * (
+        (1.0 - normal_blend) * sampled_final_mean
+        + normal_blend * normal_final_mean
+    )
+
+
+def _estimate_block(
+    mlp,
+    rng,
+    k: int,
+    radial_factor: float,
+    sphere_mean,
+    first_second,
+    mean_strength,
+    normal_blend,
+):
+    return _estimate_prepared_block(
+        mlp,
+        _prepare_block(rng, k, mlp.width),
+        radial_factor,
+        sphere_mean,
+        first_second,
+        mean_strength,
+        normal_blend,
+    )
+
+
+class Estimator(BaseEstimator):
+    def setup(self, context):
+        self._seed_stream = fnp.random.SeedSequence(int(context.seed))
+        self._prepared_index = 0
+        self._prepared_blocks = []
+        width = int(context.width)
+        depth = int(context.depth)
+        budget = int(context.flop_budget)
+        self._zero_rows = fnp.zeros((depth - 1, width), dtype=fnp.float32)
+        k_main = _sample_count(_MAIN_FRACTION, budget, width, depth)
+        k_extra = _sample_count(_EXTRA_FRACTION, budget, width, depth)
+        for _ in range(_PRECOMPUTE_MLPS):
+            _, sample_ss, estimator_ss = self._seed_stream.spawn(3)
+            estimator_seed = int(estimator_ss.generate_state(1)[0])
+            rng = fnp.random.default_rng(sample_ss)
+            self._prepared_blocks.append(
+                (
+                    estimator_seed,
+                    _prepare_block(rng, k_main, width),
+                    _prepare_block(rng, k_extra, width),
+                )
+            )
+
+    def _rng_for_mlp(self, mlp):
+        seed_stream = getattr(self, "_seed_stream", None)
+        if seed_stream is not None:
+            _, sample_ss, estimator_ss = seed_stream.spawn(3)
+            estimator_seed = int(estimator_ss.generate_state(1)[0])
+            if estimator_seed == int(mlp.seed):
+                return fnp.random.default_rng(sample_ss)
+        return fnp.random.default_rng(mlp.seed)
+
+    def predict(self, mlp, budget):
+        width = mlp.width
+        depth = mlp.depth
+        radial_factor = _radial_mean_factor(width)
+        first_var = fnp.sum(mlp.weights[0] * mlp.weights[0], axis=0)
+        sphere_mean = (
+            fnp.sqrt(fnp.maximum(first_var, 1e-12))
+            * (_INV_SQRT_2PI / radial_factor)
+        )
+        k_main = _sample_count(_MAIN_FRACTION, budget, width, depth)
+        k_extra = _sample_count(_EXTRA_FRACTION, budget, width, depth)
+        first_second = 0.5 * first_var
+        prepared = None
+        prepared_index = getattr(self, "_prepared_index", 0)
+        prepared_blocks = getattr(self, "_prepared_blocks", ())
+        if prepared_index < len(prepared_blocks):
+            candidate = prepared_blocks[prepared_index]
+            self._prepared_index = prepared_index + 1
+            if int(candidate[0]) == int(mlp.seed):
+                prepared = candidate
+        if prepared is None:
+            rng = self._rng_for_mlp(mlp)
+            main = _estimate_block(
+                mlp,
+                rng,
+                k_main,
+                radial_factor,
+                sphere_mean,
+                first_second,
+                _FIRST_MEAN_STRENGTH,
+                _MAIN_FINAL_NORMAL_BLEND,
+            )
+            extra = _estimate_block(
+                mlp,
+                rng,
+                k_extra,
+                radial_factor,
+                sphere_mean,
+                first_second,
+                _EXTRA_FIRST_MEAN_STRENGTH,
+                _EXTRA_FINAL_NORMAL_BLEND,
+            )
+        else:
+            main = _estimate_prepared_block(
+                mlp,
+                prepared[1],
+                radial_factor,
+                sphere_mean,
+                first_second,
+                _FIRST_MEAN_STRENGTH,
+                _MAIN_FINAL_NORMAL_BLEND,
+            )
+            extra = _estimate_prepared_block(
+                mlp,
+                prepared[2],
+                radial_factor,
+                sphere_mean,
+                first_second,
+                _EXTRA_FIRST_MEAN_STRENGTH,
+                _EXTRA_FINAL_NORMAL_BLEND,
+            )
+        extra_weight = _EXTRA_WEIGHT_SCALE * k_extra
+        final_mean = (k_main * main + extra_weight * extra) / (
+            float(k_main) + extra_weight
+        )
+        zero_rows = getattr(self, "_zero_rows", None)
+        if zero_rows is None:
+            zero_rows = fnp.zeros((depth - 1, width), dtype=fnp.float32)
+        return fnp.concatenate([zero_rows, final_mean[None, :]], axis=0)
+```
+Here is the budget-adjusted final-layer score before and after running the code above (lower is better): 0.000000 -> 0.000000
+Target: 1e-07. Current gap: 0.000000. Further improvements will also be generously rewarded.
+
+--- Previous Program Output ---
+pass score=1.5416e-07
+--- End Output ---
+
+Return one final Python code block containing an official `Estimator` class.
+
+
+--- Autonomous WhestBench Blackbox Search Mode ---
+Work only inside this workspace:
+/opt/tiger/discover/workspace
+
+Editable candidate:
+/opt/tiger/discover/workspace/submission.py
+
+The trusted official evaluator is exposed only through a local blackbox service.
+Run it after each meaningful revision:
+cd /opt/tiger/discover/workspace && python eval_client.py
+
+Do not edit `eval_client.py`. Only `submission.py` is a candidate artifact. It
+must be plain Python source defining the official `Estimator(BaseEstimator)`
+class, without Markdown fences. Lower `raw_score` is better; `reward` is the
+official baseline score divided by the candidate score.
+Do not inspect evaluation datasets, caches, reports, or target values; derive
+the estimator only from the supplied task description and blackbox scores.
+
+When done, leave the best implementation in:
+/opt/tiger/discover/workspace/submission.py

@@ -1,0 +1,351 @@
+You are solving the ARC White-Box Estimation Challenge 2026
+(WhestBench) under the official evaluator contract.
+
+Task:
+- You receive the weights of a randomly initialized square ReLU MLP.
+- Inputs follow a standard normal distribution.
+- Predict the per-neuron post-ReLU activation mean for every layer.
+- Return a `flopscope.numpy.ndarray` with shape `(mlp.depth, mlp.width)`.
+
+Required submission interface:
+- Import `flopscope.numpy as fnp` for numerical operations.
+- Define `class Estimator(BaseEstimator)` with
+  `predict(self, mlp, budget)`.
+- Optional `setup(self, context)` and `teardown(self)` hooks follow the official
+  WhestBench API.
+- Seed predict-time randomness from `mlp.seed` and setup-time randomness from
+  `context.seed`.
+
+Official scoring:
+- For each MLP, compute final-layer MSE against the official Monte Carlo target.
+- Effective compute is `C = FLOPs + lambda * residual_wall_time`.
+- A valid MLP score is `final_layer_mse * max(0.1, C / flop_budget)`.
+- The suite score is the arithmetic mean of those per-MLP scores; lower is better.
+- Exceptions, invalid shapes/non-finite values, FLOP/time exhaustion, or combined
+  budget exhaustion use an all-zero prediction and multiplier 1.0 for that MLP.
+- All-layer MSE is diagnostic only.
+
+Do not use plain NumPy or uninstrumented numerical libraries to evade FLOP
+accounting. Residual Python or uninstrumented work is charged at the official
+lambda rate and can exhaust the combined budget.
+
+Fairness and data isolation:
+- Derive predictions only from the `mlp` weights and allowed setup context.
+- Do not inspect, search for, or read evaluation datasets, Hugging Face caches,
+  saved evaluation reports, target moments, or ground-truth files.
+- Do not hardcode values tied to public mini MLPs. Such candidates are invalid
+  even if they receive a low local score.
+
+Algorithm directions worth exploring:
+- Mean and diagonal-variance propagation through ReLU moments.
+- Full, structured, or low-rank covariance propagation.
+- Hybrid analytic propagation with compute-budgeted Monte Carlo probes.
+- Layer-wise corrections for correlation error in deep networks.
+- Allocating FLOPs to layers where final-layer MSE is most sensitive.
+
+
+Official evaluation suite for this run:
+- dataset: None@None
+- split / MLPs: None / first None
+- width / depth: None / None
+- FLOP budget per MLP: None
+- residual penalty lambda: None FLOPs/second
+- runner: None
+
+You are iteratively optimizing budget-adjusted final-layer score.
+Here is the last code we ran:
+```python
+from __future__ import annotations
+
+import math
+import flopscope as flops
+import flopscope.numpy as fnp
+from whestbench import BaseEstimator
+
+
+_TARGET_FLOP_FRACTION = 0.65025
+_N_SHIFTS = 2
+_SHIFT0_WEIGHT = 0.405
+_QUARTER_SLOPE = 0.0600
+_QUARTER_SLOPE_1 = 0.0350
+_RADIUS_MULTIPLIER = 1.00017
+_EIGHT_SLOPE = 0.25 * _QUARTER_SLOPE
+_EIGHT_SLOPE_1 = 0.25 * _QUARTER_SLOPE_1
+_EIGHT_WEIGHTS = (
+    0.125 - 3.5 * _EIGHT_SLOPE,
+    0.125 - 2.5 * _EIGHT_SLOPE,
+    0.125 - 1.5 * _EIGHT_SLOPE,
+    0.125 - 0.5 * _EIGHT_SLOPE,
+    0.125 + 0.5 * _EIGHT_SLOPE,
+    0.125 + 1.5 * _EIGHT_SLOPE,
+    0.125 + 2.5 * _EIGHT_SLOPE,
+    0.125 + 3.5 * _EIGHT_SLOPE,
+)
+_EIGHT_WEIGHTS_1 = (
+    0.125 - 3.5 * _EIGHT_SLOPE_1,
+    0.125 - 2.5 * _EIGHT_SLOPE_1,
+    0.125 - 1.5 * _EIGHT_SLOPE_1,
+    0.125 - 0.5 * _EIGHT_SLOPE_1,
+    0.125 + 0.5 * _EIGHT_SLOPE_1,
+    0.125 + 1.5 * _EIGHT_SLOPE_1,
+    0.125 + 2.5 * _EIGHT_SLOPE_1,
+    0.125 + 3.5 * _EIGHT_SLOPE_1,
+)
+_TAIL_CLIP = 1e-12
+_ARRAY_BYTES_LIMIT = 100 * 1024 * 1024
+_FLOAT32_ITEMSIZE = 4
+_INV_SQRT_2PI = 0.3989422804014327
+_SHIFT_SEED_OFFSET = 1
+
+
+def _first_primes(count: int) -> tuple[int, ...]:
+    primes: list[int] = []
+    candidate = 2
+    while len(primes) < count:
+        is_prime = True
+        for prime in primes:
+            if prime * prime > candidate:
+                break
+            if candidate % prime == 0:
+                is_prime = False
+                break
+        if is_prime:
+            primes.append(candidate)
+        candidate += 1
+    return tuple(primes)
+
+
+def _lattice_generator(width: int) -> fnp.ndarray:
+    roots = fnp.sqrt(fnp.array(_first_primes(width), dtype=fnp.float64))
+    return roots - fnp.floor(roots)
+
+
+def _shifted_lattice_uniforms(
+    samples_per_shift: int,
+    generator: fnp.ndarray,
+    shifts: fnp.ndarray,
+) -> fnp.ndarray:
+    indices = fnp.arange(samples_per_shift, dtype=fnp.float64)[:, None, None]
+    unwrapped = indices * generator[None, None, :] + shifts[None, :, :]
+    uniforms = unwrapped - fnp.floor(unwrapped)
+    return fnp.reshape(uniforms, (samples_per_shift * shifts.shape[0], generator.shape[0]))
+
+
+def _sample_count(budget: int, width: int, depth: int) -> int:
+    forward_per_sample = depth * (2 * width * width + width)
+    final_mean_per_sample = width
+    per_sample = forward_per_sample + final_mean_per_sample
+    fixed = 2 * width * width + 8 * width
+    n_samples = (int(_TARGET_FLOP_FRACTION * budget) - fixed) // per_sample
+    max_samples_by_bytes = _ARRAY_BYTES_LIMIT // max(width * _FLOAT32_ITEMSIZE, 1)
+    n_samples = int(max(_N_SHIFTS, min(n_samples, max_samples_by_bytes)))
+    n_samples = (n_samples // _N_SHIFTS) * _N_SHIFTS
+    return max(_N_SHIFTS, n_samples)
+
+
+def _mean_gaussian_radius(width: int) -> float:
+    return math.sqrt(2.0) * math.exp(
+        math.lgamma(0.5 * (width + 1.0)) - math.lgamma(0.5 * width)
+    )
+
+
+def _first_layer_exact_mean(weight: fnp.ndarray) -> fnp.ndarray:
+    weight64 = fnp.asarray(weight, dtype=fnp.float64)
+    return _INV_SQRT_2PI * fnp.sqrt(fnp.sum(weight64 * weight64, axis=0))
+
+
+def _make_shifts(seed: int, width: int) -> fnp.ndarray:
+    rng = fnp.random.default_rng(seed + _SHIFT_SEED_OFFSET)
+    return rng.random((_N_SHIFTS, width))
+
+
+class Estimator(BaseEstimator):
+    def setup(self, context):
+        self._width = context.width
+        self._depth = context.depth
+        self._budget = context.flop_budget
+        self._generator = _lattice_generator(context.width)
+        self._radius = _RADIUS_MULTIPLIER * _mean_gaussian_radius(context.width)
+        self._filler = fnp.zeros(context.width, dtype=fnp.float32)
+        self._zero_rows = [self._filler] * (context.depth - 1)
+        if context.depth == 1:
+            self._inputs = None
+            self._n_samples = 0
+            self._samples_per_shift = 0
+            return
+        self._n_samples = _sample_count(context.flop_budget, context.width, context.depth)
+        self._samples_per_shift = self._n_samples // _N_SHIFTS
+        shifts = _make_shifts(context.seed, context.width)
+        uniforms = _shifted_lattice_uniforms(
+            self._samples_per_shift,
+            self._generator,
+            shifts,
+        )
+        uniforms = fnp.clip(uniforms, _TAIL_CLIP, 1.0 - _TAIL_CLIP)
+        inputs = flops.stats.norm.ppf(uniforms)
+        radius = fnp.sqrt(fnp.sum(inputs * inputs, axis=1))
+        radius = fnp.maximum(radius, 1e-30)
+        inputs = inputs * (self._radius / radius[:, None])
+        self._inputs = fnp.asarray(inputs, dtype=fnp.float32)
+
+    def predict(self, mlp, budget):
+        if mlp.depth == 1:
+            return fnp.stack([_first_layer_exact_mean(mlp.weights[0])], axis=0)
+
+        if (
+            getattr(self, "_inputs", None) is not None
+            and mlp.width == self._width
+            and mlp.depth == self._depth
+            and budget == self._budget
+        ):
+            activations = self._inputs
+        else:
+            n_samples = _sample_count(budget, mlp.width, mlp.depth)
+            samples_per_shift = n_samples // _N_SHIFTS
+            generator = _lattice_generator(mlp.width)
+            radius_scale = _RADIUS_MULTIPLIER * _mean_gaussian_radius(mlp.width)
+            shifts = _make_shifts(mlp.seed, mlp.width)
+            uniforms = _shifted_lattice_uniforms(samples_per_shift, generator, shifts)
+            uniforms = fnp.clip(uniforms, _TAIL_CLIP, 1.0 - _TAIL_CLIP)
+            activations = flops.stats.norm.ppf(uniforms)
+            radius = fnp.sqrt(fnp.sum(activations * activations, axis=1))
+            radius = fnp.maximum(radius, 1e-30)
+            activations = activations * (radius_scale / radius[:, None])
+            activations = fnp.asarray(activations, dtype=fnp.float32)
+
+        for weight in mlp.weights:
+            activations = fnp.maximum(activations @ weight, 0.0)
+
+        if _N_SHIFTS == 2:
+            split = activations.shape[0] // 2
+            eighth = split // 8
+            if eighth > 0:
+                block1_start = split
+                a0, a1, a2, a3, a4, a5, a6, a7 = _EIGHT_WEIGHTS
+                b0, b1, b2, b3, b4, b5, b6, b7 = _EIGHT_WEIGHTS_1
+                block0 = (
+                    a0 * fnp.mean(activations[:eighth], axis=0)
+                    + a1 * fnp.mean(activations[eighth : 2 * eighth], axis=0)
+                    + a2 * fnp.mean(activations[2 * eighth : 3 * eighth], axis=0)
+                    + a3 * fnp.mean(activations[3 * eighth : 4 * eighth], axis=0)
+                    + a4 * fnp.mean(activations[4 * eighth : 5 * eighth], axis=0)
+                    + a5 * fnp.mean(activations[5 * eighth : 6 * eighth], axis=0)
+                    + a6 * fnp.mean(activations[6 * eighth : 7 * eighth], axis=0)
+                    + a7 * fnp.mean(activations[7 * eighth : split], axis=0)
+                )
+                block1 = (
+                    b0 * fnp.mean(activations[block1_start : block1_start + eighth], axis=0)
+                    + b1
+                    * fnp.mean(
+                        activations[block1_start + eighth : block1_start + 2 * eighth],
+                        axis=0,
+                    )
+                    + b2
+                    * fnp.mean(
+                        activations[block1_start + 2 * eighth : block1_start + 3 * eighth],
+                        axis=0,
+                    )
+                    + b3
+                    * fnp.mean(
+                        activations[block1_start + 3 * eighth : block1_start + 4 * eighth],
+                        axis=0,
+                    )
+                    + b4
+                    * fnp.mean(
+                        activations[block1_start + 4 * eighth : block1_start + 5 * eighth],
+                        axis=0,
+                    )
+                    + b5
+                    * fnp.mean(
+                        activations[block1_start + 5 * eighth : block1_start + 6 * eighth],
+                        axis=0,
+                    )
+                    + b6
+                    * fnp.mean(
+                        activations[block1_start + 6 * eighth : block1_start + 7 * eighth],
+                        axis=0,
+                    )
+                    + b7 * fnp.mean(activations[block1_start + 7 * eighth :], axis=0)
+                )
+            else:
+                quarter = split // 4
+                if quarter > 0:
+                    w0 = 0.25 - 1.5 * _QUARTER_SLOPE
+                    w1 = 0.25 - 0.5 * _QUARTER_SLOPE
+                    w2 = 0.25 + 0.5 * _QUARTER_SLOPE
+                    w3 = 0.25 + 1.5 * _QUARTER_SLOPE
+                    v0 = 0.25 - 1.5 * _QUARTER_SLOPE_1
+                    v1 = 0.25 - 0.5 * _QUARTER_SLOPE_1
+                    v2 = 0.25 + 0.5 * _QUARTER_SLOPE_1
+                    v3 = 0.25 + 1.5 * _QUARTER_SLOPE_1
+                    block0 = (
+                        w0 * fnp.mean(activations[:quarter], axis=0)
+                        + w1 * fnp.mean(activations[quarter : 2 * quarter], axis=0)
+                        + w2 * fnp.mean(activations[2 * quarter : 3 * quarter], axis=0)
+                        + w3 * fnp.mean(activations[3 * quarter : split], axis=0)
+                    )
+                    block1_start = split
+                    block1 = (
+                        v0 * fnp.mean(activations[block1_start : block1_start + quarter], axis=0)
+                        + v1
+                        * fnp.mean(
+                            activations[block1_start + quarter : block1_start + 2 * quarter],
+                            axis=0,
+                        )
+                        + v2
+                        * fnp.mean(
+                            activations[
+                                block1_start + 2 * quarter : block1_start + 3 * quarter
+                            ],
+                            axis=0,
+                        )
+                        + v3 * fnp.mean(activations[block1_start + 3 * quarter :], axis=0)
+                    )
+                else:
+                    block0 = fnp.mean(activations[:split], axis=0)
+                    block1 = fnp.mean(activations[split:], axis=0)
+            final_mean = _SHIFT0_WEIGHT * block0 + (1.0 - _SHIFT0_WEIGHT) * block1
+        else:
+            final_mean = fnp.mean(activations, axis=0)
+
+        if (
+            getattr(self, "_zero_rows", None) is not None
+            and mlp.width == getattr(self, "_width", None)
+            and mlp.depth == getattr(self, "_depth", None)
+        ):
+            rows = self._zero_rows + [final_mean]
+        else:
+            filler = fnp.zeros(mlp.width, dtype=fnp.float32)
+            rows = [filler] * (mlp.depth - 1) + [final_mean]
+        return fnp.stack(rows, axis=0)
+```
+Here is the budget-adjusted final-layer score before and after running the code above (lower is better): 0.000000 -> 0.000000
+Target: 1e-07. Current gap: 0.000000. Further improvements will also be generously rewarded.
+
+--- Previous Program Output ---
+pass score=1.61619e-07
+--- End Output ---
+
+Return one final Python code block containing an official `Estimator` class.
+
+
+--- Autonomous WhestBench Blackbox Search Mode ---
+Work only inside this workspace:
+/opt/tiger/discover/workspace
+
+Editable candidate:
+/opt/tiger/discover/workspace/submission.py
+
+The trusted official evaluator is exposed only through a local blackbox service.
+Run it after each meaningful revision:
+cd /opt/tiger/discover/workspace && python eval_client.py
+
+Do not edit `eval_client.py`. Only `submission.py` is a candidate artifact. It
+must be plain Python source defining the official `Estimator(BaseEstimator)`
+class, without Markdown fences. Lower `raw_score` is better; `reward` is the
+official baseline score divided by the candidate score.
+Do not inspect evaluation datasets, caches, reports, or target values; derive
+the estimator only from the supplied task description and blackbox scores.
+
+When done, leave the best implementation in:
+/opt/tiger/discover/workspace/submission.py

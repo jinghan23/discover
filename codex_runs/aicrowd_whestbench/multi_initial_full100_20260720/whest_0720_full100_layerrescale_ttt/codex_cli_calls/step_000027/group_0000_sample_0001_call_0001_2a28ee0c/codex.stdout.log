@@ -1,0 +1,140 @@
+```python
+from __future__ import annotations
+
+import flopscope as flops
+import flopscope.numpy as fnp
+from whestbench import BaseEstimator
+
+
+class Estimator(BaseEstimator):
+    def _clip_corr(self, corr):
+        return fnp.maximum(fnp.minimum(corr, 0.9995), -0.9995)
+
+    def _stabilize_cov(self, cov, eye, eps=1e-12):
+        cov = 0.5 * (cov + cov.T)
+        var = fnp.maximum(fnp.diag(cov), eps)
+        scale = fnp.sqrt(var[:, None] * var[None, :])
+        cov = fnp.maximum(fnp.minimum(cov, 0.9995 * scale), -0.9995 * scale)
+        return cov * (1.0 - eye) + var[:, None] * eye
+
+    def _relu_zero_mean(self, cov, eye):
+        inv_sqrt_2pi = 0.3989422804014327
+        inv_2pi = 0.15915494309189535
+        pi = 3.141592653589793
+
+        var = fnp.maximum(fnp.diag(cov), 1e-12)
+        sigma = fnp.sqrt(var)
+        denom = sigma[:, None] * sigma[None, :]
+        rho = self._clip_corr(cov / fnp.maximum(denom, 1e-12))
+
+        mu = sigma * inv_sqrt_2pi
+        second = denom * (
+            fnp.sqrt(fnp.maximum(1.0 - rho * rho, 0.0))
+            + (pi - fnp.arccos(rho)) * rho
+        ) * inv_2pi
+
+        e2 = 0.5 * var
+        second = second * (1.0 - eye) + e2[:, None] * eye
+        out = second - mu[:, None] * mu[None, :]
+        return mu, self._stabilize_cov(out, eye)
+
+    def _relu_general(self, pre_mu, pre_cov, eye):
+        gh_x = fnp.asarray(
+            [
+                -5.387480890011233,
+                -4.603682449550744,
+                -3.944764040115625,
+                -3.347854567383216,
+                -2.788806058428130,
+                -2.254974002089275,
+                -1.738537712116586,
+                -1.234076215395323,
+                -0.737473728545394,
+                -0.245340708300901,
+                0.245340708300901,
+                0.737473728545394,
+                1.234076215395323,
+                1.738537712116586,
+                2.254974002089275,
+                2.788806058428130,
+                3.347854567383216,
+                3.944764040115625,
+                4.603682449550744,
+                5.387480890011233,
+            ]
+        )
+        gh_w = fnp.asarray(
+            [
+                2.229393645534151e-13,
+                4.399340992273174e-10,
+                1.086069370769281e-07,
+                7.802556478532063e-06,
+                2.283386360163539e-04,
+                3.243773342237861e-03,
+                2.481052088746359e-02,
+                1.090172060200233e-01,
+                2.866755053628341e-01,
+                4.622436696006101e-01,
+                4.622436696006101e-01,
+                2.866755053628341e-01,
+                1.090172060200233e-01,
+                2.481052088746359e-02,
+                3.243773342237861e-03,
+                2.283386360163539e-04,
+                7.802556478532063e-06,
+                1.086069370769281e-07,
+                4.399340992273174e-10,
+                2.229393645534151e-13,
+            ]
+        )
+
+        sqrt2 = 1.4142135623730951
+        inv_sqrt_pi = 0.5641895835477563
+
+        var = fnp.maximum(fnp.diag(pre_cov), 1e-12)
+        sigma = fnp.sqrt(var)
+        alpha = pre_mu / sigma
+
+        mu = pre_mu * flops.stats.norm.cdf(alpha) + sigma * flops.stats.norm.pdf(alpha)
+        e2 = (pre_mu * pre_mu + var) * flops.stats.norm.cdf(alpha) + pre_mu * sigma * flops.stats.norm.pdf(alpha)
+
+        denom = sigma[:, None] * sigma[None, :]
+        rho = self._clip_corr(pre_cov / fnp.maximum(denom, 1e-12))
+        cond_std = sigma[:, None] * fnp.sqrt(fnp.maximum(1.0 - rho * rho, 1e-10))
+
+        second = fnp.zeros(pre_cov.shape)
+        for k in range(20):
+            t = sqrt2 * gh_x[k]
+            y_pos = fnp.maximum(pre_mu[None, :] + sigma[None, :] * t, 0.0)
+            cond_mu = pre_mu[:, None] + sigma[:, None] * rho * t
+            a = cond_mu / cond_std
+            ex = cond_mu * flops.stats.norm.cdf(a) + cond_std * flops.stats.norm.pdf(a)
+            second = second + (gh_w[k] * inv_sqrt_pi) * ex * y_pos
+
+        second = 0.5 * (second + second.T)
+        second = second * (1.0 - eye) + e2[:, None] * eye
+
+        out = second - mu[:, None] * mu[None, :]
+        return mu, self._stabilize_cov(out, eye)
+
+    def predict(self, mlp, budget):
+        width = int(mlp.width)
+        eye = fnp.eye(width)
+
+        mu = fnp.zeros(width)
+        cov = eye
+        rows = []
+
+        for layer, w in enumerate(mlp.weights):
+            pre_mu = w.T @ mu
+            pre_cov = self._stabilize_cov(w.T @ cov @ w, eye)
+
+            if layer == 0:
+                mu, cov = self._relu_zero_mean(pre_cov, eye)
+            else:
+                mu, cov = self._relu_general(pre_mu, pre_cov, eye)
+
+            rows.append(mu)
+
+        return fnp.asarray(fnp.stack(rows, axis=0), dtype=fnp.float32)
+```

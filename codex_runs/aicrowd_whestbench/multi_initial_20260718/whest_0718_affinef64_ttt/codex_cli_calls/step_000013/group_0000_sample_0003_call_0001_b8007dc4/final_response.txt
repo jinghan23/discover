@@ -1,0 +1,99 @@
+```python
+from __future__ import annotations
+
+import flopscope.numpy as fnp
+from whestbench import BaseEstimator
+
+
+_BUDGET_FRACTION = 0.152
+_MIN_SAMPLES = 32
+_MAX_SAMPLES = 1_000_000
+_ARRAY_BYTES_LIMIT = 110 * 1024 * 1024
+_WORST_CASE_ITEMSIZE = 8
+_SETUP_SEED_OFFSET = 3
+
+_INV_SQRT_2PI = 0.3989422804014327
+_RELU_VAR_FACTOR = 0.5 - _INV_SQRT_2PI * _INV_SQRT_2PI
+_EPS = 1e-6
+
+
+def _sample_count(budget: int, width: int, depth: int) -> int:
+    per_sample = depth * (2 * width * width + width) + width * width
+    fixed = 14 * width**3 + 12 * width * width
+    k = (int(_BUDGET_FRACTION * budget) - fixed) // max(per_sample, 1)
+    max_k_by_bytes = _ARRAY_BYTES_LIMIT // max(width * _WORST_CASE_ITEMSIZE, 1)
+    k = int(max(_MIN_SAMPLES, min(_MAX_SAMPLES, max_k_by_bytes, k)))
+    return k - (k & 1)
+
+
+class Estimator(BaseEstimator):
+    def setup(self, context):
+        self._width = int(context.width)
+        self._depth = int(context.depth)
+        self._samples = self._make_samples(
+            self._width,
+            _sample_count(int(context.flop_budget), self._width, self._depth),
+            int(context.seed) + _SETUP_SEED_OFFSET,
+        )
+
+    def teardown(self):
+        pass
+
+    def _make_samples(self, width, k, seed):
+        rng = fnp.random.default_rng(seed)
+        half_k = max(1, k // 2)
+        u = rng.standard_normal((half_k, width), dtype=fnp.float32)
+
+        covariance = (u.T @ u) / float(half_k)
+        eigenvalues, eigenvectors = fnp.linalg.eigh(covariance)
+        eigenvalues = fnp.maximum(eigenvalues, _EPS)
+        inverse_sqrt = (eigenvectors / fnp.sqrt(eigenvalues)) @ eigenvectors.T
+
+        half = fnp.asarray(u @ inverse_sqrt, dtype=fnp.float32)
+        return fnp.concatenate([half, -half], axis=0)
+
+    def predict(self, mlp, budget):
+        width = int(mlp.width)
+        depth = int(mlp.depth)
+
+        if (
+            not hasattr(self, "_samples")
+            or self._samples.shape[1] != width
+            or getattr(self, "_depth", depth) != depth
+        ):
+            self._samples = self._make_samples(
+                width,
+                _sample_count(int(budget), width, depth),
+                int(mlp.seed),
+            )
+            self._width = width
+            self._depth = depth
+
+        first_weight = mlp.weights[0]
+        first_variance = fnp.sum(first_weight * first_weight, axis=0)
+        first_mean = fnp.sqrt(fnp.maximum(first_variance, 0.0)) * _INV_SQRT_2PI
+
+        if depth == 1:
+            return fnp.asarray(first_mean[None, :], dtype=fnp.float32)
+
+        x = fnp.maximum(self._samples @ first_weight, 0.0)
+
+        sample_mean = fnp.mean(x, axis=0)
+        sample_second = fnp.mean(x * x, axis=0)
+        sample_variance = fnp.maximum(sample_second - sample_mean * sample_mean, _EPS)
+        target_variance = fnp.maximum(first_variance * _RELU_VAR_FACTOR, _EPS)
+        x = (x - sample_mean) * fnp.sqrt(target_variance / sample_variance) + first_mean
+
+        layer_means = [fnp.asarray(first_mean, dtype=fnp.float32)]
+
+        for weight in mlp.weights[1:]:
+            x = fnp.maximum(x @ weight, 0.0)
+            layer_means.append(
+                fnp.asarray(
+                    fnp.mean(fnp.asarray(x, dtype=fnp.float64), axis=0),
+                    dtype=fnp.float32,
+                )
+            )
+
+        return fnp.asarray(fnp.stack(layer_means, axis=0), dtype=fnp.float32)
+```

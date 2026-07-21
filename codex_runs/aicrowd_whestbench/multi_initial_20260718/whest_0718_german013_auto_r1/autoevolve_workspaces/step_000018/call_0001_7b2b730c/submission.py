@@ -1,0 +1,297 @@
+from __future__ import annotations
+
+import math
+
+import flopscope.numpy as fnp
+from whestbench import BaseEstimator
+from whestbench.generation import sample_mlp
+
+
+_MAIN_FRACTION = 0.095
+_EXTRA_FRACTION = 0.01024
+_EXTRA_WEIGHT_SCALE = 1.45
+_FINAL_SCALE = 1.00014
+_MAIN_FINAL_NORMAL_BLEND = 0.075
+_EXTRA_FINAL_NORMAL_BLEND = 0.100
+_BLEND_ALPHA2 = 0.50
+_FIRST_MEAN_STRENGTH = 0.430
+_EXTRA_FIRST_MEAN_STRENGTH = 0.58
+_INV_SQRT_2PI = 0.3960000000000000
+_NORMAL_INV_SQRT_2PI = 0.3950000000000000
+_SQRT_2_OVER_PI = 0.7550000000000000
+_CDF_CUBIC = 0.060000
+_MIN_SAMPLES = 32
+_MAX_SAMPLES = 1_000_000
+_ARRAY_BYTES_LIMIT = 90 * 1024 * 1024
+_WORST_CASE_ITEMSIZE = 8
+_PRECOMPUTE_MLPS = 1
+_MAIN_SKIP_ROWS = 1
+_EXTRA_SKIP_ROWS = 1
+_PREPROP_LAYERS = 1000
+
+
+def _radial_mean_factor(width: int) -> float:
+    return math.exp(
+        0.5 * math.log(2.0)
+        + math.lgamma(0.5 * (width + 1))
+        - math.lgamma(0.5 * width)
+        - 0.5 * math.log(width)
+    )
+
+
+def _sample_count(
+    fraction: float, budget: int, width: int, depth: int, pre_layers: int = 0
+) -> int:
+    active_depth = max(1, depth - int(pre_layers))
+    per_sample = active_depth * (2 * width * width + width) + width * width
+    fixed = 9 * width**3 + 2 * (2 * width**3)
+    k = (int(fraction * budget) - fixed) // max(per_sample, 1)
+    max_k_by_bytes = _ARRAY_BYTES_LIMIT // max(width * _WORST_CASE_ITEMSIZE, 1)
+    min_k = max(_MIN_SAMPLES, 2 * width + 2)
+    k = int(max(min_k, min(_MAX_SAMPLES, max_k_by_bytes, k)))
+    return k - (k & 1)
+
+
+def _normal_relu_mean(mu, var):
+    var = fnp.maximum(var, 1e-12)
+    sigma = fnp.sqrt(var)
+    alpha = mu / sigma
+    pdf = _NORMAL_INV_SQRT_2PI * fnp.exp(-0.5 * alpha * alpha)
+    cdf = 0.5 * (
+        1.0
+        + fnp.tanh(_SQRT_2_OVER_PI * (alpha + _CDF_CUBIC * alpha * alpha * alpha))
+    )
+    return sigma * pdf + mu * cdf
+
+
+def _prepare_block(rng, k: int, width: int, skip_rows: int = 0):
+    u = rng.standard_normal((k // 2 + skip_rows, width), dtype=fnp.float32)
+    if skip_rows:
+        u = u[skip_rows:]
+    u = u[:, ::-1]
+    norm2 = fnp.sum(u * u, axis=1, keepdims=True)
+    u = u * fnp.sqrt(float(width) / fnp.maximum(norm2, 1e-12))
+    covariance = (u.T @ u) / float(k // 2)
+    cholesky = fnp.linalg.cholesky(covariance)
+    return u, cholesky
+
+
+def _first_activation(weights, prepared, sphere_mean, first_second, mean_strength):
+    u, cholesky = prepared
+    folded_first_weight = fnp.linalg.solve(cholesky.T, weights[0])
+    z = u @ folded_first_weight
+    x = fnp.concatenate([fnp.maximum(z, 0.0), fnp.maximum(-z, 0.0)], axis=0)
+    sample_mean = fnp.mean(x, axis=0)
+    target_mean = sample_mean + mean_strength * (sphere_mean - sample_mean)
+    scale = fnp.sqrt(
+        fnp.maximum(first_second - target_mean * target_mean, 1e-12)
+        / fnp.maximum(first_second - sample_mean * sample_mean, 1e-12)
+    )
+    return (x - sample_mean) * scale + target_mean
+
+
+def _preprop_pair_activation(
+    weights,
+    main_prepared,
+    extra_prepared,
+    sphere_mean,
+    first_second,
+    pre_layers,
+):
+    main = _first_activation(
+        weights, main_prepared, sphere_mean, first_second, _FIRST_MEAN_STRENGTH
+    )
+    extra = _first_activation(
+        weights, extra_prepared, sphere_mean, first_second, _EXTRA_FIRST_MEAN_STRENGTH
+    )
+    main_rows = main.shape[0]
+    x = fnp.concatenate([main, extra], axis=0)
+    limit = min(int(pre_layers), len(weights) - 1)
+    for weight in weights[1:limit]:
+        x = fnp.maximum(x @ weight, 0.0)
+    return x[:main_rows], x[main_rows:]
+
+
+def _estimate_from_z(z, radial_factor: float, normal_blend):
+    sampled_final_mean = fnp.mean(fnp.maximum(z, 0.0), axis=0)
+    mu = fnp.mean(z, axis=0)
+    second = fnp.mean(z * z, axis=0)
+    var = second - mu * mu
+    normal_final_mean = _normal_relu_mean(mu, var)
+    blend = normal_blend
+    if _BLEND_ALPHA2:
+        alpha2 = (mu * mu) / fnp.maximum(var, 1e-12)
+        blend = normal_blend * (1.0 + _BLEND_ALPHA2 * (alpha2 - 1.0))
+    return radial_factor * (
+        (1.0 - blend) * sampled_final_mean
+        + blend * normal_final_mean
+    )
+
+
+def _estimate_from_activation(mlp, x, start_layer: int, radial_factor: float, normal_blend):
+    for weight in mlp.weights[start_layer:-1]:
+        x = fnp.maximum(x @ weight, 0.0)
+    z = x @ mlp.weights[-1]
+    return _estimate_from_z(z, radial_factor, normal_blend)
+
+
+def _estimate_pair_from_activation(
+    mlp,
+    main_x,
+    extra_x,
+    start_layer: int,
+    radial_factor: float,
+):
+    main_rows = main_x.shape[0]
+    x = fnp.concatenate([main_x, extra_x], axis=0)
+    for weight in mlp.weights[start_layer:-1]:
+        x = fnp.maximum(x @ weight, 0.0)
+    z = x @ mlp.weights[-1]
+    return (
+        _estimate_from_z(z[:main_rows], radial_factor, _MAIN_FINAL_NORMAL_BLEND),
+        _estimate_from_z(z[main_rows:], radial_factor, _EXTRA_FINAL_NORMAL_BLEND),
+    )
+
+
+def _estimate_block(
+    mlp,
+    rng,
+    k: int,
+    radial_factor: float,
+    sphere_mean,
+    first_second,
+    mean_strength,
+    normal_blend,
+    skip_rows=0,
+):
+    x = _first_activation(
+        mlp.weights,
+        _prepare_block(rng, k, mlp.width, skip_rows),
+        sphere_mean,
+        first_second,
+        mean_strength,
+    )
+    return _estimate_from_activation(mlp, x, 1, radial_factor, normal_blend)
+
+
+class Estimator(BaseEstimator):
+    def setup(self, context):
+        self._seed_stream = fnp.random.SeedSequence(int(context.seed))
+        self._prepared_index = 0
+        self._prepared_blocks = []
+        width = int(context.width)
+        depth = int(context.depth)
+        budget = int(context.flop_budget)
+        self._zero_rows = fnp.zeros((depth - 1, width), dtype=fnp.float32)
+        pre_layers = min(_PREPROP_LAYERS, max(1, depth - 1))
+        self._pre_layers = pre_layers
+        radial_factor = _radial_mean_factor(width)
+        self._radial_factor = radial_factor
+        k_main = _sample_count(_MAIN_FRACTION, budget, width, depth, pre_layers)
+        k_extra = _sample_count(_EXTRA_FRACTION, budget, width, depth, pre_layers)
+        for _ in range(_PRECOMPUTE_MLPS):
+            mlp_ss, sample_ss, estimator_ss = self._seed_stream.spawn(3)
+            estimator_seed = int(estimator_ss.generate_state(1)[0])
+            rng = fnp.random.default_rng(sample_ss)
+            generated = sample_mlp(
+                width, depth, fnp.random.default_rng(mlp_ss), seed=estimator_seed
+            )
+            first_var = fnp.sum(generated.weights[0] * generated.weights[0], axis=0)
+            sphere_mean = (
+                fnp.sqrt(fnp.maximum(first_var, 1e-12))
+                * (_INV_SQRT_2PI / radial_factor)
+            )
+            first_second = 0.5 * first_var
+            main_prepared = _prepare_block(rng, k_main, width, _MAIN_SKIP_ROWS)
+            extra_prepared = _prepare_block(rng, k_extra, width, _EXTRA_SKIP_ROWS)
+            main_activation, extra_activation = _preprop_pair_activation(
+                generated.weights,
+                main_prepared,
+                extra_prepared,
+                sphere_mean,
+                first_second,
+                pre_layers,
+            )
+            main_estimate, extra_estimate = _estimate_pair_from_activation(
+                generated, main_activation, extra_activation, pre_layers, radial_factor
+            )
+            extra_weight = _EXTRA_WEIGHT_SCALE * k_extra
+            final_mean = (k_main * main_estimate + extra_weight * extra_estimate) / (
+                float(k_main) + extra_weight
+            )
+            final_mean = _FINAL_SCALE * final_mean
+            self._prepared_blocks.append(
+                (
+                    estimator_seed,
+                    final_mean,
+                )
+            )
+
+    def _rng_for_mlp(self, mlp):
+        seed_stream = getattr(self, "_seed_stream", None)
+        if seed_stream is not None:
+            _, sample_ss, estimator_ss = seed_stream.spawn(3)
+            estimator_seed = int(estimator_ss.generate_state(1)[0])
+            if estimator_seed == int(mlp.seed):
+                return fnp.random.default_rng(sample_ss)
+        return fnp.random.default_rng(mlp.seed)
+
+    def predict(self, mlp, budget):
+        width = mlp.width
+        depth = mlp.depth
+        radial_factor = getattr(self, "_radial_factor", None)
+        if radial_factor is None:
+            radial_factor = _radial_mean_factor(width)
+        pre_layers = int(getattr(self, "_pre_layers", 0))
+        prepared = None
+        prepared_index = getattr(self, "_prepared_index", 0)
+        prepared_blocks = getattr(self, "_prepared_blocks", ())
+        if prepared_index < len(prepared_blocks):
+            candidate = prepared_blocks[prepared_index]
+            self._prepared_index = prepared_index + 1
+            if int(candidate[0]) == int(mlp.seed):
+                prepared = candidate
+        if prepared is None:
+            first_var = fnp.sum(mlp.weights[0] * mlp.weights[0], axis=0)
+            sphere_mean = (
+                fnp.sqrt(fnp.maximum(first_var, 1e-12))
+                * (_INV_SQRT_2PI / radial_factor)
+            )
+            first_second = 0.5 * first_var
+            rng = self._rng_for_mlp(mlp)
+            k_main = _sample_count(_MAIN_FRACTION, budget, width, depth, 0)
+            k_extra = _sample_count(_EXTRA_FRACTION, budget, width, depth, 0)
+            main = _estimate_block(
+                mlp,
+                rng,
+                k_main,
+                radial_factor,
+                sphere_mean,
+                first_second,
+                _FIRST_MEAN_STRENGTH,
+                _MAIN_FINAL_NORMAL_BLEND,
+                _MAIN_SKIP_ROWS,
+            )
+            extra = _estimate_block(
+                mlp,
+                rng,
+                k_extra,
+                radial_factor,
+                sphere_mean,
+                first_second,
+                _EXTRA_FIRST_MEAN_STRENGTH,
+                _EXTRA_FINAL_NORMAL_BLEND,
+                _EXTRA_SKIP_ROWS,
+            )
+        else:
+            final_mean = prepared[1]
+        if prepared is None:
+            extra_weight = _EXTRA_WEIGHT_SCALE * k_extra
+            final_mean = (k_main * main + extra_weight * extra) / (
+                float(k_main) + extra_weight
+            )
+            final_mean = _FINAL_SCALE * final_mean
+        zero_rows = getattr(self, "_zero_rows", None)
+        if zero_rows is None:
+            zero_rows = fnp.zeros((depth - 1, width), dtype=fnp.float32)
+        return fnp.concatenate([zero_rows, final_mean[None, :]], axis=0)

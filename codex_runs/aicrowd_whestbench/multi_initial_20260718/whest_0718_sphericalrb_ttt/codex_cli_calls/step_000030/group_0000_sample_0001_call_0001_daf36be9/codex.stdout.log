@@ -1,0 +1,139 @@
+```python
+from __future__ import annotations
+
+import math
+
+import flopscope.numpy as fnp
+from whestbench import BaseEstimator
+
+
+_TARGET_FLOP_FRACTION = 0.62
+_MAX_SAMPLE_BYTES = 72 * 1024 * 1024
+_TAIL_CLIP = 1e-12
+_DIAG_FLOOR = 1e-10
+_PRIME_CACHE: dict[int, tuple[int, ...]] = {}
+
+
+def _first_primes(count: int) -> tuple[int, ...]:
+    cached = _PRIME_CACHE.get(count)
+    if cached is not None:
+        return cached
+
+    primes = []
+    candidate = 2
+    while len(primes) < count:
+        ok = True
+        for prime in primes:
+            if prime * prime > candidate:
+                break
+            if candidate % prime == 0:
+                ok = False
+                break
+        if ok:
+            primes.append(candidate)
+        candidate += 1
+
+    result = tuple(primes)
+    _PRIME_CACHE[count] = result
+    return result
+
+
+def _mean_chi(dimension: int) -> float:
+    half = 0.5 * float(dimension)
+    return math.sqrt(2.0) * math.exp(math.lgamma(half + 0.5) - math.lgamma(half))
+
+
+def _sample_count(budget: int | None, width: int, depth: int) -> int:
+    if budget is None:
+        budget = 2 * depth * width * width * 4096
+
+    per_sample = max(2 * depth * width * width + 24 * width, 1)
+    count = int((_TARGET_FLOP_FRACTION * int(budget)) // per_sample)
+    memory_limited = _MAX_SAMPLE_BYTES // max(width * 8, 1)
+    count = max(2, min(count, memory_limited))
+    return count - (count & 1)
+
+
+def _lattice_uniforms(n_samples: int, dimension: int, rng) -> fnp.ndarray:
+    roots = fnp.sqrt(fnp.array(_first_primes(dimension), dtype=fnp.float64))
+    generator = roots - fnp.floor(roots)
+    shift = rng.random(dimension)
+
+    indices = fnp.arange(n_samples, dtype=fnp.float64)[:, None]
+    uniforms = indices * generator[None, :] + shift[None, :]
+    uniforms = uniforms - fnp.floor(uniforms)
+    return fnp.clip(uniforms, _TAIL_CLIP, 1.0 - _TAIL_CLIP)
+
+
+def _qmc_directions(n_samples: int, width: int, rng) -> fnp.ndarray:
+    pair_count = (width + 1) // 2
+    uniforms = _lattice_uniforms(n_samples, 2 * pair_count, rng)
+
+    u_radius = uniforms[:, :pair_count]
+    u_angle = uniforms[:, pair_count:]
+
+    radius = fnp.sqrt(-2.0 * fnp.log(u_radius))
+    angle = (2.0 * math.pi) * u_angle
+
+    normals = fnp.concatenate(
+        (radius * fnp.cos(angle), radius * fnp.sin(angle)),
+        axis=1,
+    )[:, :width]
+
+    norm = fnp.sqrt(fnp.maximum(fnp.sum(normals * normals, axis=1), 1e-24))
+    directions = normals / norm[:, None]
+
+    diag = fnp.mean(directions * directions, axis=0) * float(width)
+    return directions / fnp.sqrt(fnp.maximum(diag, _DIAG_FLOOR))[None, :]
+
+
+def _exact_first_layer_mean(weights: fnp.ndarray) -> fnp.ndarray:
+    std = fnp.sqrt(fnp.sum(weights * weights, axis=0))
+    return std / math.sqrt(2.0 * math.pi)
+
+
+class Estimator(BaseEstimator):
+    def predict(self, mlp, budget: int | None) -> fnp.ndarray:
+        width = mlp.width
+        depth = mlp.depth
+
+        first_mean = _exact_first_layer_mean(mlp.weights[0])
+        if depth == 1:
+            return fnp.asarray(fnp.stack((first_mean,), axis=0), dtype=fnp.float32)
+
+        n_samples = _sample_count(budget, width, depth)
+        half_samples = n_samples // 2
+
+        rng = fnp.random.default_rng(mlp.seed)
+        half_directions = _qmc_directions(half_samples, width, rng)
+        paired_directions = fnp.concatenate((half_directions, -half_directions), axis=0)
+
+        activations = paired_directions * _mean_chi(width)
+        rows = [first_mean]
+
+        activations = fnp.maximum(activations @ mlp.weights[0], 0.0)
+        sample_mean = fnp.mean(activations, axis=0)
+        activations = activations * (
+            first_mean / fnp.maximum(sample_mean, _DIAG_FLOOR)
+        )[None, :]
+
+        previous_mean = first_mean
+        for layer_index, weights in enumerate(mlp.weights[1:], start=1):
+            preactivations = activations @ weights
+
+            linear_mean = previous_mean @ weights
+            absolute_mean = fnp.mean(fnp.abs(preactivations), axis=0)
+            layer_mean = fnp.maximum(0.5 * (linear_mean + absolute_mean), 0.0)
+
+            rows.append(layer_mean)
+            previous_mean = layer_mean
+
+            if layer_index < depth - 1:
+                activations = fnp.maximum(preactivations, 0.0)
+                sample_mean = fnp.mean(activations, axis=0)
+                activations = activations * (
+                    layer_mean / fnp.maximum(sample_mean, _DIAG_FLOOR)
+                )[None, :]
+
+        return fnp.asarray(fnp.stack(rows, axis=0), dtype=fnp.float32)
+```

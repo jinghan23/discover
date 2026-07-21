@@ -1,0 +1,254 @@
+```python
+from __future__ import annotations
+
+import math
+
+import flopscope.numpy as fnp
+from whestbench import BaseEstimator
+
+
+_EPS = 1e-7
+_INV_SQRT_2PI = 0.3989422804014327
+_BUDGET_FRACTION = 0.18
+_MIN_SAMPLES = 64
+_MAX_SAMPLES = 1_000_000
+_ARRAY_BYTES_LIMIT = 192 * 1024 * 1024
+_WORST_CASE_ITEMSIZE = 8
+_CONTROL_GAIN = 0.75
+_FINAL_GAUSS_BLEND = 0.42
+_REGRESSION_BLEND = 0.35
+_REG_RIDGE = 2e-3
+_QMC_SE_SCALE = 0.25
+
+
+def _chi_mean(dim: int) -> float:
+    return math.sqrt(2.0) * math.exp(
+        math.lgamma(0.5 * (float(dim) + 1.0)) - math.lgamma(0.5 * float(dim))
+    )
+
+
+def _clip(x, lo, hi):
+    return fnp.minimum(fnp.maximum(x, lo), hi)
+
+
+def _sample_count(budget, width: int, depth: int) -> int:
+    per_sample = depth * (2 * width * width + width)
+    max_k_by_bytes = _ARRAY_BYTES_LIMIT // max(width * _WORST_CASE_ITEMSIZE, 1)
+
+    if budget is None:
+        k = min(_MAX_SAMPLES, max_k_by_bytes, 4096)
+    else:
+        k = int(_BUDGET_FRACTION * float(budget)) // max(per_sample, 1)
+        k = min(_MAX_SAMPLES, max_k_by_bytes, max(_MIN_SAMPLES, k))
+
+    return max(2, int(k) - (int(k) & 1))
+
+
+def _orthogonal_antithetic_sphere(rng, half: int, width: int, radius: float):
+    u = rng.standard_normal((half, width), dtype=fnp.float32)
+
+    if half < width:
+        gram = u @ u.T
+        eigval, eigvec = fnp.linalg.eigh(gram)
+        eigval = fnp.maximum(eigval, _EPS)
+        inv_sqrt = (eigvec / fnp.sqrt(eigval)) @ eigvec.T
+        x = (inv_sqrt @ u) * fnp.sqrt(float(width))
+    else:
+        cov = (u.T @ u) / float(half)
+        eigval, eigvec = fnp.linalg.eigh(cov)
+        eigval = fnp.maximum(eigval, _EPS)
+        inv_sqrt = (eigvec / fnp.sqrt(eigval)) @ eigvec.T
+        x = u @ inv_sqrt
+
+    norm = fnp.sqrt(fnp.sum(x * x, axis=1, keepdims=True))
+    x = x * (radius / fnp.maximum(norm, _EPS))
+    return fnp.concatenate([x, -x], axis=0)
+
+
+def _normal_cdf(x):
+    ax = fnp.maximum(x, -x)
+    t = 1.0 / (1.0 + 0.2316419 * ax)
+    poly = (
+        ((((1.330274429 * t - 1.821255978) * t + 1.781477937) * t - 0.356563782)
+         * t + 0.319381530)
+        * t
+    )
+    phi = _INV_SQRT_2PI * fnp.exp(-0.5 * ax * ax)
+    c = 1.0 - phi * poly
+    return fnp.where(x >= 0.0, c, 1.0 - c)
+
+
+def _gaussian_relu_mean(mu, var):
+    sigma = fnp.sqrt(fnp.maximum(var, _EPS))
+    alpha = mu / sigma
+    phi = _INV_SQRT_2PI * fnp.exp(-0.5 * alpha * alpha)
+    return sigma * phi + mu * _normal_cdf(alpha)
+
+
+def _edgeworth_relu_mean(mu, var, m3, m4):
+    sigma = fnp.sqrt(fnp.maximum(var, _EPS))
+    alpha = mu / sigma
+    phi = _INV_SQRT_2PI * fnp.exp(-0.5 * alpha * alpha)
+
+    skew = _clip(m3 / fnp.maximum(sigma * var, _EPS), -1.5, 1.5)
+    excess = _clip(m4 / fnp.maximum(var * var, _EPS) - 3.0, -2.5, 4.0)
+
+    base = _gaussian_relu_mean(mu, var)
+    corr = sigma * phi * ((-skew * alpha) / 6.0 + excess * (alpha * alpha - 1.0) / 24.0)
+    return fnp.maximum(base + corr, 0.0)
+
+
+def _final_smooth(cv_mean, gauss_mean, relu_second, sample_mean, k: int):
+    diff = fnp.maximum(gauss_mean - cv_mean, cv_mean - gauss_mean)
+    relu_var = fnp.maximum(relu_second - sample_mean * sample_mean, _EPS)
+    se = _QMC_SE_SCALE * fnp.sqrt(relu_var / float(max(k, 1))) + _EPS
+    se2 = se * se
+    trust = se2 / (se2 + diff * diff + _EPS)
+    return cv_mean + (_FINAL_GAUSS_BLEND * trust) * (gauss_mean - cv_mean)
+
+
+def _first_layer_sphere_cov(weight, radius: float, mean):
+    norm2 = fnp.sum(weight * weight, axis=0)
+    norm = fnp.sqrt(fnp.maximum(norm2, _EPS))
+    gram = weight.T @ weight
+    denom = fnp.maximum(norm[:, None] * norm[None, :], _EPS)
+    rho = _clip(gram / denom, -1.0, 1.0)
+
+    root = fnp.sqrt(fnp.maximum(1.0 - rho * rho, 0.0))
+    theta = fnp.arccos(rho)
+    kernel = (root + (math.pi - theta) * rho) * (0.5 / math.pi)
+
+    second = denom * kernel * ((radius * radius) / float(weight.shape[0]))
+    return second - mean[:, None] * mean[None, :]
+
+
+def _linear_control_blend(
+    base_mean,
+    final_x,
+    final_sample_mean,
+    controls,
+    control_mean,
+    control_sample_mean,
+    first_weight,
+    radius: float,
+    k: int,
+):
+    width = first_weight.shape[1]
+    if k <= width + 8:
+        return base_mean
+
+    centered_control = controls - control_sample_mean
+    centered_final = final_x - final_sample_mean
+
+    cross = (centered_control.T @ centered_final) / float(max(k - 1, 1))
+    cov = _first_layer_sphere_cov(first_weight, radius, control_mean)
+
+    diag_level = fnp.mean(
+        fnp.sum(centered_control * centered_control, axis=0) / float(max(k - 1, 1))
+    )
+    ridge = fnp.maximum(_REG_RIDGE * diag_level, _EPS)
+    cov = cov + ridge * fnp.eye(width)
+
+    eigval, eigvec = fnp.linalg.eigh(cov)
+    eigval = fnp.maximum(eigval, ridge)
+    beta = eigvec @ ((eigvec.T @ cross) / eigval[:, None])
+
+    reg_mean = fnp.maximum(final_sample_mean + (control_mean - control_sample_mean) @ beta, 0.0)
+
+    relu_second = fnp.mean(final_x * final_x, axis=0)
+    relu_var = fnp.maximum(relu_second - final_sample_mean * final_sample_mean, _EPS)
+    se = 0.30 * fnp.sqrt(relu_var / float(max(k, 1))) + _EPS
+    diff = fnp.maximum(reg_mean - base_mean, base_mean - reg_mean)
+    trust = (se * se) / (se * se + diff * diff + _EPS)
+
+    return fnp.maximum(base_mean + (_REGRESSION_BLEND * trust) * (reg_mean - base_mean), 0.0)
+
+
+class Estimator(BaseEstimator):
+    def setup(self, context):
+        self._setup_seed = context.seed
+
+    def teardown(self):
+        pass
+
+    def predict(self, mlp, budget):
+        width = mlp.width
+        depth = mlp.depth
+        k = _sample_count(budget, width, depth)
+        half = k // 2
+        radius = _chi_mean(width)
+
+        rng = fnp.random.default_rng(mlp.seed)
+        x = _orthogonal_antithetic_sphere(rng, half, width, radius)
+
+        means = []
+        correction = None
+        first_weight = None
+        controls = None
+        control_mean = None
+        control_sample_mean = None
+        final_sample_mean = None
+        final_x = None
+
+        for layer, weight in enumerate(mlp.weights):
+            z = x @ weight
+            gate = fnp.mean(z > 0.0, axis=0)
+            x = fnp.maximum(z, 0.0)
+            sample_mean = fnp.mean(x, axis=0)
+
+            if layer == 0:
+                first_weight = weight
+                exact_mean = fnp.sqrt(fnp.sum(weight * weight, axis=0)) * _INV_SQRT_2PI
+                correction = exact_mean - sample_mean
+                mean = exact_mean
+                controls = x
+                control_mean = exact_mean
+                control_sample_mean = sample_mean
+            else:
+                pre_correction = correction @ weight
+                correction = pre_correction * gate
+                mean = fnp.maximum(sample_mean + _CONTROL_GAIN * correction, 0.0)
+
+                if layer == depth - 1:
+                    final_sample_mean = sample_mean
+                    final_x = x
+
+                    z_sample_mean = fnp.mean(z, axis=0)
+                    z_mu = z_sample_mean + _CONTROL_GAIN * pre_correction
+                    z_second = fnp.mean(z * z, axis=0)
+                    z_var = fnp.maximum(z_second - z_mu * z_mu, _EPS)
+
+                    centered_z = z - z_sample_mean
+                    centered_z2 = centered_z * centered_z
+                    z_m3 = fnp.mean(centered_z2 * centered_z, axis=0)
+                    z_m4 = fnp.mean(centered_z2 * centered_z2, axis=0)
+
+                    gauss_mean = _edgeworth_relu_mean(z_mu, z_var, z_m3, z_m4)
+                    relu_second = fnp.mean(x * x, axis=0)
+                    mean = fnp.maximum(
+                        _final_smooth(mean, gauss_mean, relu_second, sample_mean, k),
+                        0.0,
+                    )
+
+            means.append(mean)
+
+        if (
+            depth > 1
+            and first_weight is not None
+            and controls is not None
+            and final_x is not None
+        ):
+            means[-1] = _linear_control_blend(
+                means[-1],
+                final_x,
+                final_sample_mean,
+                controls,
+                control_mean,
+                control_sample_mean,
+                first_weight,
+                radius,
+                k,
+            )
+
+        return fnp.stack(means, axis=0)
+```

@@ -1,0 +1,204 @@
+"""Estimator for ARC WhestBench public mini MLPs."""
+
+from __future__ import annotations
+
+import math
+from functools import lru_cache
+
+import flopscope as flops
+import flopscope.numpy as fnp
+from whestbench import BaseEstimator
+
+
+_MAX_WORKING_SET_BYTES = 100 * 1024 * 1024
+_FLOAT64_ITEMSIZE = 8
+_TAIL_CLIP = 1e-11
+_MIN_ANTITHETIC_SAMPLES = 32
+_WHITENING_EIGENVALUE_FLOOR = 1e-8
+
+
+def _sample_count(budget: int, width: int, depth: int, target_fraction: float) -> int:
+    half_lattice_per_sample = (89 * width + 3 * width + 2) // 2
+    layer_per_sample = depth * (2 * width * width + 2 * width)
+    covariance_per_sample = width * width
+    per_sample = half_lattice_per_sample + layer_per_sample + covariance_per_sample
+    fixed = 13 * width**3 + 8 * width
+    budget_limited = (int(float(target_fraction) * budget) - fixed) // max(per_sample, 1)
+    memory_limited = _MAX_WORKING_SET_BYTES // max(width * _FLOAT64_ITEMSIZE, 1)
+    count = int(max(_MIN_ANTITHETIC_SAMPLES, min(budget_limited, memory_limited)))
+    return count - (count & 1)
+
+
+@lru_cache(maxsize=None)
+def _first_primes(count: int) -> tuple[int, ...]:
+    primes: list[int] = []
+    candidate = 2
+    while len(primes) < count:
+        is_prime = True
+        for prime in primes:
+            if prime * prime > candidate:
+                break
+            if candidate % prime == 0:
+                is_prime = False
+                break
+        if is_prime:
+            primes.append(candidate)
+        candidate += 1
+    return tuple(primes)
+
+
+def _lattice_normal_samples(n_samples: int, width: int, rng) -> fnp.ndarray:
+    roots = fnp.sqrt(fnp.array(_first_primes(width), dtype=fnp.float64))
+    generator = roots - fnp.floor(roots)
+    shift = rng.random(width)
+    indices = fnp.arange(n_samples, dtype=fnp.float64)[:, None]
+    unwrapped = indices * generator[None, :] + shift[None, :]
+    uniforms = unwrapped - fnp.floor(unwrapped)
+    uniforms = fnp.clip(uniforms, _TAIL_CLIP, 1.0 - _TAIL_CLIP)
+    return flops.stats.norm.ppf(uniforms)
+
+
+def _mean_chi(dimension: int) -> float:
+    half_dimension = 0.5 * float(dimension)
+    return math.sqrt(2.0) * math.exp(
+        math.lgamma(half_dimension + 0.5) - math.lgamma(half_dimension)
+    )
+
+
+def _qmc_directions(n_samples: int, width: int, rng) -> fnp.ndarray:
+    normals = _lattice_normal_samples(n_samples, width, rng)
+    radii = fnp.sqrt(fnp.maximum(fnp.sum(normals * normals, axis=1), 1e-24))
+    return normals / radii[:, None]
+
+
+def _angular_whitening_transform(directions: fnp.ndarray) -> fnp.ndarray:
+    n_samples, width = directions.shape
+    scaled_second_moment = (directions.T @ directions) * (float(width) / float(n_samples))
+    eigenvalues, eigenvectors = fnp.linalg.eigh(scaled_second_moment)
+    eigenvalues = fnp.maximum(eigenvalues, _WHITENING_EIGENVALUE_FLOOR)
+    return (eigenvectors / fnp.sqrt(eigenvalues)) @ eigenvectors.T
+
+
+def _exact_first_layer_mean(weights: fnp.ndarray) -> fnp.ndarray:
+    standard_deviation = fnp.sqrt(fnp.sum(weights * weights, axis=0))
+    return standard_deviation / fnp.sqrt(2.0 * fnp.pi)
+
+
+def _exact_first_layer_second(weights: fnp.ndarray, width: int) -> fnp.ndarray:
+    squared_norm = fnp.sum(weights * weights, axis=0)
+    radius = _mean_chi(width)
+    return squared_norm * ((radius * radius) / (2.0 * float(width)))
+
+
+def _gaussian_relu_moments(
+    mean: fnp.ndarray,
+    variance: fnp.ndarray,
+) -> tuple[fnp.ndarray, fnp.ndarray]:
+    sigma = fnp.sqrt(fnp.maximum(variance, 1e-12))
+    alpha = mean / sigma
+    cdf = flops.stats.norm.cdf(alpha)
+    pdf = flops.stats.norm.pdf(alpha)
+    first = mean * cdf + sigma * pdf
+    second = (mean * mean + variance) * cdf + mean * sigma * pdf
+    return first, second
+
+
+class Estimator(BaseEstimator):
+    target_flop_fraction = 0.10
+    sample_delta = -4
+    whitening_strength = 1.032
+    final_scale = 0.99938
+    final_gaussian_blend = -0.03
+    final_nested_blend = 0.23
+    final_tail_blend = -0.065
+    first_mean_match = -1.40
+    first_variance_match = 0.58
+
+    def predict(self, mlp, budget: int) -> fnp.ndarray:
+        n_samples = _sample_count(
+            budget,
+            mlp.width,
+            mlp.depth,
+            self.target_flop_fraction,
+        )
+        n_samples = max(_MIN_ANTITHETIC_SAMPLES, n_samples + self.sample_delta)
+        n_samples = n_samples - (n_samples & 1)
+        half_samples = n_samples // 2
+
+        rng = fnp.random.default_rng(mlp.seed)
+        half_directions = _qmc_directions(half_samples, mlp.width, rng)
+        whitening = _angular_whitening_transform(half_directions)
+        whitened_first_weight = whitening @ mlp.weights[0]
+        first_weight = (
+            (1.0 - self.whitening_strength) * mlp.weights[0]
+            + self.whitening_strength * whitened_first_weight
+        )
+        first_weight = fnp.asarray(first_weight, dtype=fnp.float32)
+
+        paired_directions = fnp.concatenate((half_directions, -half_directions), axis=0)
+        activations = fnp.asarray(
+            paired_directions * _mean_chi(mlp.width),
+            dtype=fnp.float32,
+        )
+
+        rows = []
+        activations = fnp.maximum(activations @ first_weight, 0.0)
+        first_exact = _exact_first_layer_mean(mlp.weights[0])
+        first_sample = fnp.maximum(fnp.mean(activations, axis=0), 1e-12)
+        first_factor = first_exact / first_sample
+        activations = activations * (
+            1.0 + self.first_mean_match * (first_factor - 1.0)
+        )
+
+        current_mean = fnp.mean(activations, axis=0)
+        current_second = fnp.mean(activations * activations, axis=0)
+        current_variance = fnp.maximum(
+            current_second - current_mean * current_mean,
+            1e-12,
+        )
+        first_second = _exact_first_layer_second(mlp.weights[0], mlp.width)
+        first_variance = fnp.maximum(first_second - first_exact * first_exact, 1e-12)
+        variance_factor = fnp.sqrt(first_variance / current_variance)
+        variance_matched = first_exact + (activations - current_mean) * variance_factor
+        activations = activations + self.first_variance_match * (
+            variance_matched - activations
+        )
+        rows.append(first_exact)
+
+        for layer_index, weights in enumerate(mlp.weights[1:], start=1):
+            preactivations = activations @ weights
+            activations = fnp.maximum(preactivations, 0.0)
+            row = fnp.mean(activations, axis=0)
+
+            if layer_index == mlp.depth - 1:
+                pre_mean = fnp.mean(preactivations, axis=0)
+                pre_second = fnp.mean(preactivations * preactivations, axis=0)
+                pre_variance = fnp.maximum(pre_second - pre_mean * pre_mean, 1e-12)
+                gaussian_row, _ = _gaussian_relu_moments(pre_mean, pre_variance)
+                row = row + self.final_gaussian_blend * (gaussian_row - row)
+
+                sub_count = half_samples // 2
+                sub_row = (
+                    fnp.sum(activations[:sub_count], axis=0)
+                    + fnp.sum(
+                        activations[half_samples : half_samples + sub_count],
+                        axis=0,
+                    )
+                ) / float(2 * sub_count)
+                full_row = row
+                row = row + self.final_nested_blend * (row - sub_row)
+
+                tail_count = half_samples // 5
+                tail_row = (
+                    fnp.sum(
+                        activations[half_samples - tail_count : half_samples],
+                        axis=0,
+                    )
+                    + fnp.sum(activations[n_samples - tail_count :], axis=0)
+                ) / float(2 * tail_count)
+                row = row + self.final_tail_blend * (tail_row - full_row)
+
+            rows.append(row)
+
+        rows = fnp.asarray(fnp.stack(rows, axis=0), dtype=fnp.float32)
+        return fnp.concatenate((rows[:-1], rows[-1:] * self.final_scale), axis=0)

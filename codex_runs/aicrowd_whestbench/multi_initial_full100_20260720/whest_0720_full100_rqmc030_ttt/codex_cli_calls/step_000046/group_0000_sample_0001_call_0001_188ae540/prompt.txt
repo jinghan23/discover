@@ -1,0 +1,191 @@
+You are solving the ARC White-Box Estimation Challenge 2026
+(WhestBench) under the official evaluator contract.
+
+Task:
+- You receive the weights of a randomly initialized square ReLU MLP.
+- Inputs follow a standard normal distribution.
+- Predict the per-neuron post-ReLU activation mean for every layer.
+- Return a `flopscope.numpy.ndarray` with shape `(mlp.depth, mlp.width)`.
+
+Required submission interface:
+- Import `flopscope.numpy as fnp` for numerical operations.
+- Define `class Estimator(BaseEstimator)` with
+  `predict(self, mlp, budget)`.
+- Optional `setup(self, context)` and `teardown(self)` hooks follow the official
+  WhestBench API.
+- Seed predict-time randomness from `mlp.seed` and setup-time randomness from
+  `context.seed`.
+
+Official scoring:
+- For each MLP, compute final-layer MSE against the official Monte Carlo target.
+- Effective compute is `C = FLOPs + lambda * residual_wall_time`.
+- A valid MLP score is `final_layer_mse * max(0.1, C / flop_budget)`.
+- The suite score is the arithmetic mean of those per-MLP scores; lower is better.
+- Exceptions, invalid shapes/non-finite values, FLOP/time exhaustion, or combined
+  budget exhaustion use an all-zero prediction and multiplier 1.0 for that MLP.
+- All-layer MSE is diagnostic only.
+
+Do not use plain NumPy or uninstrumented numerical libraries to evade FLOP
+accounting. Residual Python or uninstrumented work is charged at the official
+lambda rate and can exhaust the combined budget.
+
+Fairness and data isolation:
+- Derive predictions only from the `mlp` weights and allowed setup context.
+- Do not inspect, search for, or read evaluation datasets, Hugging Face caches,
+  saved evaluation reports, target moments, or ground-truth files.
+- Do not hardcode values tied to public mini MLPs. Such candidates are invalid
+  even if they receive a low local score.
+
+Algorithm directions worth exploring:
+- Mean and diagonal-variance propagation through ReLU moments.
+- Full, structured, or low-rank covariance propagation.
+- Hybrid analytic propagation with compute-budgeted Monte Carlo probes.
+- Layer-wise corrections for correlation error in deep networks.
+- Allocating FLOPs to layers where final-layer MSE is most sensitive.
+
+
+Official evaluation suite for this run:
+- dataset: None@None
+- split / MLPs: None / first None
+- width / depth: None / None
+- FLOP budget per MLP: None
+- residual penalty lambda: None FLOPs/second
+- runner: None
+
+You are iteratively optimizing budget-adjusted final-layer score.
+Here is the last code we ran:
+```python
+from __future__ import annotations
+
+import flopscope as flops
+import flopscope.numpy as fnp
+from whestbench import BaseEstimator
+
+
+_TARGET_FLOP_FRACTION = 0.099
+_TAIL_CLIP = 1e-12
+_ARRAY_BYTES_LIMIT = 128 * 1024 * 1024
+_FLOAT64_ITEMSIZE = 8
+_INV_SQRT_2PI = 0.3989422804014327
+
+
+def _first_primes(count: int) -> tuple[int, ...]:
+    primes = []
+    candidate = 2
+    while len(primes) < count:
+        ok = True
+        for prime in primes:
+            if prime * prime > candidate:
+                break
+            if candidate % prime == 0:
+                ok = False
+                break
+        if ok:
+            primes.append(candidate)
+        candidate += 1
+    return tuple(primes)
+
+
+def _lattice_generator(width: int) -> fnp.ndarray:
+    roots = fnp.sqrt(fnp.array(_first_primes(width), dtype=fnp.float64))
+    return roots - fnp.floor(roots)
+
+
+def _sample_count(budget: int, width: int, depth: int) -> int:
+    forward_per_sample = depth * (2 * width * width + width)
+    mean_per_sample = max(depth - 1, 0) * width
+    ppf_per_sample = 45 * width
+    fixed = 4 * width * width + 16 * width
+    per_sample = forward_per_sample + mean_per_sample + ppf_per_sample
+    count = (int(_TARGET_FLOP_FRACTION * budget) - fixed) // max(per_sample, 1)
+    max_by_bytes = _ARRAY_BYTES_LIMIT // max(width * _FLOAT64_ITEMSIZE, 1)
+    count = int(max(2, min(count, max_by_bytes)))
+    return count if count % 2 == 0 else count - 1
+
+
+def _normal_pdf(x: fnp.ndarray) -> fnp.ndarray:
+    return _INV_SQRT_2PI * fnp.exp(-0.5 * x * x)
+
+
+def _relu_mean(mu: fnp.ndarray, var: fnp.ndarray) -> fnp.ndarray:
+    sigma = fnp.sqrt(fnp.maximum(var, 1e-30))
+    alpha = mu / sigma
+    return sigma * _normal_pdf(alpha) + mu * flops.stats.norm.cdf(alpha)
+
+
+def _exact_first_layer_mean(weight: fnp.ndarray) -> fnp.ndarray:
+    return fnp.sqrt(fnp.sum(weight * weight, axis=0)) * _INV_SQRT_2PI
+
+
+def _lattice_normals(n_samples: int, width: int, seed: int) -> fnp.ndarray:
+    half = max(1, n_samples // 2)
+    rng = fnp.random.default_rng(seed)
+    generator = _lattice_generator(width)
+    shift = rng.random(width)
+    indices = fnp.arange(half, dtype=fnp.float64)[:, None] + 0.5
+    uniforms = indices * generator[None, :] + shift[None, :]
+    uniforms = uniforms - fnp.floor(uniforms)
+    uniforms = fnp.clip(uniforms, _TAIL_CLIP, 1.0 - _TAIL_CLIP)
+    base = flops.stats.norm.ppf(uniforms)
+    return fnp.concatenate((base, -base), axis=0)
+
+
+class Estimator(BaseEstimator):
+    def setup(self, context):
+        self._setup_seed = context.seed
+
+    def predict(self, mlp, budget):
+        width = mlp.width
+        depth = mlp.depth
+        n_samples = _sample_count(budget, width, depth)
+
+        activations = _lattice_normals(n_samples, width, mlp.seed)
+        rows = []
+
+        for layer_index, weight in enumerate(mlp.weights):
+            pre = activations @ weight
+
+            if layer_index == 0:
+                rows.append(_exact_first_layer_mean(weight))
+                activations = fnp.maximum(pre, 0.0)
+                continue
+
+            mc_mean = fnp.mean(fnp.maximum(pre, 0.0), axis=0)
+
+            pre_mean = fnp.mean(pre, axis=0)
+            centered = pre - pre_mean[None, :]
+            pre_var = fnp.mean(centered * centered, axis=0)
+            gaussian_mean = _relu_mean(pre_mean, pre_var)
+
+            relu_pre = fnp.maximum(pre, 0.0)
+            sample_mean = fnp.mean(relu_pre, axis=0)
+
+            # Gaussian control variate: replace the sample's noisy Gaussian-scale
+            # component with its closed-form ReLU moment while preserving the
+            # non-Gaussian residual measured from the actual propagated samples.
+            rows.append(mc_mean + (gaussian_mean - sample_mean))
+            activations = relu_pre
+
+        return fnp.stack(rows, axis=0)
+```
+Here is the budget-adjusted final-layer score before and after running the code above (lower is better): 0.000001 -> 0.000001
+Target: 1e-07. Current gap: 0.000001. Further improvements will also be generously rewarded.
+
+--- Previous Program Output ---
+
+
+		 ...(TRUNCATED)...
+84128e-06 | 2.7891274e+10 | ok
+benjamin-dean | 3.7455339e-07 | 3.646885e-06 | 2.7935765e+10 | ok
+michele-galvan | 5.69521e-07 | 5.5560595e-06 | 2.7881219e+10 | ok
+cathy-butler | 2.7356731e-06 | 2.6695769e-05 | 2.7873447e+10 | ok
+lindsey-chase | 1.070874e-06 | 1.0446251e-05 | 2.7883471e+10 | ok
+kenneth-hernandez | 9.8906244e-07 | 9.6454278e-06 | 2.7891452e+10 | ok
+lauren-flowers | 4.4221096e-07 | 4.3147666e-06 | 2.7876684e+10 | ok
+kristi-johnson | 2.488537e-07 | 2.4269618e-06 | 2.7890099e+10 | ok
+--- End Output ---
+
+Return one final Python code block containing an official `Estimator` class.
+
+
+Return only the final answer content. Do not edit files or run tools.

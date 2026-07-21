@@ -1,0 +1,189 @@
+```python
+from __future__ import annotations
+
+import math
+
+import flopscope.numpy as fnp
+from whestbench import BaseEstimator
+
+
+_TARGET_FLOP_FRACTION = 0.08
+_MAX_WORKING_SET_BYTES = 100 * 1024 * 1024
+_FLOAT32_ITEMSIZE = 4
+_TAIL_CLIP = 1e-7
+_MIN_ANTITHETIC_SAMPLES = 32
+_WHITENING_EIGENVALUE_FLOOR = 1e-5
+_PRIME_CACHE: dict[int, tuple[int, ...]] = {}
+
+
+def _first_primes(count: int) -> tuple[int, ...]:
+    cached = _PRIME_CACHE.get(count)
+    if cached is not None:
+        return cached
+
+    primes = []
+    candidate = 2
+    while len(primes) < count:
+        is_prime = True
+        for prime in primes:
+            if prime * prime > candidate:
+                break
+            if candidate % prime == 0:
+                is_prime = False
+                break
+        if is_prime:
+            primes.append(candidate)
+        candidate += 1
+
+    result = tuple(primes)
+    _PRIME_CACHE[count] = result
+    return result
+
+
+def _mean_chi(dimension: int) -> float:
+    half_dimension = 0.5 * float(dimension)
+    return math.sqrt(2.0) * math.exp(
+        math.lgamma(half_dimension + 0.5) - math.lgamma(half_dimension)
+    )
+
+
+def _sample_count(budget: int | None, width: int, depth: int) -> int:
+    if budget is None:
+        budget = 2 * depth * width * width * 4096
+
+    half_lattice_per_sample = 260 * width
+    layer_per_sample = depth * (2 * width * width + 5 * width)
+    covariance_per_sample = width * width
+    per_sample = half_lattice_per_sample + layer_per_sample + covariance_per_sample
+    fixed = 16 * width**3 + 2 * max(depth - 1, 0) * width * width + 8 * width
+
+    budget_limited = (int(_TARGET_FLOP_FRACTION * int(budget)) - fixed) // max(
+        per_sample, 1
+    )
+    memory_limited = _MAX_WORKING_SET_BYTES // max(width * _FLOAT32_ITEMSIZE, 1)
+    count = int(max(_MIN_ANTITHETIC_SAMPLES, min(budget_limited, memory_limited)))
+    return count - (count & 1)
+
+
+def _normal_ppf_approx(p: fnp.ndarray) -> fnp.ndarray:
+    p = fnp.clip(p, _TAIL_CLIP, 1.0 - _TAIL_CLIP)
+
+    a1 = -3.969683028665376e01
+    a2 = 2.209460984245205e02
+    a3 = -2.759285104469687e02
+    a4 = 1.383577518672690e02
+    a5 = -3.066479806614716e01
+    a6 = 2.506628277459239e00
+
+    b1 = -5.447609879822406e01
+    b2 = 1.615858368580409e02
+    b3 = -1.556989798598866e02
+    b4 = 6.680131188771972e01
+    b5 = -1.328068155288572e01
+
+    c1 = -7.784894002430293e-03
+    c2 = -3.223964580411365e-01
+    c3 = -2.400758277161838e00
+    c4 = -2.549732539343734e00
+    c5 = 4.374664141464968e00
+    c6 = 2.938163982698783e00
+
+    d1 = 7.784695709041462e-03
+    d2 = 3.224671290700398e-01
+    d3 = 2.445134137142996e00
+    d4 = 3.754408661907416e00
+
+    q = p - 0.5
+    r = q * q
+    central_num = (((((a1 * r + a2) * r + a3) * r + a4) * r + a5) * r + a6) * q
+    central_den = (((((b1 * r + b2) * r + b3) * r + b4) * r + b5) * r + 1.0)
+    central = central_num / central_den
+
+    lower_q = fnp.sqrt(-2.0 * fnp.log(p))
+    lower_num = (((((c1 * lower_q + c2) * lower_q + c3) * lower_q + c4) * lower_q + c5) * lower_q + c6)
+    lower_den = ((((d1 * lower_q + d2) * lower_q + d3) * lower_q + d4) * lower_q + 1.0)
+    lower = lower_num / lower_den
+
+    upper_q = fnp.sqrt(-2.0 * fnp.log(1.0 - p))
+    upper_num = (((((c1 * upper_q + c2) * upper_q + c3) * upper_q + c4) * upper_q + c5) * upper_q + c6)
+    upper_den = ((((d1 * upper_q + d2) * upper_q + d3) * upper_q + d4) * upper_q + 1.0)
+    upper = -(upper_num / upper_den)
+
+    return fnp.asarray(
+        fnp.where(p < 0.02425, lower, fnp.where(p > 0.97575, upper, central)),
+        dtype=fnp.float32,
+    )
+
+
+def _lattice_normal_samples(n_samples: int, width: int, rng) -> fnp.ndarray:
+    roots = fnp.sqrt(fnp.array(_first_primes(width), dtype=fnp.float32))
+    generator = roots - fnp.floor(roots)
+    shift = fnp.asarray(rng.random(width), dtype=fnp.float32)
+
+    indices = fnp.arange(n_samples, dtype=fnp.float32)[:, None]
+    uniforms = indices * generator[None, :] + shift[None, :]
+    uniforms = uniforms - fnp.floor(uniforms)
+    return _normal_ppf_approx(uniforms)
+
+
+def _qmc_directions(n_samples: int, width: int, rng) -> fnp.ndarray:
+    normals = _lattice_normal_samples(n_samples, width, rng)
+    radii = fnp.sqrt(fnp.maximum(fnp.sum(normals * normals, axis=1), 1e-20))
+    return fnp.asarray(normals / radii[:, None], dtype=fnp.float32)
+
+
+def _angular_whitening_transform(directions: fnp.ndarray) -> fnp.ndarray:
+    n_samples, width = directions.shape
+    if n_samples < width:
+        return fnp.eye(width, dtype=fnp.float32)
+
+    second = (directions.T @ directions) * (float(width) / float(n_samples))
+    eigenvalues, eigenvectors = fnp.linalg.eigh(second)
+    eigenvalues = fnp.maximum(eigenvalues, _WHITENING_EIGENVALUE_FLOOR)
+    whitening = (eigenvectors / fnp.sqrt(eigenvalues)) @ eigenvectors.T
+    return fnp.asarray(whitening, dtype=fnp.float32)
+
+
+def _exact_first_layer_mean(weights: fnp.ndarray) -> fnp.ndarray:
+    std = fnp.sqrt(fnp.sum(weights * weights, axis=0))
+    return fnp.asarray(std / fnp.sqrt(2.0 * fnp.pi), dtype=fnp.float32)
+
+
+class Estimator(BaseEstimator):
+    def predict(self, mlp, budget: int | None) -> fnp.ndarray:
+        width = int(mlp.width)
+        depth = int(mlp.depth)
+        n_samples = _sample_count(budget, width, depth)
+        half_samples = n_samples // 2
+
+        rng = fnp.random.default_rng(mlp.seed)
+        half_directions = _qmc_directions(half_samples, width, rng)
+        whitening = _angular_whitening_transform(half_directions)
+
+        paired_directions = fnp.concatenate((half_directions, -half_directions), axis=0)
+        activations = paired_directions * fnp.asarray(_mean_chi(width), dtype=fnp.float32)
+
+        first_weights = fnp.asarray(mlp.weights[0], dtype=fnp.float32)
+        first_mean = _exact_first_layer_mean(first_weights)
+        rows = [first_mean]
+
+        activations = fnp.maximum(activations @ (whitening @ first_weights), 0.0)
+        previous_mean = first_mean
+
+        for raw_weights in mlp.weights[1:]:
+            weights = fnp.asarray(raw_weights, dtype=fnp.float32)
+            preactivations = activations @ weights
+
+            linear_mean = previous_mean @ weights
+            sample_linear_mean = fnp.mean(preactivations, axis=0)
+            centered_preactivations = preactivations + (linear_mean - sample_linear_mean)[None, :]
+            absolute_mean = fnp.mean(fnp.abs(centered_preactivations), axis=0)
+
+            layer_mean = fnp.maximum(0.5 * (linear_mean + absolute_mean), 0.0)
+            rows.append(fnp.asarray(layer_mean, dtype=fnp.float32))
+
+            activations = fnp.maximum(preactivations, 0.0)
+            previous_mean = layer_mean
+
+        return fnp.asarray(fnp.stack(rows, axis=0), dtype=fnp.float32)
+```

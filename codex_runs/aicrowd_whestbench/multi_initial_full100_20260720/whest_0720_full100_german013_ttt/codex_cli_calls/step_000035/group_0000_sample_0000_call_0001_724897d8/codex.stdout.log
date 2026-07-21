@@ -1,0 +1,139 @@
+```python
+from __future__ import annotations
+
+import math
+
+import flopscope.numpy as fnp
+from whestbench import BaseEstimator
+
+
+_EPS = 1e-7
+_INV_SQRT_2PI = 0.3989422804014327
+_BUDGET_FRACTION = 0.22
+_MIN_SAMPLES = 64
+_MAX_SAMPLES = 1_000_000
+_ARRAY_BYTES_LIMIT = 224 * 1024 * 1024
+_WORST_CASE_ITEMSIZE = 8
+_CONTROL_GAIN = 0.78
+_FINAL_GAUSS_BLEND = 0.35
+_QMC_SE_SCALE = 0.25
+
+
+def _chi_mean(dim: int) -> float:
+    return math.sqrt(2.0) * math.exp(
+        math.lgamma(0.5 * (float(dim) + 1.0)) - math.lgamma(0.5 * float(dim))
+    )
+
+
+def _sample_count(budget, width: int, depth: int) -> int:
+    per_sample = depth * (2 * width * width + width)
+    max_k_by_bytes = _ARRAY_BYTES_LIMIT // max(width * _WORST_CASE_ITEMSIZE, 1)
+
+    if budget is None:
+        k = min(_MAX_SAMPLES, max_k_by_bytes, 4096)
+    else:
+        k = int(_BUDGET_FRACTION * float(budget)) // max(per_sample, 1)
+        k = min(_MAX_SAMPLES, max_k_by_bytes, max(_MIN_SAMPLES, k))
+
+    return max(2, int(k) - (int(k) & 1))
+
+
+def _orthogonal_antithetic_sphere(rng, half: int, width: int):
+    u = rng.standard_normal((half, width), dtype=fnp.float32)
+
+    if half < width:
+        gram = u @ u.T
+        eigval, eigvec = fnp.linalg.eigh(gram)
+        eigval = fnp.maximum(eigval, _EPS)
+        inv_sqrt = (eigvec / fnp.sqrt(eigval)) @ eigvec.T
+        x = (inv_sqrt @ u) * fnp.sqrt(float(width))
+    else:
+        cov = (u.T @ u) / float(half)
+        eigval, eigvec = fnp.linalg.eigh(cov)
+        eigval = fnp.maximum(eigval, _EPS)
+        inv_sqrt = (eigvec / fnp.sqrt(eigval)) @ eigvec.T
+        x = u @ inv_sqrt
+
+    radius = _chi_mean(width)
+    norm = fnp.sqrt(fnp.sum(x * x, axis=1, keepdims=True))
+    x = x * (radius / fnp.maximum(norm, _EPS))
+    return fnp.concatenate([x, -x], axis=0)
+
+
+def _normal_cdf(x):
+    ax = fnp.maximum(x, -x)
+    t = 1.0 / (1.0 + 0.2316419 * ax)
+    poly = (
+        ((((1.330274429 * t - 1.821255978) * t + 1.781477937) * t - 0.356563782)
+         * t + 0.319381530)
+        * t
+    )
+    phi = _INV_SQRT_2PI * fnp.exp(-0.5 * ax * ax)
+    c = 1.0 - phi * poly
+    return fnp.where(x >= 0.0, c, 1.0 - c)
+
+
+def _gaussian_relu_mean(mu, var):
+    sigma = fnp.sqrt(fnp.maximum(var, _EPS))
+    alpha = mu / sigma
+    phi = _INV_SQRT_2PI * fnp.exp(-0.5 * alpha * alpha)
+    return sigma * phi + mu * _normal_cdf(alpha)
+
+
+def _final_smooth(cv_mean, gauss_mean, relu_second, sample_mean, k: int):
+    diff = fnp.maximum(gauss_mean - cv_mean, cv_mean - gauss_mean)
+    relu_var = fnp.maximum(relu_second - sample_mean * sample_mean, _EPS)
+    se = _QMC_SE_SCALE * fnp.sqrt(relu_var / float(max(k, 1))) + _EPS
+    trust = (se * se) / (se * se + diff * diff + _EPS)
+    return cv_mean + (_FINAL_GAUSS_BLEND * trust) * (gauss_mean - cv_mean)
+
+
+class Estimator(BaseEstimator):
+    def setup(self, context):
+        self._setup_seed = context.seed
+
+    def teardown(self):
+        pass
+
+    def predict(self, mlp, budget):
+        width = mlp.width
+        depth = mlp.depth
+        k = _sample_count(budget, width, depth)
+        half = k // 2
+
+        rng = fnp.random.default_rng(mlp.seed)
+        x = _orthogonal_antithetic_sphere(rng, half, width)
+
+        means = []
+        correction = None
+
+        for layer, weight in enumerate(mlp.weights):
+            z = x @ weight
+            gate = fnp.mean(z > 0.0, axis=0)
+            x = fnp.maximum(z, 0.0)
+            sample_mean = fnp.mean(x, axis=0)
+
+            if layer == 0:
+                exact_mean = fnp.sqrt(fnp.sum(weight * weight, axis=0)) * _INV_SQRT_2PI
+                correction = exact_mean - sample_mean
+                mean = exact_mean
+            else:
+                pre_correction = correction @ weight
+                correction = pre_correction * gate
+                mean = fnp.maximum(sample_mean + _CONTROL_GAIN * correction, 0.0)
+
+                if layer == depth - 1:
+                    z_mu = fnp.mean(z, axis=0) + _CONTROL_GAIN * pre_correction
+                    z_second = fnp.mean(z * z, axis=0)
+                    z_var = fnp.maximum(z_second - z_mu * z_mu, _EPS)
+                    gauss_mean = _gaussian_relu_mean(z_mu, z_var)
+                    relu_second = fnp.mean(x * x, axis=0)
+                    mean = fnp.maximum(
+                        _final_smooth(mean, gauss_mean, relu_second, sample_mean, k),
+                        0.0,
+                    )
+
+            means.append(mean)
+
+        return fnp.stack(means, axis=0)
+```

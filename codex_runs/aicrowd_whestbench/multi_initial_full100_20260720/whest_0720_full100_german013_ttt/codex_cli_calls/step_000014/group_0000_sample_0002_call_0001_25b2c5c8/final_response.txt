@@ -1,0 +1,93 @@
+```python
+from __future__ import annotations
+
+from math import exp, lgamma, sqrt
+
+import flopscope.numpy as fnp
+from whestbench import BaseEstimator
+
+
+_BUDGET_FRACTION = 0.18
+_MIN_SAMPLES = 64
+_MAX_SAMPLES = 1_000_000
+_ARRAY_BYTES_LIMIT = 192 * 1024 * 1024
+_WORST_CASE_ITEMSIZE = 8
+_EPS = 1e-6
+_INV_SQRT_2PI = 0.3989422804014327
+
+
+def _sample_count(budget, width: int, depth: int) -> int:
+    per_sample = depth * (2 * width * width + width)
+    max_k_by_bytes = _ARRAY_BYTES_LIMIT // max(width * _WORST_CASE_ITEMSIZE, 1)
+
+    if budget is None:
+        k = min(_MAX_SAMPLES, max_k_by_bytes, 4096)
+    else:
+        k = int(_BUDGET_FRACTION * float(budget)) // max(per_sample, 1)
+        k = max(_MIN_SAMPLES, min(_MAX_SAMPLES, max_k_by_bytes, k))
+
+    return max(2, int(k) - (int(k) & 1))
+
+
+def _mean_chi_radius(width: int) -> float:
+    w = float(width)
+    return sqrt(2.0) * exp(lgamma(0.5 * (w + 1.0)) - lgamma(0.5 * w))
+
+
+def _first_layer_mean(weight):
+    return fnp.sqrt(fnp.sum(weight * weight, axis=0)) * _INV_SQRT_2PI
+
+
+def _orthogonal_antithetic_sphere(rng, half: int, width: int):
+    u = rng.standard_normal((half, width), dtype=fnp.float32)
+
+    if half < width:
+        gram = u @ u.T
+        eigval, eigvec = fnp.linalg.eigh(gram)
+        eigval = fnp.maximum(eigval, _EPS)
+        inv_sqrt = (eigvec / fnp.sqrt(eigval)) @ eigvec.T
+        x = inv_sqrt @ u
+    else:
+        cov = (u.T @ u) / float(half)
+        eigval, eigvec = fnp.linalg.eigh(cov)
+        eigval = fnp.maximum(eigval, _EPS)
+        inv_sqrt = (eigvec / fnp.sqrt(eigval)) @ eigvec.T
+        x = u @ inv_sqrt
+
+    norm = fnp.sqrt(fnp.maximum(fnp.sum(x * x, axis=1), _EPS))
+    x = (x / norm[:, None]) * _mean_chi_radius(width)
+    return fnp.concatenate([x, -x], axis=0)
+
+
+class Estimator(BaseEstimator):
+    def setup(self, context):
+        self._setup_seed = context.seed
+
+    def teardown(self):
+        pass
+
+    def predict(self, mlp, budget):
+        width = mlp.width
+        depth = mlp.depth
+
+        if depth == 1:
+            return fnp.stack([_first_layer_mean(mlp.weights[0])], axis=0)
+
+        k = _sample_count(budget, width, depth)
+        half = k // 2
+
+        rng = fnp.random.default_rng(mlp.seed)
+        x = _orthogonal_antithetic_sphere(rng, half, width)
+
+        means = []
+        for layer, weight in enumerate(mlp.weights):
+            z = x @ weight
+            x = fnp.maximum(z, 0.0)
+
+            if layer == 0:
+                means.append(_first_layer_mean(weight))
+            else:
+                means.append(fnp.mean(x, axis=0))
+
+        return fnp.stack(means, axis=0)
+```

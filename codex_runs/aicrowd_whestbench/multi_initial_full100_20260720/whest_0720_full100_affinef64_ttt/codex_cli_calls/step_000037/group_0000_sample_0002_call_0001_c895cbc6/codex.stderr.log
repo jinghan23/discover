@@ -1,0 +1,320 @@
+OpenAI Codex v0.144.3
+--------
+workdir: /opt/tiger/discover
+model: gpt-5.5
+provider: openai
+approval: never
+sandbox: read-only
+reasoning effort: xhigh
+reasoning summaries: none
+session id: 019f7cef-2a31-7842-867c-9fad7a66d3d1
+--------
+user
+You are solving the ARC White-Box Estimation Challenge 2026
+(WhestBench) under the official evaluator contract.
+
+Task:
+- You receive the weights of a randomly initialized square ReLU MLP.
+- Inputs follow a standard normal distribution.
+- Predict the per-neuron post-ReLU activation mean for every layer.
+- Return a `flopscope.numpy.ndarray` with shape `(mlp.depth, mlp.width)`.
+
+Required submission interface:
+- Import `flopscope.numpy as fnp` for numerical operations.
+- Define `class Estimator(BaseEstimator)` with
+  `predict(self, mlp, budget)`.
+- Optional `setup(self, context)` and `teardown(self)` hooks follow the official
+  WhestBench API.
+- Seed predict-time randomness from `mlp.seed` and setup-time randomness from
+  `context.seed`.
+
+Official scoring:
+- For each MLP, compute final-layer MSE against the official Monte Carlo target.
+- Effective compute is `C = FLOPs + lambda * residual_wall_time`.
+- A valid MLP score is `final_layer_mse * max(0.1, C / flop_budget)`.
+- The suite score is the arithmetic mean of those per-MLP scores; lower is better.
+- Exceptions, invalid shapes/non-finite values, FLOP/time exhaustion, or combined
+  budget exhaustion use an all-zero prediction and multiplier 1.0 for that MLP.
+- All-layer MSE is diagnostic only.
+
+Do not use plain NumPy or uninstrumented numerical libraries to evade FLOP
+accounting. Residual Python or uninstrumented work is charged at the official
+lambda rate and can exhaust the combined budget.
+
+Fairness and data isolation:
+- Derive predictions only from the `mlp` weights and allowed setup context.
+- Do not inspect, search for, or read evaluation datasets, Hugging Face caches,
+  saved evaluation reports, target moments, or ground-truth files.
+- Do not hardcode values tied to public mini MLPs. Such candidates are invalid
+  even if they receive a low local score.
+
+Algorithm directions worth exploring:
+- Mean and diagonal-variance propagation through ReLU moments.
+- Full, structured, or low-rank covariance propagation.
+- Hybrid analytic propagation with compute-budgeted Monte Carlo probes.
+- Layer-wise corrections for correlation error in deep networks.
+- Allocating FLOPs to layers where final-layer MSE is most sensitive.
+
+
+Official evaluation suite for this run:
+- dataset: None@None
+- split / MLPs: None / first None
+- width / depth: None / None
+- FLOP budget per MLP: None
+- residual penalty lambda: None FLOPs/second
+- runner: None
+
+You are iteratively optimizing budget-adjusted final-layer score.
+Here is the last code we ran:
+```python
+from __future__ import annotations
+
+import flopscope.numpy as fnp
+from whestbench import BaseEstimator
+
+
+_BUDGET_FRACTION = 0.142
+_MIN_SAMPLES = 32
+_MAX_SAMPLES = 1_000_000
+_ARRAY_BYTES_LIMIT = 100 * 1024 * 1024
+_WORST_CASE_ITEMSIZE = 8
+_SETUP_SEED_OFFSET = 3
+
+_PI = 3.141592653589793
+_INV_2PI = 0.15915494309189535
+_INV_SQRT_2PI = 0.3989422804014327
+_RELU_ZERO_VARIANCE = 0.5 - _INV_SQRT_2PI * _INV_SQRT_2PI
+_FINAL_GAUSSIAN_BLEND = 0.06
+_FIRST_COV_WIDTH_LIMIT = 2048
+
+
+def _to_int(value, default=0):
+    try:
+        if value is None:
+            return default
+        return int(value)
+    except Exception:
+        return default
+
+
+def _sample_count(budget: int, width: int, depth: int) -> int:
+    per_sample = depth * (2 * width * width + width) + width * width
+    fixed = 17 * width**3
+    k = (int(_BUDGET_FRACTION * budget) - fixed) // max(per_sample, 1)
+    max_k_by_bytes = _ARRAY_BYTES_LIMIT // max(width * _WORST_CASE_ITEMSIZE, 1)
+    k = int(max(_MIN_SAMPLES, min(_MAX_SAMPLES, max_k_by_bytes, k)))
+    return k - (k & 1)
+
+
+def _normal_cdf(x):
+    ax = fnp.abs(x)
+    t = 1.0 / (1.0 + 0.2316419 * ax)
+    poly = (
+        ((((1.330274429 * t - 1.821255978) * t + 1.781477937) * t - 0.356563782)
+         * t + 0.319381530)
+        * t
+    )
+    cdf_pos = 1.0 - _INV_SQRT_2PI * fnp.exp(-0.5 * ax * ax) * poly
+    return fnp.where(x >= 0.0, cdf_pos, 1.0 - cdf_pos)
+
+
+def _gaussian_relu_mean(mean, variance):
+    variance = fnp.maximum(variance, 1e-12)
+    std = fnp.sqrt(variance)
+    t = mean / std
+    return std * _INV_SQRT_2PI * fnp.exp(-0.5 * t * t) + mean * _normal_cdf(t)
+
+
+def _correct_columns(values, target_mean, target_variance):
+    sample_mean = fnp.mean(values, axis=0)
+    sample_second = fnp.mean(values * values, axis=0)
+    sample_variance = fnp.maximum(sample_second - sample_mean * sample_mean, 1e-6)
+    scale = fnp.sqrt(fnp.maximum(target_variance, 1e-12) / sample_variance)
+    return fnp.asarray((values - sample_mean) * scale + target_mean, dtype=fnp.float32)
+
+
+def _first_relu_covariance(weight, variance, mean):
+    std = fnp.sqrt(fnp.maximum(variance, 1e-12))
+    gram = weight.T @ weight
+    denom = fnp.maximum(std[:, None] * std[None, :], 1e-12)
+    rho = fnp.minimum(1.0, fnp.maximum(-1.0, gram / denom))
+    root = fnp.sqrt(fnp.maximum(1.0 - rho * rho, 0.0))
+    second = denom * (root + (_PI - fnp.arccos(rho)) * rho) * _INV_2PI
+    return fnp.asarray(second - mean[:, None] * mean[None, :], dtype=fnp.float32)
+
+
+class Estimator(BaseEstimator):
+    def setup(self, context):
+        self._samples = None
+        self._width = None
+        self._depth = None
+        self._sample_seed = None
+        self._setup_seed = _to_int(getattr(context, "seed", 0)) + _SETUP_SEED_OFFSET
+
+        width = getattr(context, "width", None)
+        depth = getattr(context, "depth", None)
+        flop_budget = _to_int(getattr(context, "flop_budget", 0))
+
+        if width is not None and depth is not None and flop_budget > 0:
+            self._width = int(width)
+            self._depth = int(depth)
+            self._sample_seed = self._setup_seed
+            self._samples = self._make_samples(
+                self._width,
+                _sample_count(flop_budget, self._width, self._depth),
+                self._setup_seed,
+            )
+
+    def teardown(self):
+        self._samples = None
+        self._sample_seed = None
+
+    def _make_samples(self, width, k, seed):
+        rng = fnp.random.default_rng(seed)
+        u = rng.standard_normal((k // 2, width), dtype=fnp.float32)
+
+        covariance = (u.T @ u) / float(k // 2)
+        eigenvalues, eigenvectors = fnp.linalg.eigh(covariance)
+        eigenvalues = fnp.maximum(eigenvalues, 1e-6)
+        inverse_sqrt = (eigenvectors / fnp.sqrt(eigenvalues)) @ eigenvectors.T
+
+        half = fnp.asarray(u @ inverse_sqrt, dtype=fnp.float32)
+        return fnp.concatenate([half, -half], axis=0)
+
+    def predict(self, mlp, budget):
+        width = int(mlp.width)
+        depth = int(mlp.depth)
+        sample_seed = getattr(self, "_setup_seed", None)
+        if sample_seed is None:
+            sample_seed = int(mlp.seed) + _SETUP_SEED_OFFSET
+
+        if (
+            not hasattr(self, "_samples")
+            or self._samples is None
+            or self._samples.shape[1] != width
+            or getattr(self, "_depth", depth) != depth
+            or getattr(self, "_sample_seed", None) != sample_seed
+        ):
+            self._samples = self._make_samples(
+                width,
+                _sample_count(_to_int(budget), width, depth),
+                sample_seed,
+            )
+            self._width = width
+            self._depth = depth
+            self._sample_seed = sample_seed
+
+        first_weight = mlp.weights[0]
+        first_variance = fnp.sum(first_weight * first_weight, axis=0)
+        first_mean = fnp.sqrt(fnp.maximum(first_variance, 1e-12)) * _INV_SQRT_2PI
+
+        if depth == 1:
+            return fnp.asarray(first_mean[None, :], dtype=fnp.float32)
+
+        x = fnp.maximum(self._samples @ first_weight, 0.0)
+        x = _correct_columns(x, first_mean, first_variance * _RELU_ZERO_VARIANCE)
+
+        first_covariance = None
+        if width <= _FIRST_COV_WIDTH_LIMIT:
+            first_covariance = _first_relu_covariance(
+                first_weight,
+                first_variance,
+                first_mean,
+            )
+
+        if depth == 2:
+            final_weight = mlp.weights[1]
+            z = x @ final_weight
+
+            if first_covariance is not None:
+                z_mean = first_mean @ final_weight
+                z_variance = fnp.sum(
+                    final_weight * (first_covariance @ final_weight),
+                    axis=0,
+                )
+                z = _correct_columns(z, z_mean, z_variance)
+            else:
+                z_mean = fnp.mean(z, axis=0)
+                z_second = fnp.mean(z * z, axis=0)
+                z_variance = fnp.maximum(z_second - z_mean * z_mean, 1e-6)
+
+            sample_mean = fnp.asarray(
+                fnp.mean(fnp.asarray(fnp.maximum(z, 0.0), dtype=fnp.float64), axis=0),
+                dtype=fnp.float32,
+            )
+            gaussian_mean = fnp.asarray(
+                _gaussian_relu_mean(z_mean, z_variance),
+                dtype=fnp.float32,
+            )
+            final_mean = fnp.asarray(
+                (1.0 - _FINAL_GAUSSIAN_BLEND) * sample_mean
+                + _FINAL_GAUSSIAN_BLEND * gaussian_mean,
+                dtype=fnp.float32,
+            )
+            return fnp.concatenate([first_mean[None, :], final_mean[None, :]], axis=0)
+
+        second_weight = mlp.weights[1]
+        z = x @ second_weight
+        if first_covariance is not None:
+            second_mean = first_mean @ second_weight
+            second_variance = fnp.sum(
+                second_weight * (first_covariance @ second_weight),
+                axis=0,
+            )
+            z = _correct_columns(z, second_mean, second_variance)
+        x = fnp.maximum(z, 0.0)
+
+        for weight in mlp.weights[2:-1]:
+            x = fnp.maximum(x @ weight, 0.0)
+
+        final_weight = mlp.weights[-1]
+        z = x @ final_weight
+        sample_mean = fnp.asarray(
+            fnp.mean(fnp.asarray(fnp.maximum(z, 0.0), dtype=fnp.float64), axis=0),
+            dtype=fnp.float32,
+        )
+
+        z_mean = fnp.mean(z, axis=0)
+        z_second = fnp.mean(z * z, axis=0)
+        z_variance = fnp.maximum(z_second - z_mean * z_mean, 1e-6)
+        gaussian_mean = fnp.asarray(
+            _gaussian_relu_mean(z_mean, z_variance),
+            dtype=fnp.float32,
+        )
+
+        final_mean = fnp.asarray(
+            (1.0 - _FINAL_GAUSSIAN_BLEND) * sample_mean
+            + _FINAL_GAUSSIAN_BLEND * gaussian_mean,
+            dtype=fnp.float32,
+        )
+
+        middle = fnp.zeros((depth - 2, width), dtype=fnp.float32)
+        return fnp.concatenate(
+            [first_mean[None, :], middle, final_mean[None, :]],
+            axis=0,
+        )
+```
+Here is the budget-adjusted final-layer score before and after running the code above (lower is better): 0.000000 -> 0.000000
+Target: 1e-07. Current gap: 0.000000. Further improvements will also be generously rewarded.
+
+--- Previous Program Output ---
+
+
+		 ...(TRUNCATED)...
+e-06 | 3.8103596e+10 | ok
+benjamin-dean | 1.0073514e-07 | 7.1902548e-07 | 3.8107076e+10 | ok
+michele-galvan | 2.0435447e-07 | 1.4587295e-06 | 3.8104677e+10 | ok
+cathy-butler | 5.6405614e-07 | 4.0277682e-06 | 3.8091385e+10 | ok
+lindsey-chase | 1.0813221e-06 | 7.7187369e-06 | 3.8104628e+10 | ok
+kenneth-hernandez | 1.3101892e-07 | 9.3523255e-07 | 3.8105119e+10 | ok
+lauren-flowers | 1.5502779e-07 | 1.1064883e-06 | 3.8109357e+10 | ok
+kristi-johnson | 3.6188922e-07 | 2.5835243e-06 | 3.8100616e+10 | ok
+--- End Output ---
+
+Return one final Python code block containing an official `Estimator` class.
+
+
+Return only the final answer content. Do not edit files or run tools.
+warning: Codex could not find bubblewrap on PATH. Install bubblewrap with your OS package manager. See the sandbox prerequisites: https://developers.openai.com/codex/concepts/sandboxing#prerequisites. Codex will use the bundled bubblewrap in the meantime.
+ERROR: You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at Jul 25th, 2026 7:20 PM.
+ERROR: You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at Jul 25th, 2026 7:20 PM.

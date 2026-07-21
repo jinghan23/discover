@@ -1,0 +1,35 @@
+# WhestBench search trajectory snapshots
+
+This directory contains curated, point-in-time records of completed discovery
+runs.  The local run roots are much larger than the Git snapshot because every
+autonomous call also creates a disposable Codex home, evaluation workspace,
+dependency cache, and repeated pool snapshots.
+
+## 2026-07-21 snapshot
+
+The committed snapshot includes:
+
+- all 18 completed runs under `multi_initial_20260718/`;
+- the six completed `*_ttt` runs under
+  `multi_initial_full100_20260720/`;
+- run-level `metrics.jsonl`, `agent_outputs.jsonl`, score/state streams, and the
+  final cumulative pool snapshot;
+- model-call prompts, stdout/stderr transcripts, final responses, commands,
+  sanitized environment descriptions, and final `submission.py` files;
+- initial estimators, completed-run console logs, and submission review logs.
+
+The twelve `*_auto_r*` full-100 runs were still active when this snapshot was
+created and are intentionally not included.  They should be archived only
+after their metrics, model-call logs, and final pools stop changing.
+
+The snapshot intentionally excludes `*_codex_home/`, `eval_tmp/`, Python
+caches, dependency/plugin copies, hourly review cycle workspaces, and all but
+the latest cumulative `puct_sampler_step_*.json` or
+`autoevolve_pool_step_*.json` file per completed run.  The retained JSONL
+streams preserve the per-step trajectory; earlier cumulative pool files would
+mostly duplicate the final snapshot.
+
+Three autonomous `codex.stderr.log` transcripts that printed a host credential
+during process inspection are also excluded.  Their neighboring prompt,
+stdout, final response, command metadata, and `submission.py` remain in the
+snapshot; the unredacted transcripts remain local and ignored.

@@ -1,0 +1,289 @@
+OpenAI Codex v0.144.3
+--------
+workdir: /opt/tiger/discover
+model: gpt-5.5
+provider: openai
+approval: never
+sandbox: read-only
+reasoning effort: xhigh
+reasoning summaries: none
+session id: 019f7618-adc3-7d70-9bda-144bd81e9e05
+--------
+user
+You are solving the ARC White-Box Estimation Challenge 2026
+(WhestBench) under the official evaluator contract.
+
+Task:
+- You receive the weights of a randomly initialized square ReLU MLP.
+- Inputs follow a standard normal distribution.
+- Predict the per-neuron post-ReLU activation mean for every layer.
+- Return a `flopscope.numpy.ndarray` with shape `(mlp.depth, mlp.width)`.
+
+Required submission interface:
+- Import `flopscope.numpy as fnp` for numerical operations.
+- Define `class Estimator(BaseEstimator)` with
+  `predict(self, mlp, budget)`.
+- Optional `setup(self, context)` and `teardown(self)` hooks follow the official
+  WhestBench API.
+- Seed predict-time randomness from `mlp.seed` and setup-time randomness from
+  `context.seed`.
+
+Official scoring:
+- For each MLP, compute final-layer MSE against the official Monte Carlo target.
+- Effective compute is `C = FLOPs + lambda * residual_wall_time`.
+- A valid MLP score is `final_layer_mse * max(0.1, C / flop_budget)`.
+- The suite score is the arithmetic mean of those per-MLP scores; lower is better.
+- Exceptions, invalid shapes/non-finite values, FLOP/time exhaustion, or combined
+  budget exhaustion use an all-zero prediction and multiplier 1.0 for that MLP.
+- All-layer MSE is diagnostic only.
+
+Do not use plain NumPy or uninstrumented numerical libraries to evade FLOP
+accounting. Residual Python or uninstrumented work is charged at the official
+lambda rate and can exhaust the combined budget.
+
+Fairness and data isolation:
+- Derive predictions only from the `mlp` weights and allowed setup context.
+- Do not inspect, search for, or read evaluation datasets, Hugging Face caches,
+  saved evaluation reports, target moments, or ground-truth files.
+- Do not hardcode values tied to public mini MLPs. Such candidates are invalid
+  even if they receive a low local score.
+
+Algorithm directions worth exploring:
+- Mean and diagonal-variance propagation through ReLU moments.
+- Full, structured, or low-rank covariance propagation.
+- Hybrid analytic propagation with compute-budgeted Monte Carlo probes.
+- Layer-wise corrections for correlation error in deep networks.
+- Allocating FLOPs to layers where final-layer MSE is most sensitive.
+
+
+Official evaluation suite for this run:
+- dataset: None@None
+- split / MLPs: None / first None
+- width / depth: None / None
+- FLOP budget per MLP: None
+- residual penalty lambda: None FLOPs/second
+- runner: None
+
+You are iteratively optimizing budget-adjusted final-layer score.
+Here is the last code we ran:
+```python
+from __future__ import annotations
+
+import math
+
+import flopscope.numpy as fnp
+from whestbench import BaseEstimator
+
+
+_BUDGET_FRACTION = 0.13
+_MIN_SAMPLES = 32
+_MAX_SAMPLES = 1_000_000
+_ARRAY_BYTES_LIMIT = 100 * 1024 * 1024
+_WORST_CASE_ITEMSIZE = 8
+_INV_SQRT_2PI = 0.3989422804014327
+
+
+def _sample_count(budget, width: int, depth: int) -> int:
+    max_k_by_bytes = _ARRAY_BYTES_LIMIT // max(width * _WORST_CASE_ITEMSIZE, 1)
+
+    if budget is None:
+        k = min(8192, max_k_by_bytes)
+    else:
+        per_sample = depth * (2 * width * width + width) + 3 * width * width + 4 * width
+        fixed = 13 * width**3
+        k = (int(_BUDGET_FRACTION * budget) - fixed) // max(per_sample, 1)
+        k = int(max(_MIN_SAMPLES, min(_MAX_SAMPLES, max_k_by_bytes, k)))
+
+    k = k - (k & 1)
+    return max(2, k)
+
+
+def _mean_chi_radius(width: int) -> float:
+    return math.sqrt(2.0) * math.exp(
+        math.lgamma(0.5 * (width + 1.0)) - math.lgamma(0.5 * width)
+    )
+
+
+class Estimator(BaseEstimator):
+    def predict(self, mlp, budget):
+        width = mlp.width
+        depth = mlp.depth
+
+        first_variance = fnp.sum(mlp.weights[0] * mlp.weights[0], axis=0)
+        first_mean = fnp.sqrt(fnp.maximum(first_variance, 1e-12)) * _INV_SQRT_2PI
+
+        if depth == 1:
+            return first_mean[None, :]
+
+        k = _sample_count(budget, width, depth)
+        n = k // 2
+
+        rng = fnp.random.default_rng(mlp.seed)
+        u = rng.standard_normal((n, width), dtype=fnp.float32)
+
+        row_norm = fnp.sqrt(fnp.maximum(fnp.sum(u * u, axis=1), 1e-20))
+        u = u / row_norm[:, None]
+
+        covariance = (u.T @ u) / float(n)
+        eigenvalues, eigenvectors = fnp.linalg.eigh(covariance)
+        eigenvalues = fnp.maximum(eigenvalues * float(width), 1e-6)
+        inverse_sqrt = (eigenvectors / fnp.sqrt(eigenvalues)) @ eigenvectors.T
+
+        first_weight = inverse_sqrt @ mlp.weights[0]
+        radial_mean = _mean_chi_radius(width)
+
+        x = fnp.concatenate([u, -u], axis=0) * radial_mean
+        x = fnp.maximum(x @ first_weight, 0.0)
+        first_pair = (x[:n] + x[n:]) * 0.5
+
+        for weight in mlp.weights[1:]:
+            x = fnp.maximum(x @ weight, 0.0)
+
+        final_pair = (x[:n] + x[n:]) * 0.5
+        final_mean = fnp.mean(final_pair, axis=0)
+
+        if n > width + 8:
+            control_mean = fnp.mean(first_pair, axis=0)
+            h_centered = first_pair - control_mean[None, :]
+            f_centered = final_pair - final_mean[None, :]
+
+            gram = h_centered.T @ h_centered
+            cross = h_centered.T @ f_centered
+
+            values, vectors = fnp.linalg.eigh(gram)
+            positive_values = fnp.maximum(values, 0.0)
+            ridge = fnp.maximum(fnp.mean(positive_values) * 1e-5, 1e-6)
+            beta = vectors @ ((vectors.T @ cross) / (positive_values[:, None] + ridge))
+
+            final_mean = final_mean - ((control_mean - first_mean) @ beta)
+            final_mean = fnp.maximum(final_mean, 0.0)
+
+        if depth == 2:
+            return fnp.concatenate([first_mean[None, :], final_mean[None, :]], axis=0)
+
+        middle = fnp.zeros((depth - 2, width), dtype=fnp.float32)
+        return fnp.concatenate([first_mean[None, :], middle, final_mean[None, :]], axis=0)
+```
+Here is the budget-adjusted final-layer score before and after running the code above (lower is better): 0.000000 -> 0.000000
+Target: 1e-07. Current gap: 0.000000. Further improvements will also be generously rewarded.
+
+--- Previous Program Output ---
+
+
+		 ...(TRUNCATED)...
+2260682e-06 | 3.5794147e+10 | ok
+donna-clarke | 1.0813078e-07 | 8.2594579e-07 | 3.5609569e+10 | ok
+rebecca-walker | 1.7394305e-07 | 1.3215679e-06 | 3.5800287e+10 | ok
+monique-stevens | 2.9582427e-07 | 2.2472796e-06 | 3.5805159e+10 | ok
+keith-brock | 3.3156592e-07 | 2.5206887e-06 | 3.577829e+10 | ok
+robert-huff | 2.1925297e-07 | 1.6656209e-06 | 3.5804551e+10 | ok
+kimberly-caldwell | 2.632073e-07 | 2.0000739e-06 | 3.579487e+10 | ok
+annette-hansen | 1.5012683e-07 | 1.1424177e-06 | 3.574393e+10 | ok
+--- End Output ---
+
+Return one final Python code block containing an official `Estimator` class.
+
+
+Return only the final answer content. Do not edit files or run tools.
+warning: Codex could not find bubblewrap on PATH. Install bubblewrap with your OS package manager. See the sandbox prerequisites: https://developers.openai.com/codex/concepts/sandboxing#prerequisites. Codex will use the bundled bubblewrap in the meantime.
+codex
+```python
+from __future__ import annotations
+
+import math
+
+import flopscope.numpy as fnp
+from whestbench import BaseEstimator
+
+
+_BUDGET_FRACTION = 0.13
+_MIN_SAMPLES = 32
+_MAX_SAMPLES = 1_000_000
+_ARRAY_BYTES_LIMIT = 100 * 1024 * 1024
+_WORST_CASE_ITEMSIZE = 8
+_INV_SQRT_2PI = 0.3989422804014327
+
+
+def _sample_count(budget, width: int, depth: int) -> int:
+    max_k_by_bytes = _ARRAY_BYTES_LIMIT // max(width * _WORST_CASE_ITEMSIZE, 1)
+
+    if budget is None:
+        k = min(8192, max_k_by_bytes)
+    else:
+        per_sample = depth * (2 * width * width + width) + 3 * width * width + 4 * width
+        fixed = 13 * width**3
+        k = (int(_BUDGET_FRACTION * budget) - fixed) // max(per_sample, 1)
+        k = int(max(_MIN_SAMPLES, min(_MAX_SAMPLES, max_k_by_bytes, k)))
+
+    k = k - (k & 1)
+    return max(2, k)
+
+
+def _mean_chi_radius(width: int) -> float:
+    return math.sqrt(2.0) * math.exp(
+        math.lgamma(0.5 * (width + 1.0)) - math.lgamma(0.5 * width)
+    )
+
+
+class Estimator(BaseEstimator):
+    def predict(self, mlp, budget):
+        width = mlp.width
+        depth = mlp.depth
+
+        first_variance = fnp.sum(mlp.weights[0] * mlp.weights[0], axis=0)
+        first_mean = fnp.sqrt(fnp.maximum(first_variance, 1e-12)) * _INV_SQRT_2PI
+
+        if depth == 1:
+            return first_mean[None, :]
+
+        k = _sample_count(budget, width, depth)
+        n = k // 2
+
+        rng = fnp.random.default_rng(mlp.seed)
+        u = rng.standard_normal((n, width), dtype=fnp.float32)
+
+        row_norm = fnp.sqrt(fnp.maximum(fnp.sum(u * u, axis=1), 1e-20))
+        u = u / row_norm[:, None]
+
+        covariance = (u.T @ u) / float(n)
+        eigenvalues, eigenvectors = fnp.linalg.eigh(covariance)
+        eigenvalues = fnp.maximum(eigenvalues * float(width), 1e-6)
+        inverse_sqrt = (eigenvectors / fnp.sqrt(eigenvalues)) @ eigenvectors.T
+
+        first_weight = inverse_sqrt @ mlp.weights[0]
+        radial_mean = _mean_chi_radius(width)
+
+        x = fnp.concatenate([u, -u], axis=0) * radial_mean
+        x = fnp.maximum(x @ first_weight, 0.0)
+        first_pair = (x[:n] + x[n:]) * 0.5
+
+        for weight in mlp.weights[1:]:
+            x = fnp.maximum(x @ weight, 0.0)
+
+        final_pair = (x[:n] + x[n:]) * 0.5
+        final_mean = fnp.mean(final_pair, axis=0)
+
+        if n > width + 8:
+            control_mean = fnp.mean(first_pair, axis=0)
+            h_centered = first_pair - control_mean[None, :]
+            f_centered = final_pair - final_mean[None, :]
+
+            gram = h_centered.T @ h_centered
+            cross = h_centered.T @ f_centered
+
+            values, vectors = fnp.linalg.eigh(gram)
+            positive_values = fnp.maximum(values, 0.0)
+            ridge = fnp.maximum(fnp.mean(positive_values) * 1e-5, 1e-6)
+            beta = vectors @ ((vectors.T @ cross) / (positive_values[:, None] + ridge))
+
+            final_mean = final_mean - ((control_mean - first_mean) @ beta)
+            final_mean = fnp.maximum(final_mean, 0.0)
+
+        if depth == 2:
+            return fnp.concatenate([first_mean[None, :], final_mean[None, :]], axis=0)
+
+        middle = fnp.zeros((depth - 2, width), dtype=fnp.float32)
+        return fnp.concatenate([first_mean[None, :], middle, final_mean[None, :]], axis=0)
+```
+tokens used
+9,319

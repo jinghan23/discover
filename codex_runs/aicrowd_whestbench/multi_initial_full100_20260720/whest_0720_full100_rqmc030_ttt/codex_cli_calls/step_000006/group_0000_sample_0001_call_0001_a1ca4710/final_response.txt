@@ -1,0 +1,142 @@
+```python
+from __future__ import annotations
+
+import math
+
+import flopscope as flops
+import flopscope.numpy as fnp
+from whestbench import BaseEstimator
+
+
+_INV_SQRT_2PI = 0.39894228040143267794
+_TAIL_CLIP = 1e-12
+_ARRAY_BYTES_LIMIT = 128 * 1024 * 1024
+_FLOAT64_ITEMSIZE = 8
+
+
+def _first_primes(count: int) -> tuple[int, ...]:
+    primes = []
+    candidate = 2
+    while len(primes) < count:
+        ok = True
+        for prime in primes:
+            if prime * prime > candidate:
+                break
+            if candidate % prime == 0:
+                ok = False
+                break
+        if ok:
+            primes.append(candidate)
+        candidate += 1
+    return tuple(primes)
+
+
+def _lattice_generator(width: int) -> fnp.ndarray:
+    roots = fnp.sqrt(fnp.array(_first_primes(width), dtype=fnp.float64))
+    return roots - fnp.floor(roots)
+
+
+def _mean_chi(dim: int) -> float:
+    return math.sqrt(2.0) * math.exp(
+        math.lgamma(0.5 * (dim + 1.0)) - math.lgamma(0.5 * dim)
+    )
+
+
+def _sample_count(budget: int, width: int, depth: int) -> int:
+    forward = depth * (2 * width * width + width)
+    transforms = 55 * width + 6 * width * width
+    per_sample = max(1, forward + transforms)
+    fixed = 5 * width * width * width + 12 * width * width + 16 * width
+    count = (int(0.082 * budget) - fixed) // per_sample
+    max_by_bytes = _ARRAY_BYTES_LIMIT // max(width * _FLOAT64_ITEMSIZE, 1)
+    count = int(max(8, min(count, max_by_bytes)))
+    return count if count % 2 == 0 else count - 1
+
+
+def _exact_first_layer_mean(weight: fnp.ndarray) -> fnp.ndarray:
+    sigma = fnp.sqrt(fnp.sum(weight * weight, axis=0))
+    return sigma * _INV_SQRT_2PI
+
+
+def _sphere_inputs(n_samples: int, width: int, seed: int) -> fnp.ndarray:
+    half = max(1, n_samples // 2)
+    rng = fnp.random.default_rng(seed)
+    generator = _lattice_generator(width)
+    shift = rng.random(width)
+
+    idx = fnp.arange(half, dtype=fnp.float64)[:, None]
+    uniforms = idx * generator[None, :] + shift[None, :]
+    uniforms = uniforms - fnp.floor(uniforms)
+    uniforms = fnp.clip(uniforms, _TAIL_CLIP, 1.0 - _TAIL_CLIP)
+
+    z = flops.stats.norm.ppf(uniforms)
+    norm = fnp.sqrt(fnp.sum(z * z, axis=1, keepdims=True))
+    z = (_mean_chi(width) * z) / fnp.maximum(norm, 1e-30)
+    return fnp.concatenate((z, -z), axis=0)
+
+
+def _ridge_solve_cv(
+    control: fnp.ndarray,
+    exact_control_mean: fnp.ndarray,
+    target: fnp.ndarray,
+    ridge_base: float,
+) -> fnp.ndarray:
+    n = control.shape[0]
+    width = control.shape[1]
+
+    c_mean = fnp.mean(control, axis=0)
+    y_mean = fnp.mean(target, axis=0)
+    c0 = control - c_mean
+    y0 = target - y_mean
+
+    cov_cc = (c0.T @ c0) / n
+    cov_cy = (c0.T @ y0) / n
+    scale = fnp.mean(fnp.diag(cov_cc))
+    ridge = fnp.maximum(scale, 1e-30) * ridge_base
+    beta = fnp.linalg.solve(cov_cc + ridge * fnp.eye(width, dtype=fnp.float64), cov_cy)
+    return y_mean - (c_mean - exact_control_mean) @ beta
+
+
+class Estimator(BaseEstimator):
+    def setup(self, context):
+        self._setup_seed = context.seed
+
+    def predict(self, mlp, budget):
+        width = mlp.width
+        depth = mlp.depth
+        n_samples = _sample_count(budget, width, depth)
+
+        activations = _sphere_inputs(n_samples, width, mlp.seed)
+        rows = []
+        first_activations = None
+        exact_first_mean = None
+        prev_activations = None
+        prev_mean = None
+
+        for layer_index, weight in enumerate(mlp.weights):
+            prev_activations = activations
+            activations = fnp.maximum(activations @ weight, 0.0)
+
+            if layer_index == 0:
+                exact_first_mean = _exact_first_layer_mean(weight)
+                first_activations = activations
+                rows.append(exact_first_mean)
+                prev_mean = exact_first_mean
+            else:
+                mean_est = fnp.mean(activations, axis=0)
+                rows.append(mean_est)
+                prev_mean = mean_est
+
+        if depth > 1 and first_activations is not None and exact_first_mean is not None:
+            try:
+                rows[-1] = _ridge_solve_cv(
+                    first_activations,
+                    exact_first_mean,
+                    activations,
+                    0.012 + width / fnp.maximum(float(n_samples), 1.0),
+                )
+            except Exception:
+                rows[-1] = fnp.mean(activations, axis=0)
+
+        return fnp.stack(rows, axis=0)
+```

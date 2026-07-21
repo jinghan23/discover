@@ -1,0 +1,215 @@
+```python
+from __future__ import annotations
+
+import math
+
+import flopscope as flops
+import flopscope.numpy as fnp
+from whestbench import BaseEstimator
+
+
+_INV_SQRT_2PI = 0.39894228040143267794
+_TAIL_CLIP = 1e-12
+_ARRAY_BYTES_LIMIT = 112 * 1024 * 1024
+_FLOAT64_ITEMSIZE = 8
+_TARGET_FLOP_FRACTION = 0.135
+
+
+def _first_primes(count: int) -> tuple[int, ...]:
+    primes = []
+    candidate = 2
+    while len(primes) < count:
+        ok = True
+        for p in primes:
+            if p * p > candidate:
+                break
+            if candidate % p == 0:
+                ok = False
+                break
+        if ok:
+            primes.append(candidate)
+        candidate += 1
+    return tuple(primes)
+
+
+def _mean_chi(dim: int) -> float:
+    return math.sqrt(2.0) * math.exp(
+        math.lgamma(0.5 * (dim + 1.0)) - math.lgamma(0.5 * dim)
+    )
+
+
+def _sample_count(budget: int, width: int, depth: int) -> int:
+    forward_per_sample = depth * (2 * width * width + width)
+    sphere_per_sample = 4 * width
+    mean_per_sample = max(depth - 1, 0) * width
+    ppf_per_sample = 45 * width
+    cv_per_sample = 4 * width * width
+    cv2_per_sample = 4 * width * width
+
+    per_sample = (
+        forward_per_sample
+        + sphere_per_sample
+        + mean_per_sample
+        + ppf_per_sample
+        + cv_per_sample
+        + cv2_per_sample
+    )
+    fixed = 7 * width * width * width + 18 * width * width + 12 * width
+    count = (int(_TARGET_FLOP_FRACTION * budget) - fixed) // max(per_sample, 1)
+
+    max_by_bytes = _ARRAY_BYTES_LIMIT // max(width * _FLOAT64_ITEMSIZE, 1)
+    count = int(max(6, min(count, max_by_bytes)))
+    count -= count % 2
+    return max(2, count)
+
+
+def _lattice_generator(width: int) -> fnp.ndarray:
+    roots = fnp.sqrt(fnp.array(_first_primes(width), dtype=fnp.float64))
+    return roots - fnp.floor(roots)
+
+
+def _sphere_lattice_inputs(n_samples: int, width: int, seed: int) -> fnp.ndarray:
+    half = max(1, n_samples // 2)
+    rng = fnp.random.default_rng(seed)
+    generator = _lattice_generator(width)
+    shift = rng.random(width)
+
+    indices = fnp.arange(half, dtype=fnp.float64)[:, None]
+    uniforms = indices * generator[None, :] + shift[None, :]
+    uniforms = uniforms - fnp.floor(uniforms)
+    uniforms = fnp.clip(uniforms, _TAIL_CLIP, 1.0 - _TAIL_CLIP)
+
+    base = flops.stats.norm.ppf(uniforms)
+    norm = fnp.sqrt(fnp.sum(base * base, axis=1, keepdims=True))
+    base = (_mean_chi(width) * base) / fnp.maximum(norm, 1e-30)
+
+    return fnp.concatenate((base, -base), axis=0)
+
+
+def _exact_first_layer_mean(weight: fnp.ndarray) -> fnp.ndarray:
+    sigma = fnp.sqrt(fnp.sum(weight * weight, axis=0))
+    return sigma * _INV_SQRT_2PI
+
+
+def _ridge_solve_control(
+    controls: fnp.ndarray,
+    control_exact_mean: fnp.ndarray,
+    target: fnp.ndarray,
+) -> fnp.ndarray:
+    n_samples = controls.shape[0]
+    width = controls.shape[1]
+
+    c_mean = fnp.mean(controls, axis=0)
+    y_mean = fnp.mean(target, axis=0)
+
+    c_centered = controls - c_mean
+    y_centered = target - y_mean
+
+    cov_cc = (c_centered.T @ c_centered) / n_samples
+    cov_cy = (c_centered.T @ y_centered) / n_samples
+
+    scale = fnp.mean(fnp.diag(cov_cc))
+    ridge = fnp.maximum(scale, 1e-30) * (
+        0.018 + 0.95 * width / fnp.maximum(float(n_samples), 1.0)
+    )
+
+    beta = fnp.linalg.solve(cov_cc + ridge * fnp.eye(width, dtype=fnp.float64), cov_cy)
+    return y_mean - (c_mean - control_exact_mean) @ beta
+
+
+def _relu_gaussian_mean_from_mean_var(mean: fnp.ndarray, var: fnp.ndarray) -> fnp.ndarray:
+    sigma = fnp.sqrt(fnp.maximum(var, 1e-30))
+    alpha = mean / sigma
+    phi = _INV_SQRT_2PI * fnp.exp(-0.5 * alpha * alpha)
+    return sigma * phi + mean * flops.stats.norm.cdf(alpha)
+
+
+def _diag_moment_rows(mlp) -> list[fnp.ndarray]:
+    means = []
+    m = None
+    second = None
+
+    for layer_index, weight in enumerate(mlp.weights):
+        w2 = weight * weight
+        if layer_index == 0:
+            var = fnp.sum(w2, axis=0)
+            mean = fnp.sqrt(var) * _INV_SQRT_2PI
+            second = 0.5 * var
+        else:
+            z_mean = m @ weight
+            z_second = second @ w2
+            z_var = fnp.maximum(z_second - z_mean * z_mean, 1e-30)
+            mean = _relu_gaussian_mean_from_mean_var(z_mean, z_var)
+
+            alpha = z_mean / fnp.sqrt(z_var)
+            second = (z_var + z_mean * z_mean) * flops.stats.norm.cdf(alpha)
+            second = second + z_mean * fnp.sqrt(z_var) * _INV_SQRT_2PI * fnp.exp(
+                -0.5 * alpha * alpha
+            )
+
+        means.append(mean)
+        m = mean
+
+    return means
+
+
+class Estimator(BaseEstimator):
+    def setup(self, context):
+        self._setup_seed = context.seed
+
+    def predict(self, mlp, budget):
+        width = mlp.width
+        depth = mlp.depth
+        n_samples = _sample_count(budget, width, depth)
+
+        activations = _sphere_lattice_inputs(n_samples, width, mlp.seed)
+        analytic_rows = _diag_moment_rows(mlp)
+
+        rows = []
+        first_activations = None
+        exact_first_mean = analytic_rows[0] if depth > 0 else None
+        penultimate_activations = None
+        penultimate_mean = None
+
+        for layer_index, weight in enumerate(mlp.weights):
+            if layer_index == depth - 1 and depth > 1:
+                penultimate_activations = activations
+                penultimate_mean = rows[-1]
+
+            activations = fnp.maximum(activations @ weight, 0.0)
+
+            if layer_index == 0:
+                first_activations = activations
+                rows.append(exact_first_mean)
+            else:
+                sample_mean = fnp.mean(activations, axis=0)
+                analytic_mean = analytic_rows[layer_index]
+                rows.append(0.92 * sample_mean + 0.08 * analytic_mean)
+
+        if depth > 1 and first_activations is not None and exact_first_mean is not None:
+            try:
+                rows[-1] = _ridge_solve_control(
+                    first_activations,
+                    exact_first_mean,
+                    activations,
+                )
+            except Exception:
+                rows[-1] = fnp.mean(activations, axis=0)
+
+        if (
+            depth > 2
+            and penultimate_activations is not None
+            and penultimate_mean is not None
+        ):
+            try:
+                cv_last = _ridge_solve_control(
+                    penultimate_activations,
+                    penultimate_mean,
+                    activations,
+                )
+                rows[-1] = 0.72 * rows[-1] + 0.28 * cv_last
+            except Exception:
+                pass
+
+        return fnp.stack(rows, axis=0)
+```

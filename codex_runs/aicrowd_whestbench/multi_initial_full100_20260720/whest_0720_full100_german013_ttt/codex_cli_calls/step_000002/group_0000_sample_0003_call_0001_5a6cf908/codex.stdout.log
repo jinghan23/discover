@@ -1,0 +1,72 @@
+```python
+from __future__ import annotations
+
+import math
+
+import flopscope.numpy as fnp
+from whestbench import BaseEstimator
+
+
+_BUDGET_FRACTION = 0.155
+_MIN_SAMPLES = 64
+_MAX_SAMPLES = 1_000_000
+_ARRAY_BYTES_LIMIT = 120 * 1024 * 1024
+_WORST_CASE_ITEMSIZE = 8
+_INV_SQRT_2PI = 0.3989422804014327
+
+
+def _sample_count(budget: int, width: int, depth: int) -> int:
+    per_sample = depth * (2 * width * width + width) + 2 * width * width + 3 * width
+    fixed = 14 * width**3 + depth * width
+    k = (int(_BUDGET_FRACTION * budget) - fixed) // max(per_sample, 1)
+    max_k_by_bytes = _ARRAY_BYTES_LIMIT // max(width * _WORST_CASE_ITEMSIZE, 1)
+    k = int(max(_MIN_SAMPLES, min(_MAX_SAMPLES, max_k_by_bytes, k)))
+    return k - (k & 1)
+
+
+def _radial_scales(width: int, depth: int):
+    scales = [1.0] * (depth + 1)
+    if depth >= 1:
+        scales[1] = math.sqrt(2.0 / float(width)) * math.exp(
+            math.lgamma(0.5 * (width + 1.0)) - math.lgamma(0.5 * width)
+        )
+    for power in range(depth - 1):
+        scales[power + 2] = scales[power] * (float(width + power) / float(width))
+    return scales
+
+
+class Estimator(BaseEstimator):
+    def predict(self, mlp, budget):
+        width = mlp.width
+        depth = mlp.depth
+        weights = mlp.weights
+        k = _sample_count(budget, width, depth)
+        half = k // 2
+
+        rng = fnp.random.default_rng(mlp.seed)
+        u = rng.standard_normal((half, width), dtype=fnp.float32)
+
+        covariance = (u.T @ u) / float(half)
+        eigenvalues, eigenvectors = fnp.linalg.eigh(covariance)
+        eigenvalues = fnp.maximum(eigenvalues, 1e-6)
+        inverse_sqrt = (eigenvectors / fnp.sqrt(eigenvalues)) @ eigenvectors.T
+
+        directions = u @ inverse_sqrt
+        norms = fnp.sqrt(fnp.sum(directions * directions, axis=1))
+        directions = directions * (math.sqrt(float(width)) / norms)[:, None]
+
+        x = fnp.concatenate([directions, -directions], axis=0)
+        scales = _radial_scales(width, depth)
+
+        first_mean = (
+            fnp.sqrt(fnp.sum(weights[0] * weights[0], axis=0)) * _INV_SQRT_2PI
+        )
+        out = [first_mean[None, :]]
+
+        x = fnp.maximum(x @ weights[0], 0.0)
+        for layer_index, weight in enumerate(weights[1:], start=2):
+            x = fnp.maximum(x @ weight, 0.0)
+            out.append((fnp.mean(x, axis=0) * scales[layer_index])[None, :])
+
+        return fnp.concatenate(out, axis=0)
+```

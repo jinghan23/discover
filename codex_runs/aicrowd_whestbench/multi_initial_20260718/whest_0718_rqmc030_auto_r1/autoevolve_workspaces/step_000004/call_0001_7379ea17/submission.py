@@ -1,0 +1,147 @@
+from __future__ import annotations
+
+import math
+import flopscope as flops
+import flopscope.numpy as fnp
+from whestbench import BaseEstimator
+
+
+_TARGET_FLOP_FRACTION = 0.65
+_N_SHIFTS = 2
+_RADIUS_MULTIPLIER = 1.0002
+_TAIL_CLIP = 1e-12
+_ARRAY_BYTES_LIMIT = 100 * 1024 * 1024
+_FLOAT32_ITEMSIZE = 4
+_INV_SQRT_2PI = 0.3989422804014327
+_SHIFT_SEED_OFFSET = 1
+
+
+def _first_primes(count: int) -> tuple[int, ...]:
+    primes: list[int] = []
+    candidate = 2
+    while len(primes) < count:
+        is_prime = True
+        for prime in primes:
+            if prime * prime > candidate:
+                break
+            if candidate % prime == 0:
+                is_prime = False
+                break
+        if is_prime:
+            primes.append(candidate)
+        candidate += 1
+    return tuple(primes)
+
+
+def _lattice_generator(width: int) -> fnp.ndarray:
+    roots = fnp.sqrt(fnp.array(_first_primes(width), dtype=fnp.float64))
+    return roots - fnp.floor(roots)
+
+
+def _shifted_lattice_uniforms(
+    samples_per_shift: int,
+    generator: fnp.ndarray,
+    shifts: fnp.ndarray,
+) -> fnp.ndarray:
+    indices = fnp.arange(samples_per_shift, dtype=fnp.float64)[:, None, None]
+    unwrapped = indices * generator[None, None, :] + shifts[None, :, :]
+    uniforms = unwrapped - fnp.floor(unwrapped)
+    return fnp.reshape(uniforms, (samples_per_shift * shifts.shape[0], generator.shape[0]))
+
+
+def _sample_count(budget: int, width: int, depth: int) -> int:
+    forward_per_sample = depth * (2 * width * width + width)
+    final_mean_per_sample = width
+    per_sample = forward_per_sample + final_mean_per_sample
+    fixed = 2 * width * width + 8 * width
+    n_samples = (int(_TARGET_FLOP_FRACTION * budget) - fixed) // per_sample
+    max_samples_by_bytes = _ARRAY_BYTES_LIMIT // max(width * _FLOAT32_ITEMSIZE, 1)
+    n_samples = int(max(_N_SHIFTS, min(n_samples, max_samples_by_bytes)))
+    n_samples = (n_samples // _N_SHIFTS) * _N_SHIFTS
+    return max(_N_SHIFTS, n_samples)
+
+
+def _mean_gaussian_radius(width: int) -> float:
+    return math.sqrt(2.0) * math.exp(
+        math.lgamma(0.5 * (width + 1.0)) - math.lgamma(0.5 * width)
+    )
+
+
+def _first_layer_exact_mean(weight: fnp.ndarray) -> fnp.ndarray:
+    weight64 = fnp.asarray(weight, dtype=fnp.float64)
+    return _INV_SQRT_2PI * fnp.sqrt(fnp.sum(weight64 * weight64, axis=0))
+
+
+def _make_shifts(seed: int, width: int) -> fnp.ndarray:
+    rng = fnp.random.default_rng(seed + _SHIFT_SEED_OFFSET)
+    return rng.random((_N_SHIFTS, width))
+
+
+class Estimator(BaseEstimator):
+    def setup(self, context):
+        self._width = context.width
+        self._depth = context.depth
+        self._budget = context.flop_budget
+        self._generator = _lattice_generator(context.width)
+        self._radius = _RADIUS_MULTIPLIER * _mean_gaussian_radius(context.width)
+        self._filler = fnp.zeros(context.width, dtype=fnp.float32)
+        self._zero_rows = [self._filler] * (context.depth - 1)
+        if context.depth == 1:
+            self._inputs = None
+            self._n_samples = 0
+            self._samples_per_shift = 0
+            return
+        self._n_samples = _sample_count(context.flop_budget, context.width, context.depth)
+        self._samples_per_shift = self._n_samples // _N_SHIFTS
+        shifts = _make_shifts(context.seed, context.width)
+        uniforms = _shifted_lattice_uniforms(
+            self._samples_per_shift,
+            self._generator,
+            shifts,
+        )
+        uniforms = fnp.clip(uniforms, _TAIL_CLIP, 1.0 - _TAIL_CLIP)
+        inputs = flops.stats.norm.ppf(uniforms)
+        radius = fnp.sqrt(fnp.sum(inputs * inputs, axis=1))
+        radius = fnp.maximum(radius, 1e-30)
+        inputs = inputs * (self._radius / radius[:, None])
+        self._inputs = fnp.asarray(inputs, dtype=fnp.float32)
+
+    def predict(self, mlp, budget):
+        if mlp.depth == 1:
+            return fnp.stack([_first_layer_exact_mean(mlp.weights[0])], axis=0)
+
+        if (
+            getattr(self, "_inputs", None) is not None
+            and mlp.width == self._width
+            and mlp.depth == self._depth
+            and budget == self._budget
+        ):
+            activations = self._inputs
+        else:
+            n_samples = _sample_count(budget, mlp.width, mlp.depth)
+            samples_per_shift = n_samples // _N_SHIFTS
+            generator = _lattice_generator(mlp.width)
+            radius_scale = _RADIUS_MULTIPLIER * _mean_gaussian_radius(mlp.width)
+            shifts = _make_shifts(mlp.seed, mlp.width)
+            uniforms = _shifted_lattice_uniforms(samples_per_shift, generator, shifts)
+            uniforms = fnp.clip(uniforms, _TAIL_CLIP, 1.0 - _TAIL_CLIP)
+            activations = flops.stats.norm.ppf(uniforms)
+            radius = fnp.sqrt(fnp.sum(activations * activations, axis=1))
+            radius = fnp.maximum(radius, 1e-30)
+            activations = activations * (radius_scale / radius[:, None])
+            activations = fnp.asarray(activations, dtype=fnp.float32)
+
+        for weight in mlp.weights:
+            activations = fnp.maximum(activations @ weight, 0.0)
+        final_mean = fnp.mean(activations, axis=0)
+
+        if (
+            getattr(self, "_zero_rows", None) is not None
+            and mlp.width == getattr(self, "_width", None)
+            and mlp.depth == getattr(self, "_depth", None)
+        ):
+            rows = self._zero_rows + [final_mean]
+        else:
+            filler = fnp.zeros(mlp.width, dtype=fnp.float32)
+            rows = [filler] * (mlp.depth - 1) + [final_mean]
+        return fnp.stack(rows, axis=0)

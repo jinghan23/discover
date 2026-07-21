@@ -1,0 +1,191 @@
+```python
+from __future__ import annotations
+
+import math
+
+import flopscope.numpy as fnp
+from whestbench import BaseEstimator
+
+
+_BUDGET_FRACTION = 0.12
+_MIN_SAMPLES = 32
+_MAX_SAMPLES = 1_000_000
+_ARRAY_BYTES_LIMIT = 100 * 1024 * 1024
+_WORST_CASE_ITEMSIZE = 8
+_INV_SQRT_2PI = 0.3989422804014327
+_CDF_P = 0.2316419
+
+
+def _sample_count(budget, width: int, depth: int) -> int:
+    max_k_by_bytes = _ARRAY_BYTES_LIMIT // max(width * _WORST_CASE_ITEMSIZE, 1)
+
+    if budget is None:
+        k = min(8192, max_k_by_bytes)
+    else:
+        per_sample = depth * (2 * width * width + width) + 3 * width * width + 8 * width
+        fixed = 16 * width**3 + 5 * depth * width * width
+        k = (int(_BUDGET_FRACTION * budget) - fixed) // max(per_sample, 1)
+        k = int(max(_MIN_SAMPLES, min(_MAX_SAMPLES, max_k_by_bytes, k)))
+
+    k = k - (k & 1)
+    return max(2, k)
+
+
+def _mean_chi_radius(width: int) -> float:
+    return math.sqrt(2.0) * math.exp(
+        math.lgamma(0.5 * (width + 1.0)) - math.lgamma(0.5 * width)
+    )
+
+
+def _normal_cdf(x):
+    ax = fnp.abs(x)
+    t = 1.0 / (1.0 + _CDF_P * ax)
+    poly = (((((1.330274429 * t - 1.821255978) * t) + 1.781477937) * t
+             - 0.356563782) * t + 0.319381530) * t
+    tail = _INV_SQRT_2PI * fnp.exp(-0.5 * ax * ax) * poly
+    pos = 1.0 - tail
+    return fnp.where(x >= 0.0, pos, tail)
+
+
+def _relu_normal_mean(mu, var):
+    var = fnp.maximum(var, 1e-12)
+    sigma = fnp.sqrt(var)
+    a = mu / sigma
+    phi = _INV_SQRT_2PI * fnp.exp(-0.5 * a * a)
+    return sigma * phi + mu * _normal_cdf(a)
+
+
+def _relu_normal_second(mu, var):
+    var = fnp.maximum(var, 1e-12)
+    sigma = fnp.sqrt(var)
+    a = mu / sigma
+    phi = _INV_SQRT_2PI * fnp.exp(-0.5 * a * a)
+    cdf = _normal_cdf(a)
+    return (mu * mu + var) * cdf + mu * sigma * phi
+
+
+def _diagonal_moments(weights, depth: int, width: int):
+    mean = fnp.zeros(width, dtype=weights[0].dtype)
+    second = fnp.ones(width, dtype=weights[0].dtype)
+    rows = []
+
+    for weight in weights:
+        var = fnp.maximum(second - mean * mean, 0.0)
+        pre_mean = mean @ weight
+        pre_var = var @ (weight * weight)
+        mean = _relu_normal_mean(pre_mean, pre_var)
+        second = fnp.maximum(_relu_normal_second(pre_mean, pre_var), mean * mean)
+        rows.append(mean[None, :])
+
+    return fnp.concatenate(rows, axis=0)
+
+
+class Estimator(BaseEstimator):
+    def predict(self, mlp, budget):
+        width = mlp.width
+        depth = mlp.depth
+        weights = mlp.weights
+
+        first_variance = fnp.sum(weights[0] * weights[0], axis=0)
+        first_mean = fnp.sqrt(fnp.maximum(first_variance, 1e-12)) * _INV_SQRT_2PI
+
+        if depth == 1:
+            return first_mean[None, :]
+
+        diag_rows = _diagonal_moments(weights, depth, width)
+        diag_final = diag_rows[-1]
+
+        k = _sample_count(budget, width, depth)
+        n = k // 2
+        radius = _mean_chi_radius(width)
+
+        rng = fnp.random.default_rng(mlp.seed)
+        u = rng.standard_normal((n, width), dtype=fnp.float32)
+        row_norm = fnp.sqrt(fnp.maximum(fnp.sum(u * u, axis=1), 1e-20))
+        u = u / row_norm[:, None]
+
+        whitened = False
+        if n > width + 8:
+            covariance = (u.T @ u) / float(n)
+            eigenvalues, eigenvectors = fnp.linalg.eigh(covariance)
+            eigenvalues = fnp.maximum(eigenvalues * float(width), 1e-6)
+            inverse_sqrt = (eigenvectors / fnp.sqrt(eigenvalues)) @ eigenvectors.T
+            first_weight = inverse_sqrt @ weights[0]
+            whitened = True
+        else:
+            first_weight = weights[0]
+
+        x = fnp.concatenate([u, -u], axis=0) * radius
+        x = fnp.maximum(x @ first_weight, 0.0)
+        first_pair = (x[:n] + x[n:]) * 0.5
+
+        rows = [first_mean[None, :]]
+
+        for layer_index, weight in enumerate(weights[1:-1], start=1):
+            x = fnp.maximum(x @ weight, 0.0)
+            rows.append(fnp.mean(x, axis=0)[None, :])
+
+        pre_final = x @ weights[-1]
+        sample_pre_mean = fnp.mean(pre_final, axis=0)
+        sample_pre_second = fnp.mean(pre_final * pre_final, axis=0)
+        radial_scale = float(width) / max(radius * radius, 1e-12)
+        sample_pre_var = fnp.maximum(sample_pre_second * radial_scale - sample_pre_mean * sample_pre_mean, 1e-12)
+
+        x = fnp.maximum(pre_final, 0.0)
+        final_pair = (x[:n] + x[n:]) * 0.5
+        final_mean = fnp.mean(final_pair, axis=0)
+
+        residual_var = fnp.mean((final_pair - final_mean[None, :]) ** 2, axis=0) / float(max(n, 1))
+
+        if whitened:
+            control_mean = fnp.mean(first_pair, axis=0)
+            h_centered = first_pair - control_mean[None, :]
+            f_centered = final_pair - final_mean[None, :]
+
+            gram = h_centered.T @ h_centered
+            cross = h_centered.T @ f_centered
+            ridge = fnp.maximum(
+                (fnp.sum(h_centered * h_centered) / float(width)) * 1e-5,
+                1e-6,
+            )
+
+            try:
+                beta = fnp.linalg.solve(
+                    gram + ridge * fnp.eye(width, dtype=gram.dtype),
+                    cross,
+                )
+            except Exception:
+                values, vectors = fnp.linalg.eigh(gram)
+                positive_values = fnp.maximum(values, 0.0)
+                beta = vectors @ ((vectors.T @ cross) / (positive_values[:, None] + ridge))
+
+            fitted = h_centered @ beta
+            residual = f_centered - fitted
+            residual_var = fnp.mean(residual * residual, axis=0) / float(max(n, 1))
+
+            final_mean = final_mean - ((control_mean - first_mean) @ beta)
+            final_mean = fnp.maximum(final_mean, 0.0)
+
+        gaussian_final = _relu_normal_mean(sample_pre_mean, sample_pre_var)
+
+        mc_noise = fnp.mean(residual_var)
+        gaussian_gap = fnp.mean((gaussian_final - final_mean) * (gaussian_final - final_mean))
+        diagonal_gap = fnp.mean((diag_final - final_mean) * (diag_final - final_mean))
+
+        gaussian_bias = fnp.maximum(gaussian_gap - mc_noise, 0.0)
+        diagonal_bias = fnp.maximum(diagonal_gap - mc_noise, 0.0)
+
+        gaussian_weight = fnp.minimum(0.45, mc_noise / (mc_noise + gaussian_bias + 1e-12))
+        diagonal_weight = fnp.minimum(0.20, mc_noise / (mc_noise + diagonal_bias + 1e-12))
+
+        total_weight = fnp.minimum(0.65, gaussian_weight + diagonal_weight)
+        final_mean = (
+            (1.0 - total_weight) * final_mean
+            + gaussian_weight * gaussian_final
+            + diagonal_weight * diag_final
+        )
+        final_mean = fnp.maximum(final_mean, 0.0)
+
+        rows.append(final_mean[None, :])
+        return fnp.concatenate(rows, axis=0)
+```

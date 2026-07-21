@@ -1,0 +1,1992 @@
+OpenAI Codex v0.144.3
+--------
+workdir: /opt/tiger/discover/workspace
+model: gpt-5.5
+provider: openai
+approval: never
+sandbox: danger-full-access
+reasoning effort: xhigh
+reasoning summaries: none
+session id: 019f76ae-86c1-7dc2-9058-ea1c0253782c
+--------
+user
+You are solving the ARC White-Box Estimation Challenge 2026
+(WhestBench) under the official evaluator contract.
+
+Task:
+- You receive the weights of a randomly initialized square ReLU MLP.
+- Inputs follow a standard normal distribution.
+- Predict the per-neuron post-ReLU activation mean for every layer.
+- Return a `flopscope.numpy.ndarray` with shape `(mlp.depth, mlp.width)`.
+
+Required submission interface:
+- Import `flopscope.numpy as fnp` for numerical operations.
+- Define `class Estimator(BaseEstimator)` with
+  `predict(self, mlp, budget)`.
+- Optional `setup(self, context)` and `teardown(self)` hooks follow the official
+  WhestBench API.
+- Seed predict-time randomness from `mlp.seed` and setup-time randomness from
+  `context.seed`.
+
+Official scoring:
+- For each MLP, compute final-layer MSE against the official Monte Carlo target.
+- Effective compute is `C = FLOPs + lambda * residual_wall_time`.
+- A valid MLP score is `final_layer_mse * max(0.1, C / flop_budget)`.
+- The suite score is the arithmetic mean of those per-MLP scores; lower is better.
+- Exceptions, invalid shapes/non-finite values, FLOP/time exhaustion, or combined
+  budget exhaustion use an all-zero prediction and multiplier 1.0 for that MLP.
+- All-layer MSE is diagnostic only.
+
+Do not use plain NumPy or uninstrumented numerical libraries to evade FLOP
+accounting. Residual Python or uninstrumented work is charged at the official
+lambda rate and can exhaust the combined budget.
+
+Fairness and data isolation:
+- Derive predictions only from the `mlp` weights and allowed setup context.
+- Do not inspect, search for, or read evaluation datasets, Hugging Face caches,
+  saved evaluation reports, target moments, or ground-truth files.
+- Do not hardcode values tied to public mini MLPs. Such candidates are invalid
+  even if they receive a low local score.
+
+Algorithm directions worth exploring:
+- Mean and diagonal-variance propagation through ReLU moments.
+- Full, structured, or low-rank covariance propagation.
+- Hybrid analytic propagation with compute-budgeted Monte Carlo probes.
+- Layer-wise corrections for correlation error in deep networks.
+- Allocating FLOPs to layers where final-layer MSE is most sensitive.
+
+
+Official evaluation suite for this run:
+- dataset: None@None
+- split / MLPs: None / first None
+- width / depth: None / None
+- FLOP budget per MLP: None
+- residual penalty lambda: None FLOPs/second
+- runner: None
+
+You are iteratively optimizing budget-adjusted final-layer score.
+Here is the last code we ran:
+```python
+from __future__ import annotations
+
+import flopscope.numpy as fnp
+from whestbench import BaseEstimator
+
+
+_INV_SQRT_2PI = 0.3989422804014327
+_SQRT_2_OVER_PI = 0.7978845608028654
+_BUDGET_FRACTION = 0.0925
+_SEED_OFFSET = -1
+_WHITEN_POWER = 0.4585
+_RADIUS_POWER = 0.6
+_FIRST_MEAN_POWER = 0.734
+_FINAL_GAUSSIAN_BLEND = 0.115
+_FINAL_SKEW_WEIGHT = 3.8
+_FINAL_SCALE = 0.99973
+_RADIAL_BLEND = 0.24
+_K_ADJUST = -20
+_SAMPLE_DTYPE = fnp.float32
+_MIN_SAMPLES = 32
+_MAX_SAMPLES = 1_000_000
+_ARRAY_BYTES_LIMIT = 160 * 1024 * 1024
+_WORST_CASE_ITEMSIZE = 8
+
+
+def _normal_cdf_approx(x):
+    y = _SQRT_2_OVER_PI * (x + 0.044715 * x * x * x)
+    return 0.5 * (1.0 + fnp.tanh(y))
+
+
+def _gaussian_relu_mean(mu, var):
+    var = fnp.maximum(var, 1e-20)
+    sigma = fnp.sqrt(var)
+    alpha = mu / sigma
+    phi = _INV_SQRT_2PI * fnp.exp(-0.5 * alpha * alpha)
+    return sigma * phi + mu * _normal_cdf_approx(alpha)
+
+
+def _sample_count(budget: int, width: int, depth: int) -> int:
+    per_sample = depth * (2 * width * width + width) + width * width
+    fixed = 9 * width**3 + 2 * (2 * width**3)
+    k = (int(_BUDGET_FRACTION * budget) - fixed) // max(per_sample, 1)
+    max_k_by_bytes = _ARRAY_BYTES_LIMIT // max(width * _WORST_CASE_ITEMSIZE, 1)
+    k = int(max(_MIN_SAMPLES, min(_MAX_SAMPLES, max_k_by_bytes, k)))
+    k = k + _K_ADJUST
+    return k - (k & 1)
+
+
+class Estimator(BaseEstimator):
+    def predict(self, mlp, budget):
+        width = mlp.width
+        depth = mlp.depth
+        k = _sample_count(budget, width, depth)
+        rng = fnp.random.default_rng(int(mlp.seed) + _SEED_OFFSET)
+
+        batch_half = k // 2
+        first_var = fnp.sum(mlp.weights[0] * mlp.weights[0], axis=0)
+        exact_first_mean = fnp.sqrt(fnp.maximum(first_var, 1e-20)) * _INV_SQRT_2PI
+        u = rng.standard_normal((batch_half, width), dtype=_SAMPLE_DTYPE)
+        covariance = (u.T @ u) / float(batch_half)
+        eigenvalues, eigenvectors = fnp.linalg.eigh(covariance)
+        eigenvalues = fnp.maximum(eigenvalues, 1e-6)
+        inverse_power = (eigenvectors / (eigenvalues ** _WHITEN_POWER)) @ eigenvectors.T
+        y = u @ inverse_power
+        original_radius = fnp.sqrt(fnp.maximum(fnp.sum(u * u, axis=1, keepdims=True), 1e-20))
+        whitened_radius = fnp.sqrt(fnp.maximum(fnp.sum(y * y, axis=1, keepdims=True), 1e-20))
+        y = y * ((original_radius / whitened_radius) ** _RADIUS_POWER)
+        input_radius = fnp.sqrt(fnp.maximum(fnp.sum(y * y, axis=1, keepdims=True), 1e-20))
+        radial_scale = fnp.mean(original_radius) / input_radius
+        row_radial_scale = fnp.concatenate([radial_scale, radial_scale], axis=0)
+        row_weight = (1.0 - _RADIAL_BLEND) + _RADIAL_BLEND * row_radial_scale
+
+        z = y @ mlp.weights[0]
+        x = fnp.concatenate([fnp.maximum(z, 0.0), fnp.maximum(-z, 0.0)], axis=0)
+        sample_first_mean = fnp.mean(x, axis=0)
+        first_scale = exact_first_mean / fnp.maximum(sample_first_mean, 1e-20)
+        x = x * (first_scale ** _FIRST_MEAN_POWER)
+
+        for weight in mlp.weights[1:-1]:
+            x = fnp.maximum(x @ weight, 0.0)
+
+        z = x @ mlp.weights[-1]
+        z = z * row_weight
+        z_mean = fnp.mean(z, axis=0)
+        z_second = fnp.mean(z * z, axis=0)
+        z_var = fnp.maximum(z_second - z_mean * z_mean, 1e-20)
+        gaussian_final_mean = _gaussian_relu_mean(z_mean, z_var)
+        final_relu = fnp.maximum(z, 0.0)
+        sample_final_mean = fnp.mean(final_relu, axis=0)
+        z_centered = z - z_mean
+        z_skew = fnp.abs(fnp.mean(z_centered * z_centered * z_centered, axis=0))
+        z_skew = z_skew / (z_var * fnp.sqrt(z_var))
+        final_blend = _FINAL_GAUSSIAN_BLEND / (1.0 + _FINAL_SKEW_WEIGHT * z_skew)
+        final_mean = (
+            (1.0 - final_blend) * sample_final_mean
+            + final_blend * gaussian_final_mean
+        )
+        final_mean = final_mean * _FINAL_SCALE
+        zero_rows = fnp.zeros((depth - 1, width), dtype=fnp.float32)
+        return fnp.concatenate([zero_rows, final_mean[None, :]], axis=0)
+
+```
+Here is the budget-adjusted final-layer score before and after running the code above (lower is better): 0.000000 -> 0.000000
+Target: 1e-07. Current gap: 0.000000. Further improvements will also be generously rewarded.
+
+--- Previous Program Output ---
+pass score=1.38512e-07
+--- End Output ---
+
+Return one final Python code block containing an official `Estimator` class.
+
+
+--- Autonomous WhestBench Blackbox Search Mode ---
+Work only inside this workspace:
+/opt/tiger/discover/workspace
+
+Editable candidate:
+/opt/tiger/discover/workspace/submission.py
+
+The trusted official evaluator is exposed only through a local blackbox service.
+Run it after each meaningful revision:
+cd /opt/tiger/discover/workspace && python eval_client.py
+
+Do not edit `eval_client.py`. Only `submission.py` is a candidate artifact. It
+must be plain Python source defining the official `Estimator(BaseEstimator)`
+class, without Markdown fences. Lower `raw_score` is better; `reward` is the
+official baseline score divided by the candidate score.
+Do not inspect evaluation datasets, caches, reports, or target values; derive
+the estimator only from the supplied task description and blackbox scores.
+
+When done, leave the best implementation in:
+/opt/tiger/discover/workspace/submission.py
+
+codex
+I’ll work from the existing candidate, run the official local evaluator for each revision, and keep changes isolated to `submission.py`. I’ll avoid looking for any evaluation artifacts or targets.
+exec
+/bin/bash -lc "pwd && rg --files -g 'submission.py' -g 'eval_client.py' -g 'pyproject.toml' -g 'requirements*.txt'" in /opt/tiger/discover/workspace
+ succeeded in 0ms:
+/opt/tiger/discover/workspace
+submission.py
+eval_client.py
+
+exec
+/bin/bash -lc "sed -n '1,260p' submission.py" in /opt/tiger/discover/workspace
+ succeeded in 0ms:
+from __future__ import annotations
+
+import flopscope.numpy as fnp
+from whestbench import BaseEstimator
+
+
+_INV_SQRT_2PI = 0.3989422804014327
+_SQRT_2_OVER_PI = 0.7978845608028654
+_BUDGET_FRACTION = 0.0925
+_SEED_OFFSET = -1
+_WHITEN_POWER = 0.4585
+_RADIUS_POWER = 0.6
+_FIRST_MEAN_POWER = 0.734
+_FINAL_GAUSSIAN_BLEND = 0.115
+_FINAL_SKEW_WEIGHT = 3.8
+_FINAL_SCALE = 0.99973
+_RADIAL_BLEND = 0.24
+_K_ADJUST = -20
+_SAMPLE_DTYPE = fnp.float32
+_MIN_SAMPLES = 32
+_MAX_SAMPLES = 1_000_000
+_ARRAY_BYTES_LIMIT = 160 * 1024 * 1024
+_WORST_CASE_ITEMSIZE = 8
+
+
+def _normal_cdf_approx(x):
+    y = _SQRT_2_OVER_PI * (x + 0.044715 * x * x * x)
+    return 0.5 * (1.0 + fnp.tanh(y))
+
+
+def _gaussian_relu_mean(mu, var):
+    var = fnp.maximum(var, 1e-20)
+    sigma = fnp.sqrt(var)
+    alpha = mu / sigma
+    phi = _INV_SQRT_2PI * fnp.exp(-0.5 * alpha * alpha)
+    return sigma * phi + mu * _normal_cdf_approx(alpha)
+
+
+def _sample_count(budget: int, width: int, depth: int) -> int:
+    per_sample = depth * (2 * width * width + width) + width * width
+    fixed = 9 * width**3 + 2 * (2 * width**3)
+    k = (int(_BUDGET_FRACTION * budget) - fixed) // max(per_sample, 1)
+    max_k_by_bytes = _ARRAY_BYTES_LIMIT // max(width * _WORST_CASE_ITEMSIZE, 1)
+    k = int(max(_MIN_SAMPLES, min(_MAX_SAMPLES, max_k_by_bytes, k)))
+    k = k + _K_ADJUST
+    return k - (k & 1)
+
+
+class Estimator(BaseEstimator):
+    def predict(self, mlp, budget):
+        width = mlp.width
+        depth = mlp.depth
+        k = _sample_count(budget, width, depth)
+        rng = fnp.random.default_rng(int(mlp.seed) + _SEED_OFFSET)
+
+        batch_half = k // 2
+        first_var = fnp.sum(mlp.weights[0] * mlp.weights[0], axis=0)
+        exact_first_mean = fnp.sqrt(fnp.maximum(first_var, 1e-20)) * _INV_SQRT_2PI
+        u = rng.standard_normal((batch_half, width), dtype=_SAMPLE_DTYPE)
+        covariance = (u.T @ u) / float(batch_half)
+        eigenvalues, eigenvectors = fnp.linalg.eigh(covariance)
+        eigenvalues = fnp.maximum(eigenvalues, 1e-6)
+        inverse_power = (eigenvectors / (eigenvalues ** _WHITEN_POWER)) @ eigenvectors.T
+        y = u @ inverse_power
+        original_radius = fnp.sqrt(fnp.maximum(fnp.sum(u * u, axis=1, keepdims=True), 1e-20))
+        whitened_radius = fnp.sqrt(fnp.maximum(fnp.sum(y * y, axis=1, keepdims=True), 1e-20))
+        y = y * ((original_radius / whitened_radius) ** _RADIUS_POWER)
+        input_radius = fnp.sqrt(fnp.maximum(fnp.sum(y * y, axis=1, keepdims=True), 1e-20))
+        radial_scale = fnp.mean(original_radius) / input_radius
+        row_radial_scale = fnp.concatenate([radial_scale, radial_scale], axis=0)
+        row_weight = (1.0 - _RADIAL_BLEND) + _RADIAL_BLEND * row_radial_scale
+
+        z = y @ mlp.weights[0]
+        x = fnp.concatenate([fnp.maximum(z, 0.0), fnp.maximum(-z, 0.0)], axis=0)
+        sample_first_mean = fnp.mean(x, axis=0)
+        first_scale = exact_first_mean / fnp.maximum(sample_first_mean, 1e-20)
+        x = x * (first_scale ** _FIRST_MEAN_POWER)
+
+        for weight in mlp.weights[1:-1]:
+            x = fnp.maximum(x @ weight, 0.0)
+
+        z = x @ mlp.weights[-1]
+        z = z * row_weight
+        z_mean = fnp.mean(z, axis=0)
+        z_second = fnp.mean(z * z, axis=0)
+        z_var = fnp.maximum(z_second - z_mean * z_mean, 1e-20)
+        gaussian_final_mean = _gaussian_relu_mean(z_mean, z_var)
+        final_relu = fnp.maximum(z, 0.0)
+        sample_final_mean = fnp.mean(final_relu, axis=0)
+        z_centered = z - z_mean
+        z_skew = fnp.abs(fnp.mean(z_centered * z_centered * z_centered, axis=0))
+        z_skew = z_skew / (z_var * fnp.sqrt(z_var))
+        final_blend = _FINAL_GAUSSIAN_BLEND / (1.0 + _FINAL_SKEW_WEIGHT * z_skew)
+        final_mean = (
+            (1.0 - final_blend) * sample_final_mean
+            + final_blend * gaussian_final_mean
+        )
+        final_mean = final_mean * _FINAL_SCALE
+        zero_rows = fnp.zeros((depth - 1, width), dtype=fnp.float32)
+        return fnp.concatenate([zero_rows, final_mean[None, :]], axis=0)
+
+codex
+The candidate matches the code you supplied. I’m taking a baseline measurement in this environment before changing constants, since these blackbox scores can be sensitive to small budget and sampling details.
+exec
+/bin/bash -lc 'python eval_client.py' in /opt/tiger/discover/workspace
+ succeeded in 21320ms:
+pass score=1.38512e-07
+raw_score 1.3851242670170904e-07
+reward 672.8705269956204
+
+codex
+Baseline is stable with the reported `1.385124267e-07`. I’ll start with low-risk constant sweeps around the existing tuned values, changing only `submission.py` and immediately evaluating each variant.
+exec
+/bin/bash -lc 'python eval_client.py' in /opt/tiger/discover/workspace
+ succeeded in 21214ms:
+pass score=1.38512e-07
+raw_score 1.3851242670170904e-07
+reward 672.8705269956204
+
+codex
+The first sweep is on sample count. This directly trades estimator variance against the scorer’s compute multiplier, so I’m testing small offsets around the current value before touching the sampling transform.
+apply patch
+patch: completed
+/opt/tiger/discover/workspace/submission.py
+diff --git a/submission.py b/submission.py
+index 6f86f623c4af02466b932924ac62ff2c3161a555..003bbcad6e37979ad2811d9f1464024014e32e1c
+--- a/submission.py
++++ b/submission.py
+@@ -15,7 +15,7 @@
+ _FINAL_SKEW_WEIGHT = 3.8
+ _FINAL_SCALE = 0.99973
+ _RADIAL_BLEND = 0.24
+-_K_ADJUST = -20
++_K_ADJUST = 0
+ _SAMPLE_DTYPE = fnp.float32
+ _MIN_SAMPLES = 32
+ _MAX_SAMPLES = 1_000_000
+
+diff --git a/submission.py b/submission.py
+index 6f86f623c4af02466b932924ac62ff2c3161a555..003bbcad6e37979ad2811d9f1464024014e32e1c
+--- a/submission.py
++++ b/submission.py
+@@ -15,7 +15,7 @@
+ _FINAL_SKEW_WEIGHT = 3.8
+ _FINAL_SCALE = 0.99973
+ _RADIAL_BLEND = 0.24
+-_K_ADJUST = -20
++_K_ADJUST = 0
+ _SAMPLE_DTYPE = fnp.float32
+ _MIN_SAMPLES = 32
+ _MAX_SAMPLES = 1_000_000
+
+exec
+/bin/bash -lc 'python eval_client.py' in /opt/tiger/discover/workspace
+diff --git a/submission.py b/submission.py
+index 6f86f623c4af02466b932924ac62ff2c3161a555..003bbcad6e37979ad2811d9f1464024014e32e1c
+--- a/submission.py
++++ b/submission.py
+@@ -15,7 +15,7 @@
+ _FINAL_SKEW_WEIGHT = 3.8
+ _FINAL_SCALE = 0.99973
+ _RADIAL_BLEND = 0.24
+-_K_ADJUST = -20
++_K_ADJUST = 0
+ _SAMPLE_DTYPE = fnp.float32
+ _MIN_SAMPLES = 32
+ _MAX_SAMPLES = 1_000_000
+
+ succeeded in 21418ms:
+pass score=1.4285e-07
+raw_score 1.428504521072682e-07
+reward 652.4370639039731
+
+codex
+A larger sample offset worsened the score, which suggests the current point is near the floor/multiplier boundary or is overfitting the variance reduction. I’m checking the lower side now.
+apply patch
+patch: completed
+/opt/tiger/discover/workspace/submission.py
+diff --git a/submission.py b/submission.py
+index 6f86f623c4af02466b932924ac62ff2c3161a555..ecc64f484e04fd3f8f26ae9296a2d37d08be9e92
+--- a/submission.py
++++ b/submission.py
+@@ -15,7 +15,7 @@
+ _FINAL_SKEW_WEIGHT = 3.8
+ _FINAL_SCALE = 0.99973
+ _RADIAL_BLEND = 0.24
+-_K_ADJUST = -20
++_K_ADJUST = -40
+ _SAMPLE_DTYPE = fnp.float32
+ _MIN_SAMPLES = 32
+ _MAX_SAMPLES = 1_000_000
+
+diff --git a/submission.py b/submission.py
+index 6f86f623c4af02466b932924ac62ff2c3161a555..ecc64f484e04fd3f8f26ae9296a2d37d08be9e92
+--- a/submission.py
++++ b/submission.py
+@@ -15,7 +15,7 @@
+ _FINAL_SKEW_WEIGHT = 3.8
+ _FINAL_SCALE = 0.99973
+ _RADIAL_BLEND = 0.24
+-_K_ADJUST = -20
++_K_ADJUST = -40
+ _SAMPLE_DTYPE = fnp.float32
+ _MIN_SAMPLES = 32
+ _MAX_SAMPLES = 1_000_000
+
+exec
+/bin/bash -lc 'python eval_client.py' in /opt/tiger/discover/workspace
+diff --git a/submission.py b/submission.py
+index 6f86f623c4af02466b932924ac62ff2c3161a555..ecc64f484e04fd3f8f26ae9296a2d37d08be9e92
+--- a/submission.py
++++ b/submission.py
+@@ -15,7 +15,7 @@
+ _FINAL_SKEW_WEIGHT = 3.8
+ _FINAL_SCALE = 0.99973
+ _RADIAL_BLEND = 0.24
+-_K_ADJUST = -20
++_K_ADJUST = -40
+ _SAMPLE_DTYPE = fnp.float32
+ _MIN_SAMPLES = 32
+ _MAX_SAMPLES = 1_000_000
+
+ succeeded in 21323ms:
+pass score=1.42477e-07
+raw_score 1.4247659578359163e-07
+reward 654.1490483937763
+
+codex
+Both sides of that coarse offset are worse. I’ll confirm the immediate neighborhood because the even sample count and hidden FLOP accounting can make nearby values non-smooth.
+apply patch
+patch: completed
+/opt/tiger/discover/workspace/submission.py
+diff --git a/submission.py b/submission.py
+index 6f86f623c4af02466b932924ac62ff2c3161a555..96ef33096790e3d14356ee35ad9b593c97552731
+--- a/submission.py
++++ b/submission.py
+@@ -15,7 +15,7 @@
+ _FINAL_SKEW_WEIGHT = 3.8
+ _FINAL_SCALE = 0.99973
+ _RADIAL_BLEND = 0.24
+-_K_ADJUST = -20
++_K_ADJUST = -10
+ _SAMPLE_DTYPE = fnp.float32
+ _MIN_SAMPLES = 32
+ _MAX_SAMPLES = 1_000_000
+
+diff --git a/submission.py b/submission.py
+index 6f86f623c4af02466b932924ac62ff2c3161a555..96ef33096790e3d14356ee35ad9b593c97552731
+--- a/submission.py
++++ b/submission.py
+@@ -15,7 +15,7 @@
+ _FINAL_SKEW_WEIGHT = 3.8
+ _FINAL_SCALE = 0.99973
+ _RADIAL_BLEND = 0.24
+-_K_ADJUST = -20
++_K_ADJUST = -10
+ _SAMPLE_DTYPE = fnp.float32
+ _MIN_SAMPLES = 32
+ _MAX_SAMPLES = 1_000_000
+
+exec
+/bin/bash -lc 'python eval_client.py' in /opt/tiger/discover/workspace
+diff --git a/submission.py b/submission.py
+index 6f86f623c4af02466b932924ac62ff2c3161a555..96ef33096790e3d14356ee35ad9b593c97552731
+--- a/submission.py
++++ b/submission.py
+@@ -15,7 +15,7 @@
+ _FINAL_SKEW_WEIGHT = 3.8
+ _FINAL_SCALE = 0.99973
+ _RADIAL_BLEND = 0.24
+-_K_ADJUST = -20
++_K_ADJUST = -10
+ _SAMPLE_DTYPE = fnp.float32
+ _MIN_SAMPLES = 32
+ _MAX_SAMPLES = 1_000_000
+
+ succeeded in 21197ms:
+pass score=1.41094e-07
+raw_score 1.4109442190601841e-07
+reward 660.5571523748927
+
+apply patch
+patch: completed
+/opt/tiger/discover/workspace/submission.py
+diff --git a/submission.py b/submission.py
+index 6f86f623c4af02466b932924ac62ff2c3161a555..f3dec18905a0a7813077e0d37745831ff3df6a7d
+--- a/submission.py
++++ b/submission.py
+@@ -15,7 +15,7 @@
+ _FINAL_SKEW_WEIGHT = 3.8
+ _FINAL_SCALE = 0.99973
+ _RADIAL_BLEND = 0.24
+-_K_ADJUST = -20
++_K_ADJUST = -30
+ _SAMPLE_DTYPE = fnp.float32
+ _MIN_SAMPLES = 32
+ _MAX_SAMPLES = 1_000_000
+
+diff --git a/submission.py b/submission.py
+index 6f86f623c4af02466b932924ac62ff2c3161a555..f3dec18905a0a7813077e0d37745831ff3df6a7d
+--- a/submission.py
++++ b/submission.py
+@@ -15,7 +15,7 @@
+ _FINAL_SKEW_WEIGHT = 3.8
+ _FINAL_SCALE = 0.99973
+ _RADIAL_BLEND = 0.24
+-_K_ADJUST = -20
++_K_ADJUST = -30
+ _SAMPLE_DTYPE = fnp.float32
+ _MIN_SAMPLES = 32
+ _MAX_SAMPLES = 1_000_000
+
+exec
+/bin/bash -lc 'python eval_client.py' in /opt/tiger/discover/workspace
+diff --git a/submission.py b/submission.py
+index 6f86f623c4af02466b932924ac62ff2c3161a555..f3dec18905a0a7813077e0d37745831ff3df6a7d
+--- a/submission.py
++++ b/submission.py
+@@ -15,7 +15,7 @@
+ _FINAL_SKEW_WEIGHT = 3.8
+ _FINAL_SCALE = 0.99973
+ _RADIAL_BLEND = 0.24
+-_K_ADJUST = -20
++_K_ADJUST = -30
+ _SAMPLE_DTYPE = fnp.float32
+ _MIN_SAMPLES = 32
+ _MAX_SAMPLES = 1_000_000
+
+ succeeded in 21059ms:
+pass score=1.42678e-07
+raw_score 1.4267792039390773e-07
+reward 653.2260162813589
+
+codex
+The offset sweep points back to the original `-20`. I’m leaving sample count close to that and moving to the variance-reduction parameters, where a small score improvement is more plausible.
+apply patch
+patch: completed
+/opt/tiger/discover/workspace/submission.py
+codex
+Next I’m checking the final multiplicative bias correction. It is cheap, affects only the scored final layer, and often has a sharp optimum when the estimator is already low variance.
+apply patch
+patch: completed
+/opt/tiger/discover/workspace/submission.py
+diff --git a/submission.py b/submission.py
+index 6f86f623c4af02466b932924ac62ff2c3161a555..b27706072bb0e71dd83ca2847aedd319e8cf1c5f
+--- a/submission.py
++++ b/submission.py
+@@ -13,7 +13,7 @@
+ _FIRST_MEAN_POWER = 0.734
+ _FINAL_GAUSSIAN_BLEND = 0.115
+ _FINAL_SKEW_WEIGHT = 3.8
+-_FINAL_SCALE = 0.99973
++_FINAL_SCALE = 1.0
+ _RADIAL_BLEND = 0.24
+ _K_ADJUST = -20
+ _SAMPLE_DTYPE = fnp.float32
+
+diff --git a/submission.py b/submission.py
+index 6f86f623c4af02466b932924ac62ff2c3161a555..b27706072bb0e71dd83ca2847aedd319e8cf1c5f
+--- a/submission.py
++++ b/submission.py
+@@ -13,7 +13,7 @@
+ _FIRST_MEAN_POWER = 0.734
+ _FINAL_GAUSSIAN_BLEND = 0.115
+ _FINAL_SKEW_WEIGHT = 3.8
+-_FINAL_SCALE = 0.99973
++_FINAL_SCALE = 1.0
+ _RADIAL_BLEND = 0.24
+ _K_ADJUST = -20
+ _SAMPLE_DTYPE = fnp.float32
+
+exec
+/bin/bash -lc 'python eval_client.py' in /opt/tiger/discover/workspace
+diff --git a/submission.py b/submission.py
+index 6f86f623c4af02466b932924ac62ff2c3161a555..b27706072bb0e71dd83ca2847aedd319e8cf1c5f
+--- a/submission.py
++++ b/submission.py
+@@ -13,7 +13,7 @@
+ _FIRST_MEAN_POWER = 0.734
+ _FINAL_GAUSSIAN_BLEND = 0.115
+ _FINAL_SKEW_WEIGHT = 3.8
+-_FINAL_SCALE = 0.99973
++_FINAL_SCALE = 1.0
+ _RADIAL_BLEND = 0.24
+ _K_ADJUST = -20
+ _SAMPLE_DTYPE = fnp.float32
+
+ succeeded in 21105ms:
+pass score=1.4297e-07
+raw_score 1.4297048437583728e-07
+reward 651.8893039854079
+
+apply patch
+patch: completed
+/opt/tiger/discover/workspace/submission.py
+diff --git a/submission.py b/submission.py
+index 6f86f623c4af02466b932924ac62ff2c3161a555..663de43adab02c7a2057fd700563268003577336
+--- a/submission.py
++++ b/submission.py
+@@ -13,7 +13,7 @@
+ _FIRST_MEAN_POWER = 0.734
+ _FINAL_GAUSSIAN_BLEND = 0.115
+ _FINAL_SKEW_WEIGHT = 3.8
+-_FINAL_SCALE = 0.99973
++_FINAL_SCALE = 0.9995
+ _RADIAL_BLEND = 0.24
+ _K_ADJUST = -20
+ _SAMPLE_DTYPE = fnp.float32
+
+diff --git a/submission.py b/submission.py
+index 6f86f623c4af02466b932924ac62ff2c3161a555..663de43adab02c7a2057fd700563268003577336
+--- a/submission.py
++++ b/submission.py
+@@ -13,7 +13,7 @@
+ _FIRST_MEAN_POWER = 0.734
+ _FINAL_GAUSSIAN_BLEND = 0.115
+ _FINAL_SKEW_WEIGHT = 3.8
+-_FINAL_SCALE = 0.99973
++_FINAL_SCALE = 0.9995
+ _RADIAL_BLEND = 0.24
+ _K_ADJUST = -20
+ _SAMPLE_DTYPE = fnp.float32
+
+exec
+/bin/bash -lc 'python eval_client.py' in /opt/tiger/discover/workspace
+diff --git a/submission.py b/submission.py
+index 6f86f623c4af02466b932924ac62ff2c3161a555..663de43adab02c7a2057fd700563268003577336
+--- a/submission.py
++++ b/submission.py
+@@ -13,7 +13,7 @@
+ _FIRST_MEAN_POWER = 0.734
+ _FINAL_GAUSSIAN_BLEND = 0.115
+ _FINAL_SKEW_WEIGHT = 3.8
+-_FINAL_SCALE = 0.99973
++_FINAL_SCALE = 0.9995
+ _RADIAL_BLEND = 0.24
+ _K_ADJUST = -20
+ _SAMPLE_DTYPE = fnp.float32
+
+ succeeded in 21221ms:
+pass score=1.41843e-07
+raw_score 1.4184325323185475e-07
+reward 657.0698812010214
+
+apply patch
+patch: completed
+/opt/tiger/discover/workspace/submission.py
+diff --git a/submission.py b/submission.py
+index 6f86f623c4af02466b932924ac62ff2c3161a555..7bad8a9cc11f1a503dfb147e82927904bfc8304d
+--- a/submission.py
++++ b/submission.py
+@@ -13,7 +13,7 @@
+ _FIRST_MEAN_POWER = 0.734
+ _FINAL_GAUSSIAN_BLEND = 0.115
+ _FINAL_SKEW_WEIGHT = 3.8
+-_FINAL_SCALE = 0.99973
++_FINAL_SCALE = 0.99965
+ _RADIAL_BLEND = 0.24
+ _K_ADJUST = -20
+ _SAMPLE_DTYPE = fnp.float32
+
+diff --git a/submission.py b/submission.py
+index 6f86f623c4af02466b932924ac62ff2c3161a555..7bad8a9cc11f1a503dfb147e82927904bfc8304d
+--- a/submission.py
++++ b/submission.py
+@@ -13,7 +13,7 @@
+ _FIRST_MEAN_POWER = 0.734
+ _FINAL_GAUSSIAN_BLEND = 0.115
+ _FINAL_SKEW_WEIGHT = 3.8
+-_FINAL_SCALE = 0.99973
++_FINAL_SCALE = 0.99965
+ _RADIAL_BLEND = 0.24
+ _K_ADJUST = -20
+ _SAMPLE_DTYPE = fnp.float32
+
+exec
+/bin/bash -lc 'python eval_client.py' in /opt/tiger/discover/workspace
+diff --git a/submission.py b/submission.py
+index 6f86f623c4af02466b932924ac62ff2c3161a555..7bad8a9cc11f1a503dfb147e82927904bfc8304d
+--- a/submission.py
++++ b/submission.py
+@@ -13,7 +13,7 @@
+ _FIRST_MEAN_POWER = 0.734
+ _FINAL_GAUSSIAN_BLEND = 0.115
+ _FINAL_SKEW_WEIGHT = 3.8
+-_FINAL_SCALE = 0.99973
++_FINAL_SCALE = 0.99965
+ _RADIAL_BLEND = 0.24
+ _K_ADJUST = -20
+ _SAMPLE_DTYPE = fnp.float32
+
+ succeeded in 21180ms:
+pass score=1.38927e-07
+raw_score 1.389270420304456e-07
+reward 670.8624051017828
+
+apply patch
+patch: completed
+/opt/tiger/discover/workspace/submission.py
+diff --git a/submission.py b/submission.py
+index 6f86f623c4af02466b932924ac62ff2c3161a555..d995cf29337b47f216dfada195ba93f00a0b0aa4
+--- a/submission.py
++++ b/submission.py
+@@ -13,7 +13,7 @@
+ _FIRST_MEAN_POWER = 0.734
+ _FINAL_GAUSSIAN_BLEND = 0.115
+ _FINAL_SKEW_WEIGHT = 3.8
+-_FINAL_SCALE = 0.99973
++_FINAL_SCALE = 0.9998
+ _RADIAL_BLEND = 0.24
+ _K_ADJUST = -20
+ _SAMPLE_DTYPE = fnp.float32
+
+diff --git a/submission.py b/submission.py
+index 6f86f623c4af02466b932924ac62ff2c3161a555..d995cf29337b47f216dfada195ba93f00a0b0aa4
+--- a/submission.py
++++ b/submission.py
+@@ -13,7 +13,7 @@
+ _FIRST_MEAN_POWER = 0.734
+ _FINAL_GAUSSIAN_BLEND = 0.115
+ _FINAL_SKEW_WEIGHT = 3.8
+-_FINAL_SCALE = 0.99973
++_FINAL_SCALE = 0.9998
+ _RADIAL_BLEND = 0.24
+ _K_ADJUST = -20
+ _SAMPLE_DTYPE = fnp.float32
+
+exec
+/bin/bash -lc 'python eval_client.py' in /opt/tiger/discover/workspace
+diff --git a/submission.py b/submission.py
+index 6f86f623c4af02466b932924ac62ff2c3161a555..d995cf29337b47f216dfada195ba93f00a0b0aa4
+--- a/submission.py
++++ b/submission.py
+@@ -13,7 +13,7 @@
+ _FIRST_MEAN_POWER = 0.734
+ _FINAL_GAUSSIAN_BLEND = 0.115
+ _FINAL_SKEW_WEIGHT = 3.8
+-_FINAL_SCALE = 0.99973
++_FINAL_SCALE = 0.9998
+ _RADIAL_BLEND = 0.24
+ _K_ADJUST = -20
+ _SAMPLE_DTYPE = fnp.float32
+
+ succeeded in 21105ms:
+pass score=1.38801e-07
+raw_score 1.3880095252716272e-07
+reward 671.4718296474384
+
+codex
+The bias scale optimum is close to the existing value; moving it by a few tenths of a basis point already hurts. I’ll restore that if no neighboring point beats it.
+apply patch
+patch: completed
+/opt/tiger/discover/workspace/submission.py
+codex
+I’m now isolating the analytic final-layer correction: first pure sample mean, then nearby Gaussian blend values. This tells us whether the skew-gated blend is still paying for itself on the hidden suite.
+apply patch
+patch: completed
+/opt/tiger/discover/workspace/submission.py
+diff --git a/submission.py b/submission.py
+index 6f86f623c4af02466b932924ac62ff2c3161a555..941ee99495c8a089fdda62e0d789383ec05ea52c
+--- a/submission.py
++++ b/submission.py
+@@ -11,7 +11,7 @@
+ _WHITEN_POWER = 0.4585
+ _RADIUS_POWER = 0.6
+ _FIRST_MEAN_POWER = 0.734
+-_FINAL_GAUSSIAN_BLEND = 0.115
++_FINAL_GAUSSIAN_BLEND = 0.0
+ _FINAL_SKEW_WEIGHT = 3.8
+ _FINAL_SCALE = 0.99973
+ _RADIAL_BLEND = 0.24
+
+diff --git a/submission.py b/submission.py
+index 6f86f623c4af02466b932924ac62ff2c3161a555..941ee99495c8a089fdda62e0d789383ec05ea52c
+--- a/submission.py
++++ b/submission.py
+@@ -11,7 +11,7 @@
+ _WHITEN_POWER = 0.4585
+ _RADIUS_POWER = 0.6
+ _FIRST_MEAN_POWER = 0.734
+-_FINAL_GAUSSIAN_BLEND = 0.115
++_FINAL_GAUSSIAN_BLEND = 0.0
+ _FINAL_SKEW_WEIGHT = 3.8
+ _FINAL_SCALE = 0.99973
+ _RADIAL_BLEND = 0.24
+
+exec
+/bin/bash -lc 'python eval_client.py' in /opt/tiger/discover/workspace
+diff --git a/submission.py b/submission.py
+index 6f86f623c4af02466b932924ac62ff2c3161a555..941ee99495c8a089fdda62e0d789383ec05ea52c
+--- a/submission.py
++++ b/submission.py
+@@ -11,7 +11,7 @@
+ _WHITEN_POWER = 0.4585
+ _RADIUS_POWER = 0.6
+ _FIRST_MEAN_POWER = 0.734
+-_FINAL_GAUSSIAN_BLEND = 0.115
++_FINAL_GAUSSIAN_BLEND = 0.0
+ _FINAL_SKEW_WEIGHT = 3.8
+ _FINAL_SCALE = 0.99973
+ _RADIAL_BLEND = 0.24
+
+ succeeded in 21020ms:
+pass score=1.38757e-07
+raw_score 1.3875665445084453e-07
+reward 671.6861970986641
+
+apply patch
+patch: completed
+/opt/tiger/discover/workspace/submission.py
+diff --git a/submission.py b/submission.py
+index 6f86f623c4af02466b932924ac62ff2c3161a555..ba5297ad38740fcee77c72ba360a3ed1661bfc0a
+--- a/submission.py
++++ b/submission.py
+@@ -11,7 +11,7 @@
+ _WHITEN_POWER = 0.4585
+ _RADIUS_POWER = 0.6
+ _FIRST_MEAN_POWER = 0.734
+-_FINAL_GAUSSIAN_BLEND = 0.115
++_FINAL_GAUSSIAN_BLEND = 0.08
+ _FINAL_SKEW_WEIGHT = 3.8
+ _FINAL_SCALE = 0.99973
+ _RADIAL_BLEND = 0.24
+
+diff --git a/submission.py b/submission.py
+index 6f86f623c4af02466b932924ac62ff2c3161a555..ba5297ad38740fcee77c72ba360a3ed1661bfc0a
+--- a/submission.py
++++ b/submission.py
+@@ -11,7 +11,7 @@
+ _WHITEN_POWER = 0.4585
+ _RADIUS_POWER = 0.6
+ _FIRST_MEAN_POWER = 0.734
+-_FINAL_GAUSSIAN_BLEND = 0.115
++_FINAL_GAUSSIAN_BLEND = 0.08
+ _FINAL_SKEW_WEIGHT = 3.8
+ _FINAL_SCALE = 0.99973
+ _RADIAL_BLEND = 0.24
+
+exec
+/bin/bash -lc 'python eval_client.py' in /opt/tiger/discover/workspace
+diff --git a/submission.py b/submission.py
+index 6f86f623c4af02466b932924ac62ff2c3161a555..ba5297ad38740fcee77c72ba360a3ed1661bfc0a
+--- a/submission.py
++++ b/submission.py
+@@ -11,7 +11,7 @@
+ _WHITEN_POWER = 0.4585
+ _RADIUS_POWER = 0.6
+ _FIRST_MEAN_POWER = 0.734
+-_FINAL_GAUSSIAN_BLEND = 0.115
++_FINAL_GAUSSIAN_BLEND = 0.08
+ _FINAL_SKEW_WEIGHT = 3.8
+ _FINAL_SCALE = 0.99973
+ _RADIAL_BLEND = 0.24
+
+ succeeded in 21459ms:
+pass score=1.38543e-07
+raw_score 1.3854289022674492e-07
+reward 672.7225727547965
+
+codex
+Pure sample and lower blend are both just behind the baseline, so the existing correction is useful but small. I’m checking the upper side of that same parameter next.
+apply patch
+patch: completed
+/opt/tiger/discover/workspace/submission.py
+diff --git a/submission.py b/submission.py
+index 6f86f623c4af02466b932924ac62ff2c3161a555..24cc9f8226bbcaec6b7d2d3218939eb622f3ef74
+--- a/submission.py
++++ b/submission.py
+@@ -11,7 +11,7 @@
+ _WHITEN_POWER = 0.4585
+ _RADIUS_POWER = 0.6
+ _FIRST_MEAN_POWER = 0.734
+-_FINAL_GAUSSIAN_BLEND = 0.115
++_FINAL_GAUSSIAN_BLEND = 0.13
+ _FINAL_SKEW_WEIGHT = 3.8
+ _FINAL_SCALE = 0.99973
+ _RADIAL_BLEND = 0.24
+
+diff --git a/submission.py b/submission.py
+index 6f86f623c4af02466b932924ac62ff2c3161a555..24cc9f8226bbcaec6b7d2d3218939eb622f3ef74
+--- a/submission.py
++++ b/submission.py
+@@ -11,7 +11,7 @@
+ _WHITEN_POWER = 0.4585
+ _RADIUS_POWER = 0.6
+ _FIRST_MEAN_POWER = 0.734
+-_FINAL_GAUSSIAN_BLEND = 0.115
++_FINAL_GAUSSIAN_BLEND = 0.13
+ _FINAL_SKEW_WEIGHT = 3.8
+ _FINAL_SCALE = 0.99973
+ _RADIAL_BLEND = 0.24
+
+exec
+/bin/bash -lc 'python eval_client.py' in /opt/tiger/discover/workspace
+diff --git a/submission.py b/submission.py
+index 6f86f623c4af02466b932924ac62ff2c3161a555..24cc9f8226bbcaec6b7d2d3218939eb622f3ef74
+--- a/submission.py
++++ b/submission.py
+@@ -11,7 +11,7 @@
+ _WHITEN_POWER = 0.4585
+ _RADIUS_POWER = 0.6
+ _FIRST_MEAN_POWER = 0.734
+-_FINAL_GAUSSIAN_BLEND = 0.115
++_FINAL_GAUSSIAN_BLEND = 0.13
+ _FINAL_SKEW_WEIGHT = 3.8
+ _FINAL_SCALE = 0.99973
+ _RADIAL_BLEND = 0.24
+
+ succeeded in 21379ms:
+pass score=1.38511e-07
+raw_score 1.3851140977294564e-07
+reward 672.8754671041216
+
+codex
+There is a tiny deterministic improvement at blend `0.13`. I’ll probe a couple of adjacent points; if they do not help, I’ll keep the best measured value rather than the original.
+apply patch
+patch: completed
+/opt/tiger/discover/workspace/submission.py
+diff --git a/submission.py b/submission.py
+index 6f86f623c4af02466b932924ac62ff2c3161a555..e4edb3e111073fc74235ee9fbaade2aed0f89f3b
+--- a/submission.py
++++ b/submission.py
+@@ -11,7 +11,7 @@
+ _WHITEN_POWER = 0.4585
+ _RADIUS_POWER = 0.6
+ _FIRST_MEAN_POWER = 0.734
+-_FINAL_GAUSSIAN_BLEND = 0.115
++_FINAL_GAUSSIAN_BLEND = 0.145
+ _FINAL_SKEW_WEIGHT = 3.8
+ _FINAL_SCALE = 0.99973
+ _RADIAL_BLEND = 0.24
+
+diff --git a/submission.py b/submission.py
+index 6f86f623c4af02466b932924ac62ff2c3161a555..e4edb3e111073fc74235ee9fbaade2aed0f89f3b
+--- a/submission.py
++++ b/submission.py
+@@ -11,7 +11,7 @@
+ _WHITEN_POWER = 0.4585
+ _RADIUS_POWER = 0.6
+ _FIRST_MEAN_POWER = 0.734
+-_FINAL_GAUSSIAN_BLEND = 0.115
++_FINAL_GAUSSIAN_BLEND = 0.145
+ _FINAL_SKEW_WEIGHT = 3.8
+ _FINAL_SCALE = 0.99973
+ _RADIAL_BLEND = 0.24
+
+exec
+/bin/bash -lc 'python eval_client.py' in /opt/tiger/discover/workspace
+diff --git a/submission.py b/submission.py
+index 6f86f623c4af02466b932924ac62ff2c3161a555..e4edb3e111073fc74235ee9fbaade2aed0f89f3b
+--- a/submission.py
++++ b/submission.py
+@@ -11,7 +11,7 @@
+ _WHITEN_POWER = 0.4585
+ _RADIUS_POWER = 0.6
+ _FIRST_MEAN_POWER = 0.734
+-_FINAL_GAUSSIAN_BLEND = 0.115
++_FINAL_GAUSSIAN_BLEND = 0.145
+ _FINAL_SKEW_WEIGHT = 3.8
+ _FINAL_SCALE = 0.99973
+ _RADIAL_BLEND = 0.24
+
+ succeeded in 21377ms:
+pass score=1.38517e-07
+raw_score 1.3851713447365908e-07
+reward 672.8476581931069
+
+apply patch
+patch: completed
+/opt/tiger/discover/workspace/submission.py
+diff --git a/submission.py b/submission.py
+index 6f86f623c4af02466b932924ac62ff2c3161a555..94da6fce31372235c5e673cdf9e6770ff2f3e502
+--- a/submission.py
++++ b/submission.py
+@@ -11,7 +11,7 @@
+ _WHITEN_POWER = 0.4585
+ _RADIUS_POWER = 0.6
+ _FIRST_MEAN_POWER = 0.734
+-_FINAL_GAUSSIAN_BLEND = 0.115
++_FINAL_GAUSSIAN_BLEND = 0.125
+ _FINAL_SKEW_WEIGHT = 3.8
+ _FINAL_SCALE = 0.99973
+ _RADIAL_BLEND = 0.24
+
+diff --git a/submission.py b/submission.py
+index 6f86f623c4af02466b932924ac62ff2c3161a555..94da6fce31372235c5e673cdf9e6770ff2f3e502
+--- a/submission.py
++++ b/submission.py
+@@ -11,7 +11,7 @@
+ _WHITEN_POWER = 0.4585
+ _RADIUS_POWER = 0.6
+ _FIRST_MEAN_POWER = 0.734
+-_FINAL_GAUSSIAN_BLEND = 0.115
++_FINAL_GAUSSIAN_BLEND = 0.125
+ _FINAL_SKEW_WEIGHT = 3.8
+ _FINAL_SCALE = 0.99973
+ _RADIAL_BLEND = 0.24
+
+exec
+/bin/bash -lc 'python eval_client.py' in /opt/tiger/discover/workspace
+diff --git a/submission.py b/submission.py
+index 6f86f623c4af02466b932924ac62ff2c3161a555..94da6fce31372235c5e673cdf9e6770ff2f3e502
+--- a/submission.py
++++ b/submission.py
+@@ -11,7 +11,7 @@
+ _WHITEN_POWER = 0.4585
+ _RADIUS_POWER = 0.6
+ _FIRST_MEAN_POWER = 0.734
+-_FINAL_GAUSSIAN_BLEND = 0.115
++_FINAL_GAUSSIAN_BLEND = 0.125
+ _FINAL_SKEW_WEIGHT = 3.8
+ _FINAL_SCALE = 0.99973
+ _RADIAL_BLEND = 0.24
+
+ succeeded in 21247ms:
+pass score=1.38511e-07
+raw_score 1.3851054177393963e-07
+reward 672.8796837884919
+
+apply patch
+patch: completed
+/opt/tiger/discover/workspace/submission.py
+diff --git a/submission.py b/submission.py
+index 6f86f623c4af02466b932924ac62ff2c3161a555..d73055a513cce03417dc1be4526e3b434c34fc28
+--- a/submission.py
++++ b/submission.py
+@@ -11,7 +11,7 @@
+ _WHITEN_POWER = 0.4585
+ _RADIUS_POWER = 0.6
+ _FIRST_MEAN_POWER = 0.734
+-_FINAL_GAUSSIAN_BLEND = 0.115
++_FINAL_GAUSSIAN_BLEND = 0.12
+ _FINAL_SKEW_WEIGHT = 3.8
+ _FINAL_SCALE = 0.99973
+ _RADIAL_BLEND = 0.24
+
+diff --git a/submission.py b/submission.py
+index 6f86f623c4af02466b932924ac62ff2c3161a555..d73055a513cce03417dc1be4526e3b434c34fc28
+--- a/submission.py
++++ b/submission.py
+@@ -11,7 +11,7 @@
+ _WHITEN_POWER = 0.4585
+ _RADIUS_POWER = 0.6
+ _FIRST_MEAN_POWER = 0.734
+-_FINAL_GAUSSIAN_BLEND = 0.115
++_FINAL_GAUSSIAN_BLEND = 0.12
+ _FINAL_SKEW_WEIGHT = 3.8
+ _FINAL_SCALE = 0.99973
+ _RADIAL_BLEND = 0.24
+
+exec
+/bin/bash -lc 'python eval_client.py' in /opt/tiger/discover/workspace
+diff --git a/submission.py b/submission.py
+index 6f86f623c4af02466b932924ac62ff2c3161a555..d73055a513cce03417dc1be4526e3b434c34fc28
+--- a/submission.py
++++ b/submission.py
+@@ -11,7 +11,7 @@
+ _WHITEN_POWER = 0.4585
+ _RADIUS_POWER = 0.6
+ _FIRST_MEAN_POWER = 0.734
+-_FINAL_GAUSSIAN_BLEND = 0.115
++_FINAL_GAUSSIAN_BLEND = 0.12
+ _FINAL_SKEW_WEIGHT = 3.8
+ _FINAL_SCALE = 0.99973
+ _RADIAL_BLEND = 0.24
+
+ succeeded in 21373ms:
+pass score=1.38511e-07
+raw_score 1.3851085100213823e-07
+reward 672.878181571366
+
+codex
+The best blend so far is `0.125`, still a very small gain. I’ll refine it once, then move to the skew gate because the two constants interact.
+apply patch
+patch: completed
+/opt/tiger/discover/workspace/submission.py
+diff --git a/submission.py b/submission.py
+index 6f86f623c4af02466b932924ac62ff2c3161a555..9a22ad4a89f64bd65e172d43a65eace916e93239
+--- a/submission.py
++++ b/submission.py
+@@ -11,7 +11,7 @@
+ _WHITEN_POWER = 0.4585
+ _RADIUS_POWER = 0.6
+ _FIRST_MEAN_POWER = 0.734
+-_FINAL_GAUSSIAN_BLEND = 0.115
++_FINAL_GAUSSIAN_BLEND = 0.1275
+ _FINAL_SKEW_WEIGHT = 3.8
+ _FINAL_SCALE = 0.99973
+ _RADIAL_BLEND = 0.24
+
+diff --git a/submission.py b/submission.py
+index 6f86f623c4af02466b932924ac62ff2c3161a555..9a22ad4a89f64bd65e172d43a65eace916e93239
+--- a/submission.py
++++ b/submission.py
+@@ -11,7 +11,7 @@
+ _WHITEN_POWER = 0.4585
+ _RADIUS_POWER = 0.6
+ _FIRST_MEAN_POWER = 0.734
+-_FINAL_GAUSSIAN_BLEND = 0.115
++_FINAL_GAUSSIAN_BLEND = 0.1275
+ _FINAL_SKEW_WEIGHT = 3.8
+ _FINAL_SCALE = 0.99973
+ _RADIAL_BLEND = 0.24
+
+exec
+/bin/bash -lc 'python eval_client.py' in /opt/tiger/discover/workspace
+diff --git a/submission.py b/submission.py
+index 6f86f623c4af02466b932924ac62ff2c3161a555..9a22ad4a89f64bd65e172d43a65eace916e93239
+--- a/submission.py
++++ b/submission.py
+@@ -11,7 +11,7 @@
+ _WHITEN_POWER = 0.4585
+ _RADIUS_POWER = 0.6
+ _FIRST_MEAN_POWER = 0.734
+-_FINAL_GAUSSIAN_BLEND = 0.115
++_FINAL_GAUSSIAN_BLEND = 0.1275
+ _FINAL_SKEW_WEIGHT = 3.8
+ _FINAL_SCALE = 0.99973
+ _RADIAL_BLEND = 0.24
+
+ succeeded in 21475ms:
+pass score=1.38511e-07
+raw_score 1.385107725582202e-07
+reward 672.8785626478696
+
+apply patch
+patch: completed
+/opt/tiger/discover/workspace/submission.py
+diff --git a/submission.py b/submission.py
+index 6f86f623c4af02466b932924ac62ff2c3161a555..d469f4ecfd449b0901d96a2f45c886e041f97227
+--- a/submission.py
++++ b/submission.py
+@@ -11,7 +11,7 @@
+ _WHITEN_POWER = 0.4585
+ _RADIUS_POWER = 0.6
+ _FIRST_MEAN_POWER = 0.734
+-_FINAL_GAUSSIAN_BLEND = 0.115
++_FINAL_GAUSSIAN_BLEND = 0.1235
+ _FINAL_SKEW_WEIGHT = 3.8
+ _FINAL_SCALE = 0.99973
+ _RADIAL_BLEND = 0.24
+
+diff --git a/submission.py b/submission.py
+index 6f86f623c4af02466b932924ac62ff2c3161a555..d469f4ecfd449b0901d96a2f45c886e041f97227
+--- a/submission.py
++++ b/submission.py
+@@ -11,7 +11,7 @@
+ _WHITEN_POWER = 0.4585
+ _RADIUS_POWER = 0.6
+ _FIRST_MEAN_POWER = 0.734
+-_FINAL_GAUSSIAN_BLEND = 0.115
++_FINAL_GAUSSIAN_BLEND = 0.1235
+ _FINAL_SKEW_WEIGHT = 3.8
+ _FINAL_SCALE = 0.99973
+ _RADIAL_BLEND = 0.24
+
+exec
+/bin/bash -lc 'python eval_client.py' in /opt/tiger/discover/workspace
+diff --git a/submission.py b/submission.py
+index 6f86f623c4af02466b932924ac62ff2c3161a555..d469f4ecfd449b0901d96a2f45c886e041f97227
+--- a/submission.py
++++ b/submission.py
+@@ -11,7 +11,7 @@
+ _WHITEN_POWER = 0.4585
+ _RADIUS_POWER = 0.6
+ _FIRST_MEAN_POWER = 0.734
+-_FINAL_GAUSSIAN_BLEND = 0.115
++_FINAL_GAUSSIAN_BLEND = 0.1235
+ _FINAL_SKEW_WEIGHT = 3.8
+ _FINAL_SCALE = 0.99973
+ _RADIAL_BLEND = 0.24
+
+ succeeded in 21511ms:
+pass score=1.38511e-07
+raw_score 1.3851094081474e-07
+reward 672.8777452669137
+
+codex
+The blend refinement peaked around `0.125`. I’m testing the skew damping now; it controls where the Gaussian correction is trusted versus where the sampled ReLU mean dominates.
+apply patch
+patch: completed
+/opt/tiger/discover/workspace/submission.py
+diff --git a/submission.py b/submission.py
+index 6f86f623c4af02466b932924ac62ff2c3161a555..861550d6cdf5a08b556b7152c7909d62b6323ef5
+--- a/submission.py
++++ b/submission.py
+@@ -11,8 +11,8 @@
+ _WHITEN_POWER = 0.4585
+ _RADIUS_POWER = 0.6
+ _FIRST_MEAN_POWER = 0.734
+-_FINAL_GAUSSIAN_BLEND = 0.115
+-_FINAL_SKEW_WEIGHT = 3.8
++_FINAL_GAUSSIAN_BLEND = 0.125
++_FINAL_SKEW_WEIGHT = 2.5
+ _FINAL_SCALE = 0.99973
+ _RADIAL_BLEND = 0.24
+ _K_ADJUST = -20
+
+diff --git a/submission.py b/submission.py
+index 6f86f623c4af02466b932924ac62ff2c3161a555..861550d6cdf5a08b556b7152c7909d62b6323ef5
+--- a/submission.py
++++ b/submission.py
+@@ -11,8 +11,8 @@
+ _WHITEN_POWER = 0.4585
+ _RADIUS_POWER = 0.6
+ _FIRST_MEAN_POWER = 0.734
+-_FINAL_GAUSSIAN_BLEND = 0.115
+-_FINAL_SKEW_WEIGHT = 3.8
++_FINAL_GAUSSIAN_BLEND = 0.125
++_FINAL_SKEW_WEIGHT = 2.5
+ _FINAL_SCALE = 0.99973
+ _RADIAL_BLEND = 0.24
+ _K_ADJUST = -20
+
+exec
+/bin/bash -lc 'python eval_client.py' in /opt/tiger/discover/workspace
+diff --git a/submission.py b/submission.py
+index 6f86f623c4af02466b932924ac62ff2c3161a555..861550d6cdf5a08b556b7152c7909d62b6323ef5
+--- a/submission.py
++++ b/submission.py
+@@ -11,8 +11,8 @@
+ _WHITEN_POWER = 0.4585
+ _RADIUS_POWER = 0.6
+ _FIRST_MEAN_POWER = 0.734
+-_FINAL_GAUSSIAN_BLEND = 0.115
+-_FINAL_SKEW_WEIGHT = 3.8
++_FINAL_GAUSSIAN_BLEND = 0.125
++_FINAL_SKEW_WEIGHT = 2.5
+ _FINAL_SCALE = 0.99973
+ _RADIAL_BLEND = 0.24
+ _K_ADJUST = -20
+
+ succeeded in 21591ms:
+pass score=1.3853e-07
+raw_score 1.3853043299150158e-07
+reward 672.7830667788268
+
+codex
+Less skew damping made the correction worse, so the correction is probably too aggressive on skewed neurons. I’m testing stronger damping next.
+apply patch
+patch: completed
+/opt/tiger/discover/workspace/submission.py
+diff --git a/submission.py b/submission.py
+index 6f86f623c4af02466b932924ac62ff2c3161a555..7262f88ecf94218e5570b1cd37724d7de757d259
+--- a/submission.py
++++ b/submission.py
+@@ -11,8 +11,8 @@
+ _WHITEN_POWER = 0.4585
+ _RADIUS_POWER = 0.6
+ _FIRST_MEAN_POWER = 0.734
+-_FINAL_GAUSSIAN_BLEND = 0.115
+-_FINAL_SKEW_WEIGHT = 3.8
++_FINAL_GAUSSIAN_BLEND = 0.125
++_FINAL_SKEW_WEIGHT = 5.0
+ _FINAL_SCALE = 0.99973
+ _RADIAL_BLEND = 0.24
+ _K_ADJUST = -20
+
+diff --git a/submission.py b/submission.py
+index 6f86f623c4af02466b932924ac62ff2c3161a555..7262f88ecf94218e5570b1cd37724d7de757d259
+--- a/submission.py
++++ b/submission.py
+@@ -11,8 +11,8 @@
+ _WHITEN_POWER = 0.4585
+ _RADIUS_POWER = 0.6
+ _FIRST_MEAN_POWER = 0.734
+-_FINAL_GAUSSIAN_BLEND = 0.115
+-_FINAL_SKEW_WEIGHT = 3.8
++_FINAL_GAUSSIAN_BLEND = 0.125
++_FINAL_SKEW_WEIGHT = 5.0
+ _FINAL_SCALE = 0.99973
+ _RADIAL_BLEND = 0.24
+ _K_ADJUST = -20
+
+exec
+/bin/bash -lc 'python eval_client.py' in /opt/tiger/discover/workspace
+diff --git a/submission.py b/submission.py
+index 6f86f623c4af02466b932924ac62ff2c3161a555..7262f88ecf94218e5570b1cd37724d7de757d259
+--- a/submission.py
++++ b/submission.py
+@@ -11,8 +11,8 @@
+ _WHITEN_POWER = 0.4585
+ _RADIUS_POWER = 0.6
+ _FIRST_MEAN_POWER = 0.734
+-_FINAL_GAUSSIAN_BLEND = 0.115
+-_FINAL_SKEW_WEIGHT = 3.8
++_FINAL_GAUSSIAN_BLEND = 0.125
++_FINAL_SKEW_WEIGHT = 5.0
+ _FINAL_SCALE = 0.99973
+ _RADIAL_BLEND = 0.24
+ _K_ADJUST = -20
+
+ succeeded in 22008ms:
+pass score=1.38511e-07
+raw_score 1.3851146832166705e-07
+reward 672.875182680032
+
+codex
+The original skew weight remains close. I’m doing a tight local check around it with the improved blend.
+apply patch
+patch: completed
+/opt/tiger/discover/workspace/submission.py
+diff --git a/submission.py b/submission.py
+index 6f86f623c4af02466b932924ac62ff2c3161a555..ab5205b1946513b4065657536103589ec4c60625
+--- a/submission.py
++++ b/submission.py
+@@ -11,8 +11,8 @@
+ _WHITEN_POWER = 0.4585
+ _RADIUS_POWER = 0.6
+ _FIRST_MEAN_POWER = 0.734
+-_FINAL_GAUSSIAN_BLEND = 0.115
+-_FINAL_SKEW_WEIGHT = 3.8
++_FINAL_GAUSSIAN_BLEND = 0.125
++_FINAL_SKEW_WEIGHT = 3.5
+ _FINAL_SCALE = 0.99973
+ _RADIAL_BLEND = 0.24
+ _K_ADJUST = -20
+
+diff --git a/submission.py b/submission.py
+index 6f86f623c4af02466b932924ac62ff2c3161a555..ab5205b1946513b4065657536103589ec4c60625
+--- a/submission.py
++++ b/submission.py
+@@ -11,8 +11,8 @@
+ _WHITEN_POWER = 0.4585
+ _RADIUS_POWER = 0.6
+ _FIRST_MEAN_POWER = 0.734
+-_FINAL_GAUSSIAN_BLEND = 0.115
+-_FINAL_SKEW_WEIGHT = 3.8
++_FINAL_GAUSSIAN_BLEND = 0.125
++_FINAL_SKEW_WEIGHT = 3.5
+ _FINAL_SCALE = 0.99973
+ _RADIAL_BLEND = 0.24
+ _K_ADJUST = -20
+
+exec
+/bin/bash -lc 'python eval_client.py' in /opt/tiger/discover/workspace
+diff --git a/submission.py b/submission.py
+index 6f86f623c4af02466b932924ac62ff2c3161a555..ab5205b1946513b4065657536103589ec4c60625
+--- a/submission.py
++++ b/submission.py
+@@ -11,8 +11,8 @@
+ _WHITEN_POWER = 0.4585
+ _RADIUS_POWER = 0.6
+ _FIRST_MEAN_POWER = 0.734
+-_FINAL_GAUSSIAN_BLEND = 0.115
+-_FINAL_SKEW_WEIGHT = 3.8
++_FINAL_GAUSSIAN_BLEND = 0.125
++_FINAL_SKEW_WEIGHT = 3.5
+ _FINAL_SCALE = 0.99973
+ _RADIAL_BLEND = 0.24
+ _K_ADJUST = -20
+
+ succeeded in 21493ms:
+pass score=1.38513e-07
+raw_score 1.3851250173502195e-07
+reward 672.8701624963574
+
+apply patch
+patch: completed
+/opt/tiger/discover/workspace/submission.py
+diff --git a/submission.py b/submission.py
+index 6f86f623c4af02466b932924ac62ff2c3161a555..a62602f231d4cfb03b2be96323da5a0d3935f263
+--- a/submission.py
++++ b/submission.py
+@@ -11,8 +11,8 @@
+ _WHITEN_POWER = 0.4585
+ _RADIUS_POWER = 0.6
+ _FIRST_MEAN_POWER = 0.734
+-_FINAL_GAUSSIAN_BLEND = 0.115
+-_FINAL_SKEW_WEIGHT = 3.8
++_FINAL_GAUSSIAN_BLEND = 0.125
++_FINAL_SKEW_WEIGHT = 4.0
+ _FINAL_SCALE = 0.99973
+ _RADIAL_BLEND = 0.24
+ _K_ADJUST = -20
+
+diff --git a/submission.py b/submission.py
+index 6f86f623c4af02466b932924ac62ff2c3161a555..a62602f231d4cfb03b2be96323da5a0d3935f263
+--- a/submission.py
++++ b/submission.py
+@@ -11,8 +11,8 @@
+ _WHITEN_POWER = 0.4585
+ _RADIUS_POWER = 0.6
+ _FIRST_MEAN_POWER = 0.734
+-_FINAL_GAUSSIAN_BLEND = 0.115
+-_FINAL_SKEW_WEIGHT = 3.8
++_FINAL_GAUSSIAN_BLEND = 0.125
++_FINAL_SKEW_WEIGHT = 4.0
+ _FINAL_SCALE = 0.99973
+ _RADIAL_BLEND = 0.24
+ _K_ADJUST = -20
+
+exec
+/bin/bash -lc 'python eval_client.py' in /opt/tiger/discover/workspace
+diff --git a/submission.py b/submission.py
+index 6f86f623c4af02466b932924ac62ff2c3161a555..a62602f231d4cfb03b2be96323da5a0d3935f263
+--- a/submission.py
++++ b/submission.py
+@@ -11,8 +11,8 @@
+ _WHITEN_POWER = 0.4585
+ _RADIUS_POWER = 0.6
+ _FIRST_MEAN_POWER = 0.734
+-_FINAL_GAUSSIAN_BLEND = 0.115
+-_FINAL_SKEW_WEIGHT = 3.8
++_FINAL_GAUSSIAN_BLEND = 0.125
++_FINAL_SKEW_WEIGHT = 4.0
+ _FINAL_SCALE = 0.99973
+ _RADIAL_BLEND = 0.24
+ _K_ADJUST = -20
+
+ succeeded in 21410ms:
+pass score=1.3851e-07
+raw_score 1.3851018252353244e-07
+reward 672.8814290197521
+
+codex
+A slightly stronger skew weight improved the best score. I’m extending that direction cautiously.
+apply patch
+patch: completed
+/opt/tiger/discover/workspace/submission.py
+diff --git a/submission.py b/submission.py
+index 6f86f623c4af02466b932924ac62ff2c3161a555..2024c76ef90a037ab9c483ce4e19617c80d7ce75
+--- a/submission.py
++++ b/submission.py
+@@ -11,8 +11,8 @@
+ _WHITEN_POWER = 0.4585
+ _RADIUS_POWER = 0.6
+ _FIRST_MEAN_POWER = 0.734
+-_FINAL_GAUSSIAN_BLEND = 0.115
+-_FINAL_SKEW_WEIGHT = 3.8
++_FINAL_GAUSSIAN_BLEND = 0.125
++_FINAL_SKEW_WEIGHT = 4.3
+ _FINAL_SCALE = 0.99973
+ _RADIAL_BLEND = 0.24
+ _K_ADJUST = -20
+
+diff --git a/submission.py b/submission.py
+index 6f86f623c4af02466b932924ac62ff2c3161a555..2024c76ef90a037ab9c483ce4e19617c80d7ce75
+--- a/submission.py
++++ b/submission.py
+@@ -11,8 +11,8 @@
+ _WHITEN_POWER = 0.4585
+ _RADIUS_POWER = 0.6
+ _FIRST_MEAN_POWER = 0.734
+-_FINAL_GAUSSIAN_BLEND = 0.115
+-_FINAL_SKEW_WEIGHT = 3.8
++_FINAL_GAUSSIAN_BLEND = 0.125
++_FINAL_SKEW_WEIGHT = 4.3
+ _FINAL_SCALE = 0.99973
+ _RADIAL_BLEND = 0.24
+ _K_ADJUST = -20
+
+exec
+/bin/bash -lc 'python eval_client.py' in /opt/tiger/discover/workspace
+diff --git a/submission.py b/submission.py
+index 6f86f623c4af02466b932924ac62ff2c3161a555..2024c76ef90a037ab9c483ce4e19617c80d7ce75
+--- a/submission.py
++++ b/submission.py
+@@ -11,8 +11,8 @@
+ _WHITEN_POWER = 0.4585
+ _RADIUS_POWER = 0.6
+ _FIRST_MEAN_POWER = 0.734
+-_FINAL_GAUSSIAN_BLEND = 0.115
+-_FINAL_SKEW_WEIGHT = 3.8
++_FINAL_GAUSSIAN_BLEND = 0.125
++_FINAL_SKEW_WEIGHT = 4.3
+ _FINAL_SCALE = 0.99973
+ _RADIAL_BLEND = 0.24
+ _K_ADJUST = -20
+
+ succeeded in 21415ms:
+pass score=1.3851e-07
+raw_score 1.3850990171704325e-07
+reward 672.8827931783385
+
+codex
+`4.3` is the best skew gate so far. I’ll check one higher value and then keep the local minimum.
+apply patch
+patch: completed
+/opt/tiger/discover/workspace/submission.py
+diff --git a/submission.py b/submission.py
+index 6f86f623c4af02466b932924ac62ff2c3161a555..6c12275c5012a847f882d176fac4dc06b2eef62f
+--- a/submission.py
++++ b/submission.py
+@@ -11,8 +11,8 @@
+ _WHITEN_POWER = 0.4585
+ _RADIUS_POWER = 0.6
+ _FIRST_MEAN_POWER = 0.734
+-_FINAL_GAUSSIAN_BLEND = 0.115
+-_FINAL_SKEW_WEIGHT = 3.8
++_FINAL_GAUSSIAN_BLEND = 0.125
++_FINAL_SKEW_WEIGHT = 4.6
+ _FINAL_SCALE = 0.99973
+ _RADIAL_BLEND = 0.24
+ _K_ADJUST = -20
+
+diff --git a/submission.py b/submission.py
+index 6f86f623c4af02466b932924ac62ff2c3161a555..6c12275c5012a847f882d176fac4dc06b2eef62f
+--- a/submission.py
++++ b/submission.py
+@@ -11,8 +11,8 @@
+ _WHITEN_POWER = 0.4585
+ _RADIUS_POWER = 0.6
+ _FIRST_MEAN_POWER = 0.734
+-_FINAL_GAUSSIAN_BLEND = 0.115
+-_FINAL_SKEW_WEIGHT = 3.8
++_FINAL_GAUSSIAN_BLEND = 0.125
++_FINAL_SKEW_WEIGHT = 4.6
+ _FINAL_SCALE = 0.99973
+ _RADIAL_BLEND = 0.24
+ _K_ADJUST = -20
+
+exec
+/bin/bash -lc 'python eval_client.py' in /opt/tiger/discover/workspace
+diff --git a/submission.py b/submission.py
+index 6f86f623c4af02466b932924ac62ff2c3161a555..6c12275c5012a847f882d176fac4dc06b2eef62f
+--- a/submission.py
++++ b/submission.py
+@@ -11,8 +11,8 @@
+ _WHITEN_POWER = 0.4585
+ _RADIUS_POWER = 0.6
+ _FIRST_MEAN_POWER = 0.734
+-_FINAL_GAUSSIAN_BLEND = 0.115
+-_FINAL_SKEW_WEIGHT = 3.8
++_FINAL_GAUSSIAN_BLEND = 0.125
++_FINAL_SKEW_WEIGHT = 4.6
+ _FINAL_SCALE = 0.99973
+ _RADIAL_BLEND = 0.24
+ _K_ADJUST = -20
+
+ succeeded in 21789ms:
+pass score=1.3851e-07
+raw_score 1.3851022799826752e-07
+reward 672.8812081039023
+
+apply patch
+patch: completed
+/opt/tiger/discover/workspace/submission.py
+diff --git a/submission.py b/submission.py
+index 6f86f623c4af02466b932924ac62ff2c3161a555..2024c76ef90a037ab9c483ce4e19617c80d7ce75
+--- a/submission.py
++++ b/submission.py
+@@ -11,8 +11,8 @@
+ _WHITEN_POWER = 0.4585
+ _RADIUS_POWER = 0.6
+ _FIRST_MEAN_POWER = 0.734
+-_FINAL_GAUSSIAN_BLEND = 0.115
+-_FINAL_SKEW_WEIGHT = 3.8
++_FINAL_GAUSSIAN_BLEND = 0.125
++_FINAL_SKEW_WEIGHT = 4.3
+ _FINAL_SCALE = 0.99973
+ _RADIAL_BLEND = 0.24
+ _K_ADJUST = -20
+
+diff --git a/submission.py b/submission.py
+index 6f86f623c4af02466b932924ac62ff2c3161a555..2024c76ef90a037ab9c483ce4e19617c80d7ce75
+--- a/submission.py
++++ b/submission.py
+@@ -11,8 +11,8 @@
+ _WHITEN_POWER = 0.4585
+ _RADIUS_POWER = 0.6
+ _FIRST_MEAN_POWER = 0.734
+-_FINAL_GAUSSIAN_BLEND = 0.115
+-_FINAL_SKEW_WEIGHT = 3.8
++_FINAL_GAUSSIAN_BLEND = 0.125
++_FINAL_SKEW_WEIGHT = 4.3
+ _FINAL_SCALE = 0.99973
+ _RADIAL_BLEND = 0.24
+ _K_ADJUST = -20
+
+codex
+With the final correction locally tuned, I’m moving to the radial reweighting. This is another final-layer-only correction and can shift bias without changing the main propagation path.
+apply patch
+patch: completed
+/opt/tiger/discover/workspace/submission.py
+diff --git a/submission.py b/submission.py
+index 6f86f623c4af02466b932924ac62ff2c3161a555..249bdaa4ab8fff8b90da890757b3d68004365f69
+--- a/submission.py
++++ b/submission.py
+@@ -11,10 +11,10 @@
+ _WHITEN_POWER = 0.4585
+ _RADIUS_POWER = 0.6
+ _FIRST_MEAN_POWER = 0.734
+-_FINAL_GAUSSIAN_BLEND = 0.115
+-_FINAL_SKEW_WEIGHT = 3.8
++_FINAL_GAUSSIAN_BLEND = 0.125
++_FINAL_SKEW_WEIGHT = 4.3
+ _FINAL_SCALE = 0.99973
+-_RADIAL_BLEND = 0.24
++_RADIAL_BLEND = 0.20
+ _K_ADJUST = -20
+ _SAMPLE_DTYPE = fnp.float32
+ _MIN_SAMPLES = 32
+
+diff --git a/submission.py b/submission.py
+index 6f86f623c4af02466b932924ac62ff2c3161a555..249bdaa4ab8fff8b90da890757b3d68004365f69
+--- a/submission.py
++++ b/submission.py
+@@ -11,10 +11,10 @@
+ _WHITEN_POWER = 0.4585
+ _RADIUS_POWER = 0.6
+ _FIRST_MEAN_POWER = 0.734
+-_FINAL_GAUSSIAN_BLEND = 0.115
+-_FINAL_SKEW_WEIGHT = 3.8
++_FINAL_GAUSSIAN_BLEND = 0.125
++_FINAL_SKEW_WEIGHT = 4.3
+ _FINAL_SCALE = 0.99973
+-_RADIAL_BLEND = 0.24
++_RADIAL_BLEND = 0.20
+ _K_ADJUST = -20
+ _SAMPLE_DTYPE = fnp.float32
+ _MIN_SAMPLES = 32
+
+exec
+/bin/bash -lc 'python eval_client.py' in /opt/tiger/discover/workspace
+diff --git a/submission.py b/submission.py
+index 6f86f623c4af02466b932924ac62ff2c3161a555..249bdaa4ab8fff8b90da890757b3d68004365f69
+--- a/submission.py
++++ b/submission.py
+@@ -11,10 +11,10 @@
+ _WHITEN_POWER = 0.4585
+ _RADIUS_POWER = 0.6
+ _FIRST_MEAN_POWER = 0.734
+-_FINAL_GAUSSIAN_BLEND = 0.115
+-_FINAL_SKEW_WEIGHT = 3.8
++_FINAL_GAUSSIAN_BLEND = 0.125
++_FINAL_SKEW_WEIGHT = 4.3
+ _FINAL_SCALE = 0.99973
+-_RADIAL_BLEND = 0.24
++_RADIAL_BLEND = 0.20
+ _K_ADJUST = -20
+ _SAMPLE_DTYPE = fnp.float32
+ _MIN_SAMPLES = 32
+
+ succeeded in 21531ms:
+pass score=1.38798e-07
+raw_score 1.387979557421204e-07
+reward 671.4863273878747
+
+codex
+Lower radial correction worsened the result. I’ll test the higher side before restoring or refining.
+apply patch
+patch: completed
+/opt/tiger/discover/workspace/submission.py
+diff --git a/submission.py b/submission.py
+index 6f86f623c4af02466b932924ac62ff2c3161a555..9edc5716057c5b418a27df483e42674b3990a681
+--- a/submission.py
++++ b/submission.py
+@@ -11,10 +11,10 @@
+ _WHITEN_POWER = 0.4585
+ _RADIUS_POWER = 0.6
+ _FIRST_MEAN_POWER = 0.734
+-_FINAL_GAUSSIAN_BLEND = 0.115
+-_FINAL_SKEW_WEIGHT = 3.8
++_FINAL_GAUSSIAN_BLEND = 0.125
++_FINAL_SKEW_WEIGHT = 4.3
+ _FINAL_SCALE = 0.99973
+-_RADIAL_BLEND = 0.24
++_RADIAL_BLEND = 0.28
+ _K_ADJUST = -20
+ _SAMPLE_DTYPE = fnp.float32
+ _MIN_SAMPLES = 32
+
+diff --git a/submission.py b/submission.py
+index 6f86f623c4af02466b932924ac62ff2c3161a555..9edc5716057c5b418a27df483e42674b3990a681
+--- a/submission.py
++++ b/submission.py
+@@ -11,10 +11,10 @@
+ _WHITEN_POWER = 0.4585
+ _RADIUS_POWER = 0.6
+ _FIRST_MEAN_POWER = 0.734
+-_FINAL_GAUSSIAN_BLEND = 0.115
+-_FINAL_SKEW_WEIGHT = 3.8
++_FINAL_GAUSSIAN_BLEND = 0.125
++_FINAL_SKEW_WEIGHT = 4.3
+ _FINAL_SCALE = 0.99973
+-_RADIAL_BLEND = 0.24
++_RADIAL_BLEND = 0.28
+ _K_ADJUST = -20
+ _SAMPLE_DTYPE = fnp.float32
+ _MIN_SAMPLES = 32
+
+exec
+/bin/bash -lc 'python eval_client.py' in /opt/tiger/discover/workspace
+diff --git a/submission.py b/submission.py
+index 6f86f623c4af02466b932924ac62ff2c3161a555..9edc5716057c5b418a27df483e42674b3990a681
+--- a/submission.py
++++ b/submission.py
+@@ -11,10 +11,10 @@
+ _WHITEN_POWER = 0.4585
+ _RADIUS_POWER = 0.6
+ _FIRST_MEAN_POWER = 0.734
+-_FINAL_GAUSSIAN_BLEND = 0.115
+-_FINAL_SKEW_WEIGHT = 3.8
++_FINAL_GAUSSIAN_BLEND = 0.125
++_FINAL_SKEW_WEIGHT = 4.3
+ _FINAL_SCALE = 0.99973
+-_RADIAL_BLEND = 0.24
++_RADIAL_BLEND = 0.28
+ _K_ADJUST = -20
+ _SAMPLE_DTYPE = fnp.float32
+ _MIN_SAMPLES = 32
+
+ succeeded in 21537ms:
+pass score=1.38388e-07
+raw_score 1.383879691729817e-07
+reward 673.4756648803931
+
+codex
+Higher radial blending helped materially compared with the previous micro-tweaks. I’m continuing in that direction and watching for the point where bias or variance starts to climb.
+apply patch
+patch: completed
+/opt/tiger/discover/workspace/submission.py
+diff --git a/submission.py b/submission.py
+index 6f86f623c4af02466b932924ac62ff2c3161a555..630d72bd2028cd6462eb5e379e81a4ed95aa5379
+--- a/submission.py
++++ b/submission.py
+@@ -11,10 +11,10 @@
+ _WHITEN_POWER = 0.4585
+ _RADIUS_POWER = 0.6
+ _FIRST_MEAN_POWER = 0.734
+-_FINAL_GAUSSIAN_BLEND = 0.115
+-_FINAL_SKEW_WEIGHT = 3.8
++_FINAL_GAUSSIAN_BLEND = 0.125
++_FINAL_SKEW_WEIGHT = 4.3
+ _FINAL_SCALE = 0.99973
+-_RADIAL_BLEND = 0.24
++_RADIAL_BLEND = 0.32
+ _K_ADJUST = -20
+ _SAMPLE_DTYPE = fnp.float32
+ _MIN_SAMPLES = 32
+
+diff --git a/submission.py b/submission.py
+index 6f86f623c4af02466b932924ac62ff2c3161a555..630d72bd2028cd6462eb5e379e81a4ed95aa5379
+--- a/submission.py
++++ b/submission.py
+@@ -11,10 +11,10 @@
+ _WHITEN_POWER = 0.4585
+ _RADIUS_POWER = 0.6
+ _FIRST_MEAN_POWER = 0.734
+-_FINAL_GAUSSIAN_BLEND = 0.115
+-_FINAL_SKEW_WEIGHT = 3.8
++_FINAL_GAUSSIAN_BLEND = 0.125
++_FINAL_SKEW_WEIGHT = 4.3
+ _FINAL_SCALE = 0.99973
+-_RADIAL_BLEND = 0.24
++_RADIAL_BLEND = 0.32
+ _K_ADJUST = -20
+ _SAMPLE_DTYPE = fnp.float32
+ _MIN_SAMPLES = 32
+
+exec
+/bin/bash -lc 'python eval_client.py' in /opt/tiger/discover/workspace
+diff --git a/submission.py b/submission.py
+index 6f86f623c4af02466b932924ac62ff2c3161a555..630d72bd2028cd6462eb5e379e81a4ed95aa5379
+--- a/submission.py
++++ b/submission.py
+@@ -11,10 +11,10 @@
+ _WHITEN_POWER = 0.4585
+ _RADIUS_POWER = 0.6
+ _FIRST_MEAN_POWER = 0.734
+-_FINAL_GAUSSIAN_BLEND = 0.115
+-_FINAL_SKEW_WEIGHT = 3.8
++_FINAL_GAUSSIAN_BLEND = 0.125
++_FINAL_SKEW_WEIGHT = 4.3
+ _FINAL_SCALE = 0.99973
+-_RADIAL_BLEND = 0.24
++_RADIAL_BLEND = 0.32
+ _K_ADJUST = -20
+ _SAMPLE_DTYPE = fnp.float32
+ _MIN_SAMPLES = 32
+
+ succeeded in 21580ms:
+pass score=1.38411e-07
+raw_score 1.3841125962699152e-07
+reward 673.3623391723409
+
+codex
+The radial optimum looks near `0.28`; `0.32` overshot. I’ll refine around the new best.
+apply patch
+patch: completed
+/opt/tiger/discover/workspace/submission.py
+diff --git a/submission.py b/submission.py
+index 6f86f623c4af02466b932924ac62ff2c3161a555..4be24126a424bdc8579e29a3f0b0070724193e85
+--- a/submission.py
++++ b/submission.py
+@@ -11,10 +11,10 @@
+ _WHITEN_POWER = 0.4585
+ _RADIUS_POWER = 0.6
+ _FIRST_MEAN_POWER = 0.734
+-_FINAL_GAUSSIAN_BLEND = 0.115
+-_FINAL_SKEW_WEIGHT = 3.8
++_FINAL_GAUSSIAN_BLEND = 0.125
++_FINAL_SKEW_WEIGHT = 4.3
+ _FINAL_SCALE = 0.99973
+-_RADIAL_BLEND = 0.24
++_RADIAL_BLEND = 0.30
+ _K_ADJUST = -20
+ _SAMPLE_DTYPE = fnp.float32
+ _MIN_SAMPLES = 32
+
+diff --git a/submission.py b/submission.py
+index 6f86f623c4af02466b932924ac62ff2c3161a555..4be24126a424bdc8579e29a3f0b0070724193e85
+--- a/submission.py
++++ b/submission.py
+@@ -11,10 +11,10 @@
+ _WHITEN_POWER = 0.4585
+ _RADIUS_POWER = 0.6
+ _FIRST_MEAN_POWER = 0.734
+-_FINAL_GAUSSIAN_BLEND = 0.115
+-_FINAL_SKEW_WEIGHT = 3.8
++_FINAL_GAUSSIAN_BLEND = 0.125
++_FINAL_SKEW_WEIGHT = 4.3
+ _FINAL_SCALE = 0.99973
+-_RADIAL_BLEND = 0.24
++_RADIAL_BLEND = 0.30
+ _K_ADJUST = -20
+ _SAMPLE_DTYPE = fnp.float32
+ _MIN_SAMPLES = 32
+
+exec
+/bin/bash -lc 'python eval_client.py' in /opt/tiger/discover/workspace
+diff --git a/submission.py b/submission.py
+index 6f86f623c4af02466b932924ac62ff2c3161a555..4be24126a424bdc8579e29a3f0b0070724193e85
+--- a/submission.py
++++ b/submission.py
+@@ -11,10 +11,10 @@
+ _WHITEN_POWER = 0.4585
+ _RADIUS_POWER = 0.6
+ _FIRST_MEAN_POWER = 0.734
+-_FINAL_GAUSSIAN_BLEND = 0.115
+-_FINAL_SKEW_WEIGHT = 3.8
++_FINAL_GAUSSIAN_BLEND = 0.125
++_FINAL_SKEW_WEIGHT = 4.3
+ _FINAL_SCALE = 0.99973
+-_RADIAL_BLEND = 0.24
++_RADIAL_BLEND = 0.30
+ _K_ADJUST = -20
+ _SAMPLE_DTYPE = fnp.float32
+ _MIN_SAMPLES = 32
+
+ succeeded in 21587ms:
+pass score=1.38388e-07
+raw_score 1.3838801692145354e-07
+reward 673.4754325088733
+
+apply patch
+patch: completed
+/opt/tiger/discover/workspace/submission.py
+diff --git a/submission.py b/submission.py
+index 6f86f623c4af02466b932924ac62ff2c3161a555..29f73da600c812729eeb97b4c2d40b063c7cc2be
+--- a/submission.py
++++ b/submission.py
+@@ -11,10 +11,10 @@
+ _WHITEN_POWER = 0.4585
+ _RADIUS_POWER = 0.6
+ _FIRST_MEAN_POWER = 0.734
+-_FINAL_GAUSSIAN_BLEND = 0.115
+-_FINAL_SKEW_WEIGHT = 3.8
++_FINAL_GAUSSIAN_BLEND = 0.125
++_FINAL_SKEW_WEIGHT = 4.3
+ _FINAL_SCALE = 0.99973
+-_RADIAL_BLEND = 0.24
++_RADIAL_BLEND = 0.275
+ _K_ADJUST = -20
+ _SAMPLE_DTYPE = fnp.float32
+ _MIN_SAMPLES = 32
+
+diff --git a/submission.py b/submission.py
+index 6f86f623c4af02466b932924ac62ff2c3161a555..29f73da600c812729eeb97b4c2d40b063c7cc2be
+--- a/submission.py
++++ b/submission.py
+@@ -11,10 +11,10 @@
+ _WHITEN_POWER = 0.4585
+ _RADIUS_POWER = 0.6
+ _FIRST_MEAN_POWER = 0.734
+-_FINAL_GAUSSIAN_BLEND = 0.115
+-_FINAL_SKEW_WEIGHT = 3.8
++_FINAL_GAUSSIAN_BLEND = 0.125
++_FINAL_SKEW_WEIGHT = 4.3
+ _FINAL_SCALE = 0.99973
+-_RADIAL_BLEND = 0.24
++_RADIAL_BLEND = 0.275
+ _K_ADJUST = -20
+ _SAMPLE_DTYPE = fnp.float32
+ _MIN_SAMPLES = 32
+
+exec
+/bin/bash -lc 'python eval_client.py' in /opt/tiger/discover/workspace
+diff --git a/submission.py b/submission.py
+index 6f86f623c4af02466b932924ac62ff2c3161a555..29f73da600c812729eeb97b4c2d40b063c7cc2be
+--- a/submission.py
++++ b/submission.py
+@@ -11,10 +11,10 @@
+ _WHITEN_POWER = 0.4585
+ _RADIUS_POWER = 0.6
+ _FIRST_MEAN_POWER = 0.734
+-_FINAL_GAUSSIAN_BLEND = 0.115
+-_FINAL_SKEW_WEIGHT = 3.8
++_FINAL_GAUSSIAN_BLEND = 0.125
++_FINAL_SKEW_WEIGHT = 4.3
+ _FINAL_SCALE = 0.99973
+-_RADIAL_BLEND = 0.24
++_RADIAL_BLEND = 0.275
+ _K_ADJUST = -20
+ _SAMPLE_DTYPE = fnp.float32
+ _MIN_SAMPLES = 32
+
+ exited 143 in 5494ms:
+codex
+That evaluator call exited early without producing a score, so I’m rerunning the same candidate once before interpreting it. No code change in between.
+exec
+/bin/bash -lc 'python eval_client.py' in /opt/tiger/discover/workspace
+diff --git a/submission.py b/submission.py
+index 6f86f623c4af02466b932924ac62ff2c3161a555..29f73da600c812729eeb97b4c2d40b063c7cc2be
+--- a/submission.py
++++ b/submission.py
+@@ -11,10 +11,10 @@
+ _WHITEN_POWER = 0.4585
+ _RADIUS_POWER = 0.6
+ _FIRST_MEAN_POWER = 0.734
+-_FINAL_GAUSSIAN_BLEND = 0.115
+-_FINAL_SKEW_WEIGHT = 3.8
++_FINAL_GAUSSIAN_BLEND = 0.125
++_FINAL_SKEW_WEIGHT = 4.3
+ _FINAL_SCALE = 0.99973
+-_RADIAL_BLEND = 0.24
++_RADIAL_BLEND = 0.275
+ _K_ADJUST = -20
+ _SAMPLE_DTYPE = fnp.float32
+ _MIN_SAMPLES = 32
+
+ exited 143 in 19532ms:
+codex
+The early termination repeats on the same candidate. Since this only changed a numeric constant and should not affect runtime materially, I’m restoring the last scored radial setting to see whether the evaluator service recovers normally.
+apply patch
+patch: completed
+/opt/tiger/discover/workspace/submission.py
+diff --git a/submission.py b/submission.py
+index 6f86f623c4af02466b932924ac62ff2c3161a555..9edc5716057c5b418a27df483e42674b3990a681
+--- a/submission.py
++++ b/submission.py
+@@ -11,10 +11,10 @@
+ _WHITEN_POWER = 0.4585
+ _RADIUS_POWER = 0.6
+ _FIRST_MEAN_POWER = 0.734
+-_FINAL_GAUSSIAN_BLEND = 0.115
+-_FINAL_SKEW_WEIGHT = 3.8
++_FINAL_GAUSSIAN_BLEND = 0.125
++_FINAL_SKEW_WEIGHT = 4.3
+ _FINAL_SCALE = 0.99973
+-_RADIAL_BLEND = 0.24
++_RADIAL_BLEND = 0.28
+ _K_ADJUST = -20
+ _SAMPLE_DTYPE = fnp.float32
+ _MIN_SAMPLES = 32
+
+diff --git a/submission.py b/submission.py
+index 6f86f623c4af02466b932924ac62ff2c3161a555..9edc5716057c5b418a27df483e42674b3990a681
+--- a/submission.py
++++ b/submission.py
+@@ -11,10 +11,10 @@
+ _WHITEN_POWER = 0.4585
+ _RADIUS_POWER = 0.6
+ _FIRST_MEAN_POWER = 0.734
+-_FINAL_GAUSSIAN_BLEND = 0.115
+-_FINAL_SKEW_WEIGHT = 3.8
++_FINAL_GAUSSIAN_BLEND = 0.125
++_FINAL_SKEW_WEIGHT = 4.3
+ _FINAL_SCALE = 0.99973
+-_RADIAL_BLEND = 0.24
++_RADIAL_BLEND = 0.28
+ _K_ADJUST = -20
+ _SAMPLE_DTYPE = fnp.float32
+ _MIN_SAMPLES = 32
+
+exec
+/bin/bash -lc 'python eval_client.py' in /opt/tiger/discover/workspace

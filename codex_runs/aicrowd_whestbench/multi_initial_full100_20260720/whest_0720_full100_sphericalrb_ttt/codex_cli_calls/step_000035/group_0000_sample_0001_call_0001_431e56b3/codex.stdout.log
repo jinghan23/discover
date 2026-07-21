@@ -1,0 +1,178 @@
+```python
+from __future__ import annotations
+
+import math
+from functools import lru_cache
+
+import flopscope as flops
+import flopscope.numpy as fnp
+from whestbench import BaseEstimator
+
+
+_TARGET_FLOP_FRACTION = 0.055
+_MAX_WORKING_SET_BYTES = 64 * 1024 * 1024
+_FLOAT64_ITEMSIZE = 8
+_TAIL_CLIP = 1e-11
+_MIN_PARTICLE_SAMPLES = 16
+_MOMENT_FLOOR = 1e-24
+_INV_SQRT_2PI = 1.0 / math.sqrt(2.0 * math.pi)
+
+
+@lru_cache(maxsize=None)
+def _first_primes(count: int) -> tuple[int, ...]:
+    primes: list[int] = []
+    candidate = 2
+    while len(primes) < count:
+        is_prime = True
+        for prime in primes:
+            if prime * prime > candidate:
+                break
+            if candidate % prime == 0:
+                is_prime = False
+                break
+        if is_prime:
+            primes.append(candidate)
+        candidate += 1
+    return tuple(primes)
+
+
+def _particle_sample_count(budget: int, width: int, depth: int) -> int:
+    if budget is None or budget <= 0:
+        return 0
+
+    fixed = depth * (8 * width * width + 32 * width)
+    per_sample = depth * (2 * width * width + 48 * width) + 110 * width
+    budget_limited = (int(float(_TARGET_FLOP_FRACTION) * budget) - fixed) // max(
+        per_sample, 1
+    )
+    memory_limited = _MAX_WORKING_SET_BYTES // max(width * _FLOAT64_ITEMSIZE, 1)
+
+    count = int(max(0, min(budget_limited, memory_limited)))
+    count -= count & 1
+    if count < _MIN_PARTICLE_SAMPLES:
+        return 0
+    return count
+
+
+def _lattice_normal_samples(n_samples: int, width: int, rng) -> fnp.ndarray:
+    roots = fnp.sqrt(fnp.array(_first_primes(width), dtype=fnp.float64))
+    generator = roots - fnp.floor(roots)
+    shift = rng.random(width)
+
+    indices = fnp.arange(n_samples, dtype=fnp.float64)[:, None]
+    uniforms = indices * generator[None, :] + shift[None, :]
+    uniforms = uniforms - fnp.floor(uniforms)
+    uniforms = fnp.clip(uniforms, _TAIL_CLIP, 1.0 - _TAIL_CLIP)
+    return flops.stats.norm.ppf(uniforms)
+
+
+def _relu_gaussian_moments(mean: fnp.ndarray, variance: fnp.ndarray) -> tuple[fnp.ndarray, fnp.ndarray]:
+    variance = fnp.maximum(variance, _MOMENT_FLOOR)
+    sigma = fnp.sqrt(variance)
+    alpha = mean / sigma
+    cdf = flops.stats.norm.cdf(alpha)
+    pdf = fnp.exp(-0.5 * alpha * alpha) * _INV_SQRT_2PI
+
+    relu_mean = sigma * pdf + mean * cdf
+    relu_second = (variance + mean * mean) * cdf + mean * sigma * pdf
+    return relu_mean, fnp.maximum(relu_second, _MOMENT_FLOOR)
+
+
+def _match_column_moments(
+    values: fnp.ndarray,
+    target_mean: fnp.ndarray,
+    target_variance: fnp.ndarray,
+) -> fnp.ndarray:
+    sample_mean = fnp.mean(values, axis=0)
+    centered = values - sample_mean
+    sample_variance = fnp.mean(centered * centered, axis=0)
+    scale = fnp.sqrt(
+        fnp.maximum(target_variance, _MOMENT_FLOOR)
+        / fnp.maximum(sample_variance, _MOMENT_FLOOR)
+    )
+    return centered * scale + target_mean
+
+
+def _diagonal_gaussian_pass(weights: list[fnp.ndarray]):
+    first_weights = weights[0]
+    first_variance = fnp.maximum(fnp.sum(first_weights * first_weights, axis=0), 0.0)
+    mean = fnp.sqrt(first_variance) * _INV_SQRT_2PI
+    second = first_variance * 0.5
+
+    rows = [mean]
+    post_means = [mean]
+    post_variances = [fnp.maximum(second - mean * mean, _MOMENT_FLOOR)]
+    pre_means = []
+    pre_variances = []
+
+    for layer_weights in weights[1:]:
+        centered_second = fnp.maximum(second - mean * mean, _MOMENT_FLOOR)
+        pre_mean = mean @ layer_weights
+        pre_variance = centered_second @ (layer_weights * layer_weights)
+        pre_variance = fnp.maximum(pre_variance, _MOMENT_FLOOR)
+
+        pre_means.append(pre_mean)
+        pre_variances.append(pre_variance)
+
+        mean, second = _relu_gaussian_moments(pre_mean, pre_variance)
+        rows.append(mean)
+        post_means.append(mean)
+        post_variances.append(fnp.maximum(second - mean * mean, _MOMENT_FLOOR))
+
+    return rows, post_means, post_variances, pre_means, pre_variances
+
+
+class Estimator(BaseEstimator):
+    def predict(self, mlp, budget: int) -> fnp.ndarray:
+        weights = mlp.weights
+        depth = mlp.depth
+        width = mlp.width
+
+        rows, post_means, post_variances, pre_means, pre_variances = _diagonal_gaussian_pass(
+            weights
+        )
+
+        if depth == 1:
+            return fnp.asarray(fnp.stack(rows, axis=0), dtype=fnp.float32)
+
+        n_samples = _particle_sample_count(int(budget), width, depth)
+        if n_samples <= 0:
+            return fnp.asarray(fnp.stack(rows, axis=0), dtype=fnp.float32)
+
+        rng = fnp.random.default_rng(mlp.seed)
+        half_samples = n_samples // 2
+        half_inputs = _lattice_normal_samples(half_samples, width, rng)
+        inputs = fnp.concatenate((half_inputs, -half_inputs), axis=0)
+
+        activations = fnp.maximum(inputs @ weights[0], 0.0)
+        activations = _match_column_moments(
+            activations,
+            post_means[0],
+            post_variances[0],
+        )
+
+        corrected_rows = [rows[0]]
+        shrink = float(n_samples) / (float(n_samples) + 24.0)
+
+        for layer_index, layer_weights in enumerate(weights[1:]):
+            preactivations = activations @ layer_weights
+            preactivations = _match_column_moments(
+                preactivations,
+                pre_means[layer_index],
+                pre_variances[layer_index],
+            )
+            activations = fnp.maximum(preactivations, 0.0)
+            particle_mean = fnp.mean(activations, axis=0)
+            corrected_rows.append(
+                rows[layer_index + 1] + shrink * (particle_mean - rows[layer_index + 1])
+            )
+
+            if layer_index + 1 < depth:
+                activations = _match_column_moments(
+                    activations,
+                    post_means[layer_index + 1],
+                    post_variances[layer_index + 1],
+                )
+
+        return fnp.asarray(fnp.stack(corrected_rows, axis=0), dtype=fnp.float32)
+```

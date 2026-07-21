@@ -1,0 +1,595 @@
+OpenAI Codex v0.144.3
+--------
+workdir: /opt/tiger/discover
+model: gpt-5.5
+provider: openai
+approval: never
+sandbox: read-only
+reasoning effort: xhigh
+reasoning summaries: none
+session id: 019f7bd5-8370-79a3-95e5-dc3bf9890628
+--------
+user
+You are solving the ARC White-Box Estimation Challenge 2026
+(WhestBench) under the official evaluator contract.
+
+Task:
+- You receive the weights of a randomly initialized square ReLU MLP.
+- Inputs follow a standard normal distribution.
+- Predict the per-neuron post-ReLU activation mean for every layer.
+- Return a `flopscope.numpy.ndarray` with shape `(mlp.depth, mlp.width)`.
+
+Required submission interface:
+- Import `flopscope.numpy as fnp` for numerical operations.
+- Define `class Estimator(BaseEstimator)` with
+  `predict(self, mlp, budget)`.
+- Optional `setup(self, context)` and `teardown(self)` hooks follow the official
+  WhestBench API.
+- Seed predict-time randomness from `mlp.seed` and setup-time randomness from
+  `context.seed`.
+
+Official scoring:
+- For each MLP, compute final-layer MSE against the official Monte Carlo target.
+- Effective compute is `C = FLOPs + lambda * residual_wall_time`.
+- A valid MLP score is `final_layer_mse * max(0.1, C / flop_budget)`.
+- The suite score is the arithmetic mean of those per-MLP scores; lower is better.
+- Exceptions, invalid shapes/non-finite values, FLOP/time exhaustion, or combined
+  budget exhaustion use an all-zero prediction and multiplier 1.0 for that MLP.
+- All-layer MSE is diagnostic only.
+
+Do not use plain NumPy or uninstrumented numerical libraries to evade FLOP
+accounting. Residual Python or uninstrumented work is charged at the official
+lambda rate and can exhaust the combined budget.
+
+Fairness and data isolation:
+- Derive predictions only from the `mlp` weights and allowed setup context.
+- Do not inspect, search for, or read evaluation datasets, Hugging Face caches,
+  saved evaluation reports, target moments, or ground-truth files.
+- Do not hardcode values tied to public mini MLPs. Such candidates are invalid
+  even if they receive a low local score.
+
+Algorithm directions worth exploring:
+- Mean and diagonal-variance propagation through ReLU moments.
+- Full, structured, or low-rank covariance propagation.
+- Hybrid analytic propagation with compute-budgeted Monte Carlo probes.
+- Layer-wise corrections for correlation error in deep networks.
+- Allocating FLOPs to layers where final-layer MSE is most sensitive.
+
+
+Official evaluation suite for this run:
+- dataset: aicrowd/arc-whestbench-public-2026@v1-phase1
+- split / MLPs: mini / first 100
+- width / depth: 256 / 32
+- FLOP budget per MLP: 272000000000
+- residual penalty lambda: 100000000000.0 FLOPs/second
+- runner: subprocess
+
+You are iteratively optimizing budget-adjusted final-layer score.
+Here is the last code we ran:
+```python
+"""Progressive Monte Carlo estimators for ARC WhestBench.
+
+The module keeps the original plain Monte Carlo estimator and adds four
+variance-reduction stages:
+
+``plain -> quasi-Monte Carlo -> importance sampling -> control variates
+        -> Rao--Blackwellization``.
+
+All stages estimate the same standard-Gaussian activation means.  The default
+``Estimator`` combines randomized QMC directions, antithetic pairing, angular
+second-moment whitening, and analytic integration of the independent Gaussian
+radius.  The radial identity follows because a bias-free ReLU MLP is positively
+homogeneous: ``f(r * u) = r * f(u)`` for ``r >= 0``.
+"""
+
+from __future__ import annotations
+
+import math
+
+import flopscope as flops
+import flopscope.numpy as fnp
+from whestbench import BaseEstimator
+
+
+_TARGET_FLOP_FRACTION = 0.09
+_MAX_WORKING_SET_BYTES = 100 * 1024 * 1024
+_FLOAT32_ITEMSIZE = 4
+_FLOAT64_ITEMSIZE = 8
+_TAIL_CLIP = 1e-11
+_IMPORTANCE_MIXTURE_WEIGHT = 0.8
+_MIN_ANTITHETIC_SAMPLES = 32
+_WHITENING_EIGENVALUE_FLOOR = 1e-8
+
+
+def sample_count(budget: int, width: int, depth: int) -> int:
+    """Choose the original plain-MC sample count from the FLOP model."""
+
+    # Per row: Gaussian generation, then for each layer one dense matmul,
+    # ReLU, and reduction into the reported layer mean.
+    random_per_sample = 16 * width
+    layer_per_sample = 2 * width * width + 2 * width
+    per_sample = random_per_sample + depth * layer_per_sample
+    budget_limited = int(_TARGET_FLOP_FRACTION * budget) // max(per_sample, 1)
+    memory_limited = _MAX_WORKING_SET_BYTES // max(
+        width * _FLOAT32_ITEMSIZE,
+        1,
+    )
+    return int(max(1, min(budget_limited, memory_limited)))
+
+
+def _qmc_sample_count(budget: int, width: int, depth: int, *, radial: bool) -> int:
+    """Choose a QMC count using the documented flopscope operation costs."""
+
+    inverse_normal_per_sample = 89 * width
+    direction_normalization = 3 * width + 2 if radial else 0
+    radial_proposal = 20 * width + 32 if radial else 0
+    layer_per_sample = 2 * width * width + 2 * width
+    per_sample = (
+        inverse_normal_per_sample
+        + direction_normalization
+        + radial_proposal
+        + depth * layer_per_sample
+    )
+    budget_limited = int(_TARGET_FLOP_FRACTION * budget) // max(per_sample, 1)
+    memory_limited = _MAX_WORKING_SET_BYTES // max(
+        width * _FLOAT64_ITEMSIZE,
+        1,
+    )
+    return int(max(1, min(budget_limited, memory_limited)))
+
+
+def whitened_antithetic_sample_count(
+    budget: int,
+    width: int,
+    depth: int,
+    target_fraction: float,
+) -> int:
+    """Choose an even count for half-lattice antithetic spherical sampling."""
+
+    # Only half of the forwarded rows require a lattice inverse-normal map and
+    # normalization.  The angular second-moment matrix costs k*w^2 across the
+    # half batch.  The eigendecomposition, inverse square root, and folding the
+    # transform into the first weight are fixed O(w^3) work.
+    half_lattice_per_sample = (89 * width + 3 * width + 2) // 2
+    layer_per_sample = depth * (2 * width * width + 2 * width)
+    covariance_per_sample = width * width
+    per_sample = (
+        half_lattice_per_sample + layer_per_sample + covariance_per_sample
+    )
+    fixed = 13 * width**3 + 8 * width
+    budget_limited = (
+        int(float(target_fraction) * budget) - fixed
+    ) // max(per_sample, 1)
+    memory_limited = _MAX_WORKING_SET_BYTES // max(
+        width * _FLOAT64_ITEMSIZE,
+        1,
+    )
+    count = int(
+        max(
+            _MIN_ANTITHETIC_SAMPLES,
+            min(budget_limited, memory_limited),
+        )
+    )
+    return count - (count & 1)
+
+
+def _first_primes(count: int) -> tuple[int, ...]:
+    primes: list[int] = []
+    candidate = 2
+    while len(primes) < count:
+        is_prime = True
+        for prime in primes:
+            if prime * prime > candidate:
+                break
+            if candidate % prime == 0:
+                is_prime = False
+                break
+        if is_prime:
+            primes.append(candidate)
+        candidate += 1
+    return tuple(primes)
+
+
+def _lattice_normal_samples(n_samples: int, width: int, rng) -> fnp.ndarray:
+    """Return one randomly shifted rank-1 lattice mapped through normal PPF."""
+
+    roots = fnp.sqrt(fnp.array(_first_primes(width), dtype=fnp.float64))
+    generator = roots - fnp.floor(roots)
+    shift = rng.random(width)
+    indices = fnp.arange(n_samples, dtype=fnp.float64)[:, None]
+    unwrapped = indices * generator[None, :] + shift[None, :]
+    uniforms = unwrapped - fnp.floor(unwrapped)
+    uniforms = fnp.clip(uniforms, _TAIL_CLIP, 1.0 - _TAIL_CLIP)
+    return flops.stats.norm.ppf(uniforms)
+
+
+def _mean_chi(dimension: int) -> float:
+    """Return E[chi_dimension] without requiring SciPy in the submission."""
+
+    half_dimension = 0.5 * float(dimension)
+    return math.sqrt(2.0) * math.exp(
+        math.lgamma(half_dimension + 0.5) - math.lgamma(half_dimension)
+    )
+
+
+def _qmc_directions(n_samples: int, width: int, rng) -> fnp.ndarray:
+    normals = _lattice_normal_samples(n_samples, width, rng)
+    radii = fnp.sqrt(fnp.maximum(fnp.sum(normals * normals, axis=1), 1e-24))
+    return normals / radii[:, None]
+
+
+def _angular_whitening_transform(directions: fnp.ndarray) -> fnp.ndarray:
+    """Match a half-batch's angular second moment to I/width.
+
+    The returned symmetric transform ``A`` satisfies
+    ``width * (directions @ A).T @ (directions @ A) / n = I`` up to numerical
+    precision.  Applying it is a finite-sample moment-matching correction, not
+    an additional Rao--Blackwell identity.
+    """
+
+    n_samples, width = directions.shape
+    scaled_second_moment = (
+        directions.T @ directions
+    ) * (float(width) / float(n_samples))
+    eigenvalues, eigenvectors = fnp.linalg.eigh(scaled_second_moment)
+    eigenvalues = fnp.maximum(eigenvalues, _WHITENING_EIGENVALUE_FLOOR)
+    return (eigenvectors / fnp.sqrt(eigenvalues)) @ eigenvectors.T
+
+
+def _importance_radial_factors(n_samples: int, width: int, rng) -> fnp.ndarray:
+    """Sample an exact radial mixture and return likelihood-weighted radii.
+
+    If ``p`` is the chi-width target radial density, its size-biased density is
+    ``p_sb(r) = r p(r) / E[R]``, which is chi-(width+1).  We sample
+    ``q = (1-epsilon) p + epsilon p_sb`` and return
+
+        r p(r) / q(r) = r / ((1-epsilon) + epsilon r/E[R]).
+
+    Multiplying a unit direction by this scalar applies the importance weight
+    to every layer at once via positive homogeneity.
+    """
+
+    epsilon = _IMPORTANCE_MIXTURE_WEIGHT
+    radial_normals = rng.standard_normal(
+        (n_samples, width + 1),
+        dtype=fnp.float32,
+    )
+    squared_radius = fnp.sum(radial_normals[:, :width] ** 2, axis=1)
+    target_radius = fnp.sqrt(fnp.maximum(squared_radius, 1e-24))
+    size_biased_radius = fnp.sqrt(
+        fnp.maximum(squared_radius + radial_normals[:, width] ** 2, 1e-24)
+    )
+    use_size_biased = rng.random(n_samples) < epsilon
+    proposal_radius = fnp.where(
+        use_size_biased,
+        size_biased_radius,
+        target_radius,
+    )
+    density_ratio = (1.0 - epsilon) + epsilon * proposal_radius / _mean_chi(width)
+    return proposal_radius / density_ratio
+
+
+def _diagonal_gaussian_means(mlp) -> list[fnp.ndarray]:
+    """Cheap fixed coefficients for the radial control variate."""
+
+    mean = fnp.zeros(mlp.width)
+    variance = fnp.ones(mlp.width)
+    rows = []
+    for weights in mlp.weights:
+        pre_mean = weights.T @ mean
+        pre_variance = fnp.maximum((weights * weights).T @ variance, 1e-12)
+        pre_sigma = fnp.sqrt(pre_variance)
+        alpha = pre_mean / pre_sigma
+        density = flops.stats.norm.pdf(alpha)
+        probability = flops.stats.norm.cdf(alpha)
+        mean = pre_mean * probability + pre_sigma * density
+        second_moment = (
+            (pre_mean * pre_mean + pre_variance) * probability
+            + pre_mean * pre_sigma * density
+        )
+        variance = fnp.maximum(second_moment - mean * mean, 0.0)
+        rows.append(mean)
+    return rows
+
+
+def _exact_first_layer_mean(weights: fnp.ndarray) -> fnp.ndarray:
+    standard_deviation = fnp.sqrt(fnp.sum(weights * weights, axis=0))
+    return standard_deviation / fnp.sqrt(2.0 * fnp.pi)
+
+
+def _forward_means(mlp, activations, *, radial_control=None):
+    rows = []
+    control_mean = None
+    control_coefficients = None
+    if radial_control is not None:
+        radial_factors, control_coefficients = radial_control
+        control_mean = fnp.mean(radial_factors) - _mean_chi(mlp.width)
+
+    for layer_index, weights in enumerate(mlp.weights):
+        activations = fnp.maximum(activations @ weights, 0.0)
+        row = fnp.mean(activations, axis=0)
+        if control_coefficients is not None:
+            row = row - control_coefficients[layer_index] * control_mean
+        rows.append(row)
+    return rows
+
+
+class PlainMonteCarloEstimator(BaseEstimator):
+    """Stage 1: independent pseudo-random Gaussian samples."""
+
+    def predict(self, mlp, budget: int) -> fnp.ndarray:
+        n_samples = sample_count(budget, mlp.width, mlp.depth)
+        rng = fnp.random.default_rng(mlp.seed)
+        activations = rng.standard_normal(
+            (n_samples, mlp.width),
+            dtype=fnp.float32,
+        )
+        rows = _forward_means(mlp, activations)
+        return fnp.asarray(fnp.stack(rows, axis=0), dtype=fnp.float32)
+
+
+class QuasiMonteCarloEstimator(BaseEstimator):
+    """Stage 2: a Cranley--Patterson shifted rank-1 lattice."""
+
+    def predict(self, mlp, budget: int) -> fnp.ndarray:
+        n_samples = _qmc_sample_count(
+            budget,
+            mlp.width,
+            mlp.depth,
+            radial=False,
+        )
+        rng = fnp.random.default_rng(mlp.seed)
+        activations = _lattice_normal_samples(n_samples, mlp.width, rng)
+        rows = _forward_means(mlp, activations)
+        return fnp.asarray(fnp.stack(rows, axis=0), dtype=fnp.float32)
+
+
+class ImportanceSamplingEstimator(BaseEstimator):
+    """Stage 3: QMC directions with exact radial mixture importance sampling."""
+
+    def predict(self, mlp, budget: int) -> fnp.ndarray:
+        n_samples = _qmc_sample_count(
+            budget,
+            mlp.width,
+            mlp.depth,
+            radial=True,
+        )
+        rng = fnp.random.default_rng(mlp.seed)
+        directions = _qmc_directions(n_samples, mlp.width, rng)
+        radial_factors = _importance_radial_factors(
+            n_samples,
+            mlp.width,
+            rng,
+        )
+        rows = _forward_means(mlp, directions * radial_factors[:, None])
+        return fnp.asarray(fnp.stack(rows, axis=0), dtype=fnp.float32)
+
+
+class ControlVariateEstimator(BaseEstimator):
+    """Stage 4: fixed radial controls with known expectation E[chi_width]."""
+
+    def predict(self, mlp, budget: int) -> fnp.ndarray:
+        n_samples = _qmc_sample_count(
+            budget,
+            mlp.width,
+            mlp.depth,
+            radial=True,
+        )
+        rng = fnp.random.default_rng(mlp.seed)
+        directions = _qmc_directions(n_samples, mlp.width, rng)
+        radial_factors = _importance_radial_factors(
+            n_samples,
+            mlp.width,
+            rng,
+        )
+        mean_radius = _mean_chi(mlp.width)
+        coefficients = [
+            row / mean_radius for row in _diagonal_gaussian_means(mlp)
+        ]
+        rows = _forward_means(
+            mlp,
+            directions * radial_factors[:, None],
+            radial_control=(radial_factors, coefficients),
+        )
+        return fnp.asarray(fnp.stack(rows, axis=0), dtype=fnp.float32)
+
+
+class RaoBlackwellEstimator(BaseEstimator):
+    """Stage 5: integrate the Gaussian radius and the reported first layer."""
+
+    def predict(self, mlp, budget: int) -> fnp.ndarray:
+        n_samples = _qmc_sample_count(
+            budget,
+            mlp.width,
+            mlp.depth,
+            radial=False,
+        )
+        rng = fnp.random.default_rng(mlp.seed)
+        directions = _qmc_directions(n_samples, mlp.width, rng)
+        activations = directions * _mean_chi(mlp.width)
+        rows = _forward_means(mlp, activations)
+        rows[0] = _exact_first_layer_mean(mlp.weights[0])
+        return fnp.asarray(fnp.stack(rows, axis=0), dtype=fnp.float32)
+
+
+class _WhitenedAntitheticRaoBlackwellEstimator(BaseEstimator):
+    """Half-lattice antithetic spherical RQMC with angular moment matching."""
+
+    target_flop_fraction = 0.10
+
+    def predict(self, mlp, budget: int) -> fnp.ndarray:
+        n_samples = whitened_antithetic_sample_count(
+            budget,
+            mlp.width,
+            mlp.depth,
+            self.target_flop_fraction,
+        )
+        half_samples = n_samples // 2
+        rng = fnp.random.default_rng(mlp.seed)
+        half_directions = _qmc_directions(half_samples, mlp.width, rng)
+        whitening = _angular_whitening_transform(half_directions)
+
+        # Fold the angular whitening into the first weight, avoiding a
+        # sample-sized whitening matmul.  Antipodal pairing makes the empirical
+        # direction mean exactly zero.  E[chi_width] integrates the independent
+        # Gaussian radius for every positively homogeneous ReLU layer.
+        first_weight = whitening @ mlp.weights[0]
+        paired_directions = fnp.concatenate(
+            (half_directions, -half_directions),
+            axis=0,
+        )
+        activations = paired_directions * _mean_chi(mlp.width)
+
+        rows = []
+        activations = fnp.maximum(activations @ first_weight, 0.0)
+        rows.append(_exact_first_layer_mean(mlp.weights[0]))
+        for weights in mlp.weights[1:]:
+            activations = fnp.maximum(activations @ weights, 0.0)
+            rows.append(fnp.mean(activations, axis=0))
+
+        return fnp.asarray(fnp.stack(rows, axis=0), dtype=fnp.float32)
+
+
+class WhitenedAntitheticRaoBlackwell10Estimator(
+    _WhitenedAntitheticRaoBlackwellEstimator
+):
+    """Whitened-antithetic spherical RQMC targeting 10% tracked compute."""
+
+    target_flop_fraction = 0.10
+
+
+class WhitenedAntitheticRaoBlackwell15Estimator(
+    _WhitenedAntitheticRaoBlackwellEstimator
+):
+    """Whitened-antithetic spherical RQMC targeting 15% tracked compute."""
+
+    target_flop_fraction = 0.15
+
+
+class Estimator(WhitenedAntitheticRaoBlackwell10Estimator):
+    """Best full-100 stage, targeting approximately 10% effective compute."""
+
+```
+Current budget-adjusted final-layer score (lower is better): 0.000000
+Target: 1e-07. Current gap: 0.000000. Further improvements will also be generously rewarded.
+
+Return one final Python code block containing an official `Estimator` class.
+
+
+Return only the final answer content. Do not edit files or run tools.
+warning: Codex could not find bubblewrap on PATH. Install bubblewrap with your OS package manager. See the sandbox prerequisites: https://developers.openai.com/codex/concepts/sandboxing#prerequisites. Codex will use the bundled bubblewrap in the meantime.
+codex
+```python
+from __future__ import annotations
+
+import math
+
+import flopscope as flops
+import flopscope.numpy as fnp
+from whestbench import BaseEstimator
+
+
+_TARGET_FLOP_FRACTION = 0.10
+_MAX_WORKING_SET_BYTES = 100 * 1024 * 1024
+_FLOAT64_ITEMSIZE = 8
+_TAIL_CLIP = 1e-11
+_MIN_ANTITHETIC_SAMPLES = 32
+_WHITENING_EIGENVALUE_FLOOR = 1e-8
+
+
+def _first_primes(count: int) -> tuple[int, ...]:
+    primes = []
+    candidate = 2
+    while len(primes) < count:
+        is_prime = True
+        for prime in primes:
+            if prime * prime > candidate:
+                break
+            if candidate % prime == 0:
+                is_prime = False
+                break
+        if is_prime:
+            primes.append(candidate)
+        candidate += 1
+    return tuple(primes)
+
+
+def _mean_chi(dimension: int) -> float:
+    half_dimension = 0.5 * float(dimension)
+    return math.sqrt(2.0) * math.exp(
+        math.lgamma(half_dimension + 0.5) - math.lgamma(half_dimension)
+    )
+
+
+def _sample_count(budget: int, width: int, depth: int) -> int:
+    half_lattice_per_sample = (89 * width + 3 * width + 2) // 2
+    layer_per_sample = depth * (2 * width * width + 2 * width)
+    covariance_per_sample = width * width
+    per_sample = half_lattice_per_sample + layer_per_sample + covariance_per_sample
+    fixed = 13 * width**3 + 8 * width
+
+    budget_limited = (
+        int(float(_TARGET_FLOP_FRACTION) * budget) - fixed
+    ) // max(per_sample, 1)
+    memory_limited = _MAX_WORKING_SET_BYTES // max(width * _FLOAT64_ITEMSIZE, 1)
+    count = int(max(_MIN_ANTITHETIC_SAMPLES, min(budget_limited, memory_limited)))
+    return count - (count & 1)
+
+
+def _lattice_normal_samples(n_samples: int, width: int, rng) -> fnp.ndarray:
+    roots = fnp.sqrt(fnp.array(_first_primes(width), dtype=fnp.float64))
+    generator = roots - fnp.floor(roots)
+    shift = rng.random(width)
+    indices = fnp.arange(n_samples, dtype=fnp.float64)[:, None]
+    uniforms = indices * generator[None, :] + shift[None, :]
+    uniforms = uniforms - fnp.floor(uniforms)
+    uniforms = fnp.clip(uniforms, _TAIL_CLIP, 1.0 - _TAIL_CLIP)
+    return flops.stats.norm.ppf(uniforms)
+
+
+def _qmc_directions(n_samples: int, width: int, rng) -> fnp.ndarray:
+    normals = _lattice_normal_samples(n_samples, width, rng)
+    radii = fnp.sqrt(fnp.maximum(fnp.sum(normals * normals, axis=1), 1e-24))
+    return normals / radii[:, None]
+
+
+def _angular_whitening_transform(directions: fnp.ndarray) -> fnp.ndarray:
+    n_samples, width = directions.shape
+    scaled_second_moment = (directions.T @ directions) * (
+        float(width) / float(n_samples)
+    )
+    eigenvalues, eigenvectors = fnp.linalg.eigh(scaled_second_moment)
+    eigenvalues = fnp.maximum(eigenvalues, _WHITENING_EIGENVALUE_FLOOR)
+    return (eigenvectors / fnp.sqrt(eigenvalues)) @ eigenvectors.T
+
+
+def _exact_first_layer_mean(weights: fnp.ndarray) -> fnp.ndarray:
+    standard_deviation = fnp.sqrt(fnp.sum(weights * weights, axis=0))
+    return standard_deviation / fnp.sqrt(2.0 * fnp.pi)
+
+
+class Estimator(BaseEstimator):
+    def predict(self, mlp, budget: int) -> fnp.ndarray:
+        n_samples = _sample_count(budget, mlp.width, mlp.depth)
+        half_samples = n_samples // 2
+
+        rng = fnp.random.default_rng(mlp.seed)
+        half_directions = _qmc_directions(half_samples, mlp.width, rng)
+        whitening = _angular_whitening_transform(half_directions)
+
+        first_weight = whitening @ mlp.weights[0]
+        directions = fnp.concatenate((half_directions, -half_directions), axis=0)
+        activations = directions * _mean_chi(mlp.width)
+
+        rows = []
+        activations = fnp.maximum(activations @ first_weight, 0.0)
+        rows.append(_exact_first_layer_mean(mlp.weights[0]))
+
+        for weights in mlp.weights[1:]:
+            activations = fnp.maximum(activations @ weights, 0.0)
+            rows.append(fnp.mean(activations, axis=0))
+
+        return fnp.asarray(fnp.stack(rows, axis=0), dtype=fnp.float32)
+```
+tokens used
+8,214

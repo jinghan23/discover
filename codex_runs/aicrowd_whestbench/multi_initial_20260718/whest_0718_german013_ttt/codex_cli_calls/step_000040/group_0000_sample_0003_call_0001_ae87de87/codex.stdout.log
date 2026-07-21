@@ -1,0 +1,109 @@
+```python
+from __future__ import annotations
+
+import math
+
+import flopscope.numpy as fnp
+from whestbench import BaseEstimator
+
+
+_BUDGET_FRACTION = 0.14
+_MIN_SAMPLES = 32
+_MAX_SAMPLES = 1_000_000
+_ARRAY_BYTES_LIMIT = 112 * 1024 * 1024
+_WORST_CASE_ITEMSIZE = 8
+_INV_SQRT_2PI = 0.3989422804014327
+
+
+def _sample_count(budget, width: int, depth: int) -> int:
+    max_k_by_bytes = _ARRAY_BYTES_LIMIT // max(width * _WORST_CASE_ITEMSIZE, 1)
+
+    if budget is None:
+        k = min(8192, max_k_by_bytes)
+    else:
+        per_sample = depth * (2 * width * width + width) + 3 * width * width + 4 * width
+        fixed = 14 * width**3 + 8 * width * width
+        k = (int(_BUDGET_FRACTION * budget) - fixed) // max(per_sample, 1)
+        k = int(max(_MIN_SAMPLES, min(_MAX_SAMPLES, max_k_by_bytes, k)))
+
+    k = k - (k & 1)
+    return max(2, k)
+
+
+def _mean_chi_radius(width: int) -> float:
+    return math.sqrt(2.0) * math.exp(
+        math.lgamma(0.5 * (width + 1.0)) - math.lgamma(0.5 * width)
+    )
+
+
+class Estimator(BaseEstimator):
+    def predict(self, mlp, budget):
+        width = mlp.width
+        depth = mlp.depth
+        weights = mlp.weights
+
+        first_variance = fnp.sum(weights[0] * weights[0], axis=0)
+        first_mean = fnp.sqrt(fnp.maximum(first_variance, 1e-12)) * _INV_SQRT_2PI
+
+        if depth == 1:
+            return first_mean[None, :]
+
+        k = _sample_count(budget, width, depth)
+        n = k // 2
+
+        rng = fnp.random.default_rng(mlp.seed)
+        u = rng.standard_normal((n, width), dtype=fnp.float32)
+
+        row_norm = fnp.sqrt(fnp.maximum(fnp.sum(u * u, axis=1), 1e-20))
+        u = u / row_norm[:, None]
+
+        do_whiten = n > width + 8
+        if do_whiten:
+            covariance = (u.T @ u) / float(n)
+            eigenvalues, eigenvectors = fnp.linalg.eigh(covariance)
+            eigenvalues = fnp.maximum(eigenvalues * float(width), 1e-6)
+            inverse_sqrt = (eigenvectors / fnp.sqrt(eigenvalues)) @ eigenvectors.T
+            first_weight = inverse_sqrt @ weights[0]
+        else:
+            first_weight = weights[0]
+
+        x = fnp.concatenate([u, -u], axis=0) * _mean_chi_radius(width)
+        x = fnp.maximum(x @ first_weight, 0.0)
+        first_pair = (x[:n] + x[n:]) * 0.5
+
+        rows = [first_mean[None, :]]
+
+        for layer_index, weight in enumerate(weights[1:], start=1):
+            x = fnp.maximum(x @ weight, 0.0)
+            if layer_index < depth - 1:
+                rows.append(fnp.mean(x, axis=0)[None, :])
+
+        final_pair = (x[:n] + x[n:]) * 0.5
+        final_mean = fnp.mean(final_pair, axis=0)
+
+        if do_whiten:
+            control_mean = fnp.mean(first_pair, axis=0)
+            h_centered = first_pair - control_mean[None, :]
+            f_centered = final_pair - final_mean[None, :]
+
+            gram = h_centered.T @ h_centered
+            cross = h_centered.T @ f_centered
+            ridge = fnp.maximum(
+                (fnp.sum(h_centered * h_centered) / float(width)) * 1e-5,
+                1e-6,
+            )
+
+            eye = fnp.eye(width, dtype=gram.dtype)
+            try:
+                beta = fnp.linalg.solve(gram + ridge * eye, cross)
+            except Exception:
+                values, vectors = fnp.linalg.eigh(gram)
+                values = fnp.maximum(values, 0.0)
+                beta = vectors @ ((vectors.T @ cross) / (values[:, None] + ridge))
+
+            corrected = final_mean - ((control_mean - first_mean) @ beta)
+            final_mean = fnp.maximum(corrected, 0.0)
+
+        rows.append(final_mean[None, :])
+        return fnp.concatenate(rows, axis=0)
+```

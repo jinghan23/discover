@@ -1,0 +1,229 @@
+OpenAI Codex v0.144.3
+--------
+workdir: /opt/tiger/discover
+model: gpt-5.5
+provider: openai
+approval: never
+sandbox: read-only
+reasoning effort: xhigh
+reasoning summaries: none
+session id: 019f7692-b12c-7940-993f-311c97fbf25a
+--------
+user
+You are solving the ARC White-Box Estimation Challenge 2026
+(WhestBench) under the official evaluator contract.
+
+Task:
+- You receive the weights of a randomly initialized square ReLU MLP.
+- Inputs follow a standard normal distribution.
+- Predict the per-neuron post-ReLU activation mean for every layer.
+- Return a `flopscope.numpy.ndarray` with shape `(mlp.depth, mlp.width)`.
+
+Required submission interface:
+- Import `flopscope.numpy as fnp` for numerical operations.
+- Define `class Estimator(BaseEstimator)` with
+  `predict(self, mlp, budget)`.
+- Optional `setup(self, context)` and `teardown(self)` hooks follow the official
+  WhestBench API.
+- Seed predict-time randomness from `mlp.seed` and setup-time randomness from
+  `context.seed`.
+
+Official scoring:
+- For each MLP, compute final-layer MSE against the official Monte Carlo target.
+- Effective compute is `C = FLOPs + lambda * residual_wall_time`.
+- A valid MLP score is `final_layer_mse * max(0.1, C / flop_budget)`.
+- The suite score is the arithmetic mean of those per-MLP scores; lower is better.
+- Exceptions, invalid shapes/non-finite values, FLOP/time exhaustion, or combined
+  budget exhaustion use an all-zero prediction and multiplier 1.0 for that MLP.
+- All-layer MSE is diagnostic only.
+
+Do not use plain NumPy or uninstrumented numerical libraries to evade FLOP
+accounting. Residual Python or uninstrumented work is charged at the official
+lambda rate and can exhaust the combined budget.
+
+Fairness and data isolation:
+- Derive predictions only from the `mlp` weights and allowed setup context.
+- Do not inspect, search for, or read evaluation datasets, Hugging Face caches,
+  saved evaluation reports, target moments, or ground-truth files.
+- Do not hardcode values tied to public mini MLPs. Such candidates are invalid
+  even if they receive a low local score.
+
+Algorithm directions worth exploring:
+- Mean and diagonal-variance propagation through ReLU moments.
+- Full, structured, or low-rank covariance propagation.
+- Hybrid analytic propagation with compute-budgeted Monte Carlo probes.
+- Layer-wise corrections for correlation error in deep networks.
+- Allocating FLOPs to layers where final-layer MSE is most sensitive.
+
+
+Official evaluation suite for this run:
+- dataset: None@None
+- split / MLPs: None / first None
+- width / depth: None / None
+- FLOP budget per MLP: None
+- residual penalty lambda: None FLOPs/second
+- runner: None
+
+You are iteratively optimizing budget-adjusted final-layer score.
+Here is the last code we ran:
+```python
+from __future__ import annotations
+
+import flopscope.numpy as fnp
+from whestbench import BaseEstimator
+
+
+_BUDGET_FRACTION = 0.152
+_MIN_SAMPLES = 32
+_MAX_SAMPLES = 1_000_000
+_ARRAY_BYTES_LIMIT = 110 * 1024 * 1024
+_WORST_CASE_ITEMSIZE = 8
+_SETUP_SEED_OFFSET = 3
+
+_INV_SQRT_2PI = 0.3989422804014327
+_RELU_VAR_FACTOR = 0.5 - _INV_SQRT_2PI * _INV_SQRT_2PI
+_EPS = 1e-6
+
+
+def _sample_count(budget: int, width: int, depth: int) -> int:
+    per_sample = depth * (2 * width * width + width) + width * width
+    fixed = 14 * width**3 + 12 * width * width
+    k = (int(_BUDGET_FRACTION * budget) - fixed) // max(per_sample, 1)
+    max_k_by_bytes = _ARRAY_BYTES_LIMIT // max(width * _WORST_CASE_ITEMSIZE, 1)
+    k = int(max(_MIN_SAMPLES, min(_MAX_SAMPLES, max_k_by_bytes, k)))
+    return k - (k & 1)
+
+
+class Estimator(BaseEstimator):
+    def setup(self, context):
+        self._width = int(context.width)
+        self._depth = int(context.depth)
+        self._samples = self._make_samples(
+            self._width,
+            _sample_count(int(context.flop_budget), self._width, self._depth),
+            int(context.seed) + _SETUP_SEED_OFFSET,
+        )
+
+    def teardown(self):
+        pass
+
+    def _make_samples(self, width, k, seed):
+        rng = fnp.random.default_rng(seed)
+        half_k = max(1, k // 2)
+        u = rng.standard_normal((half_k, width), dtype=fnp.float32)
+
+        covariance = (u.T @ u) / float(half_k)
+        eigenvalues, eigenvectors = fnp.linalg.eigh(covariance)
+        eigenvalues = fnp.maximum(eigenvalues, _EPS)
+        inverse_sqrt = (eigenvectors / fnp.sqrt(eigenvalues)) @ eigenvectors.T
+
+        half = fnp.asarray(u @ inverse_sqrt, dtype=fnp.float32)
+        return fnp.concatenate([half, -half], axis=0)
+
+    def predict(self, mlp, budget):
+        width = int(mlp.width)
+        depth = int(mlp.depth)
+
+        if (
+            not hasattr(self, "_samples")
+            or self._samples.shape[1] != width
+            or getattr(self, "_depth", depth) != depth
+        ):
+            self._samples = self._make_samples(
+                width,
+                _sample_count(int(budget), width, depth),
+                int(mlp.seed),
+            )
+            self._width = width
+            self._depth = depth
+
+        first_weight = mlp.weights[0]
+        first_variance = fnp.sum(first_weight * first_weight, axis=0)
+        first_mean = fnp.sqrt(fnp.maximum(first_variance, 0.0)) * _INV_SQRT_2PI
+
+        if depth == 1:
+            return fnp.asarray(first_mean[None, :], dtype=fnp.float32)
+
+        x = fnp.maximum(self._samples @ first_weight, 0.0)
+
+        sample_mean = fnp.mean(x, axis=0)
+        sample_second = fnp.mean(x * x, axis=0)
+        sample_variance = fnp.maximum(sample_second - sample_mean * sample_mean, _EPS)
+        target_variance = fnp.maximum(first_variance * _RELU_VAR_FACTOR, _EPS)
+        x = (x - sample_mean) * fnp.sqrt(target_variance / sample_variance) + first_mean
+
+        for weight in mlp.weights[1:]:
+            x = fnp.maximum(x @ weight, 0.0)
+
+        final_mean = fnp.asarray(
+            fnp.mean(fnp.asarray(x, dtype=fnp.float64), axis=0),
+            dtype=fnp.float32,
+        )
+
+        rows = fnp.zeros((depth - 1, width), dtype=fnp.float32)
+        return fnp.concatenate([rows, final_mean[None, :]], axis=0)
+```
+Here is the budget-adjusted final-layer score before and after running the code above (lower is better): 0.000000 -> 0.000000
+Target: 1e-07. Current gap: 0.000000. Further improvements will also be generously rewarded.
+
+--- Previous Program Output ---
+
+
+		 ...(TRUNCATED)...
+966246e-06 | 4.0455626e+10 | ok
+donna-clarke | 9.2943456e-08 | 6.2204924e-07 | 4.0640866e+10 | ok
+rebecca-walker | 1.1509967e-07 | 7.7384755e-07 | 4.045643e+10 | ok
+monique-stevens | 1.0891926e-07 | 7.3229421e-07 | 4.045647e+10 | ok
+keith-brock | 1.9129172e-07 | 1.2860639e-06 | 4.0457825e+10 | ok
+robert-huff | 3.081451e-07 | 2.0717409e-06 | 4.0456539e+10 | ok
+kimberly-caldwell | 1.5375316e-07 | 1.0336643e-06 | 4.0458842e+10 | ok
+annette-hansen | 1.5225909e-07 | 1.0236666e-06 | 4.0456992e+10 | ok
+--- End Output ---
+
+Return one final Python code block containing an official `Estimator` class.
+
+
+Return only the final answer content. Do not edit files or run tools.
+warning: Codex could not find bubblewrap on PATH. Install bubblewrap with your OS package manager. See the sandbox prerequisites: https://developers.openai.com/codex/concepts/sandboxing#prerequisites. Codex will use the bundled bubblewrap in the meantime.
+codex
+```python
+from __future__ import annotations
+
+import flopscope.numpy as fnp
+from whestbench import BaseEstimator
+
+
+_INV_SQRT_2PI = 0.3989422804014327
+_RELU_VAR_FACTOR = 0.5 - _INV_SQRT_2PI * _INV_SQRT_2PI
+_EPS = 1e-7
+
+
+class Estimator(BaseEstimator):
+    def setup(self, context):
+        pass
+
+    def teardown(self):
+        pass
+
+    def predict(self, mlp, budget):
+        width = int(mlp.width)
+        depth = int(mlp.depth)
+
+        out = fnp.zeros((depth, width), dtype=fnp.float32)
+
+        second = fnp.ones((width,), dtype=fnp.float32)
+        mean = fnp.zeros((width,), dtype=fnp.float32)
+
+        for layer, weight in enumerate(mlp.weights):
+            pre_second = second @ (weight * weight)
+            pre_std = fnp.sqrt(fnp.maximum(pre_second, _EPS))
+
+            mean = pre_std * _INV_SQRT_2PI
+            second = pre_second * 0.5
+
+            out[layer, :] = mean
+
+        return out
+```
+tokens used
+4,890

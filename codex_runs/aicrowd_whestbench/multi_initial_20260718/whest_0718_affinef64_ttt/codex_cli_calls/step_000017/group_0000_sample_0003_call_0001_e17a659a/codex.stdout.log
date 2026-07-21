@@ -1,0 +1,206 @@
+```python
+from __future__ import annotations
+
+import flopscope.numpy as fnp
+from whestbench import BaseEstimator
+
+
+_BUDGET_FRACTION = 0.152
+_MIN_SAMPLES = 32
+_MAX_SAMPLES = 1_000_000
+_ARRAY_BYTES_LIMIT = 110 * 1024 * 1024
+_MOMENT_BYTES_LIMIT = 120 * 1024 * 1024
+_WORST_CASE_ITEMSIZE = 8
+_SETUP_SEED_OFFSET = 3
+
+_PI = 3.141592653589793
+_INV_SQRT_2PI = 0.3989422804014327
+_INV_2PI = 0.15915494309189535
+_RELU_VAR_FACTOR = 0.5 - _INV_SQRT_2PI * _INV_SQRT_2PI
+_EPS = 1e-6
+
+_HIDDEN_GAUSS_BLEND = 0.18
+_FINAL_GAUSS_BLEND = 0.20
+
+
+def _as_int(value, default):
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except Exception:
+        return default
+
+
+def _sample_count(budget: int, width: int, depth: int) -> int:
+    per_sample = depth * (2 * width * width + width) + width * width
+    fixed = 22 * width**3 + 18 * width * width
+    k = (int(_BUDGET_FRACTION * budget) - fixed) // max(per_sample, 1)
+    cap = _ARRAY_BYTES_LIMIT // max(width * _WORST_CASE_ITEMSIZE, 1)
+    k = int(min(_MAX_SAMPLES, max(2, cap), max(_MIN_SAMPLES, k)))
+    k = k - (k & 1)
+    return max(2, k)
+
+
+def _normal_cdf(x):
+    z = x * 0.7071067811865476
+    sign = fnp.where(z < 0.0, -1.0, 1.0)
+    a = fnp.abs(z)
+    t = 1.0 / (1.0 + 0.3275911 * a)
+    poly = (((((1.061405429 * t - 1.453152027) * t + 1.421413741) * t
+              - 0.284496736) * t + 0.254829592) * t)
+    erf = sign * (1.0 - poly * fnp.exp(-a * a))
+    return fnp.maximum(0.0, fnp.minimum(1.0, 0.5 * (1.0 + erf)))
+
+
+def _relu_gaussian_moments(mean, variance):
+    variance = fnp.maximum(variance, _EPS)
+    std = fnp.sqrt(variance)
+    alpha = mean / std
+    phi = _INV_SQRT_2PI * fnp.exp(-0.5 * alpha * alpha)
+    cdf = _normal_cdf(alpha)
+    relu_mean = std * phi + mean * cdf
+    relu_second = (variance + mean * mean) * cdf + mean * std * phi
+    return relu_mean, fnp.maximum(relu_second, relu_mean * relu_mean + _EPS)
+
+
+def _first_layer_second_moment(weight, width):
+    gram = weight.T @ weight
+    variance = fnp.maximum(fnp.sum(weight * weight, axis=0), 0.0)
+    std = fnp.sqrt(variance)
+    mean = std * _INV_SQRT_2PI
+
+    outer = std[:, None] * std[None, :]
+    corr = gram / fnp.maximum(outer, _EPS)
+    corr = fnp.maximum(-1.0, fnp.minimum(1.0, corr))
+    root = fnp.sqrt(fnp.maximum(0.0, 1.0 - corr * corr))
+    second = outer * (root + (_PI - fnp.arccos(corr)) * corr) * _INV_2PI
+    return mean, variance, second
+
+
+def _match_mean_variance(values, target_mean, target_variance):
+    sample_mean = fnp.mean(values, axis=0)
+    sample_second = fnp.mean(values * values, axis=0)
+    sample_variance = fnp.maximum(sample_second - sample_mean * sample_mean, _EPS)
+    scale = fnp.sqrt(fnp.maximum(target_variance, _EPS) / sample_variance)
+    return (values - sample_mean) * scale + target_mean
+
+
+class Estimator(BaseEstimator):
+    def setup(self, context):
+        self._setup_seed = _as_int(getattr(context, "seed", None), 0) + _SETUP_SEED_OFFSET
+        self._width = _as_int(getattr(context, "width", None), None)
+        self._depth = _as_int(getattr(context, "depth", None), None)
+        self._budget = _as_int(getattr(context, "flop_budget", None), None)
+        self._samples = None
+
+        if self._width is not None and self._depth is not None and self._budget is not None:
+            self._samples = self._make_samples(
+                self._width,
+                _sample_count(self._budget, self._width, self._depth),
+                self._setup_seed,
+            )
+
+    def teardown(self):
+        pass
+
+    def _make_samples(self, width, k, seed):
+        rng = fnp.random.default_rng(seed)
+        half_k = max(1, k // 2)
+        u = rng.standard_normal((half_k, width), dtype=fnp.float32)
+
+        covariance = (u.T @ u) / float(half_k)
+        eigenvalues, eigenvectors = fnp.linalg.eigh(covariance)
+        eigenvalues = fnp.maximum(eigenvalues, _EPS)
+        inverse_sqrt = (eigenvectors / fnp.sqrt(eigenvalues)) @ eigenvectors.T
+
+        half = fnp.asarray(u @ inverse_sqrt, dtype=fnp.float32)
+        return fnp.concatenate([half, -half], axis=0)
+
+    def _samples_for(self, width, depth, budget, seed):
+        desired = _sample_count(max(0, int(budget)), width, depth)
+        samples = getattr(self, "_samples", None)
+
+        if samples is not None and samples.shape[1] == width:
+            if samples.shape[0] >= desired:
+                return samples[:desired]
+            return samples
+
+        samples = self._make_samples(width, desired, seed)
+        self._samples = samples
+        self._width = width
+        self._depth = depth
+        return samples
+
+    def predict(self, mlp, budget):
+        width = int(mlp.width)
+        depth = int(mlp.depth)
+        budget = _as_int(budget, getattr(self, "_budget", 0) or 0)
+
+        samples = self._samples_for(width, depth, budget, int(mlp.seed))
+        first_weight = mlp.weights[0]
+
+        use_exact_second = (
+            depth > 1
+            and width * width * _WORST_CASE_ITEMSIZE <= _MOMENT_BYTES_LIMIT
+        )
+
+        if use_exact_second:
+            first_mean, first_variance, first_second = _first_layer_second_moment(
+                first_weight, width
+            )
+        else:
+            first_variance = fnp.sum(first_weight * first_weight, axis=0)
+            first_mean = fnp.sqrt(fnp.maximum(first_variance, 0.0)) * _INV_SQRT_2PI
+            first_second = None
+
+        if depth == 1:
+            return fnp.asarray(first_mean[None, :], dtype=fnp.float32)
+
+        x = fnp.maximum(samples @ first_weight, 0.0)
+        first_target_variance = fnp.maximum(first_variance * _RELU_VAR_FACTOR, _EPS)
+        x = _match_mean_variance(x, first_mean, first_target_variance)
+
+        rows = [fnp.asarray(first_mean[None, :], dtype=fnp.float32)]
+
+        for layer_index, weight in enumerate(mlp.weights[1:], start=1):
+            z = x @ weight
+
+            if layer_index == 1 and first_second is not None:
+                target_mean = first_mean @ weight
+                target_second = fnp.sum((first_second @ weight) * weight, axis=0)
+                target_variance = fnp.maximum(
+                    target_second - target_mean * target_mean,
+                    _EPS,
+                )
+                z = _match_mean_variance(z, target_mean, target_variance)
+                z_mean = target_mean
+                z_variance = target_variance
+            else:
+                z_mean = fnp.mean(z, axis=0)
+                z_second = fnp.mean(z * z, axis=0)
+                z_variance = fnp.maximum(z_second - z_mean * z_mean, _EPS)
+
+            raw = fnp.maximum(z, 0.0)
+            raw_mean = fnp.mean(raw, axis=0)
+
+            gauss_mean, gauss_second = _relu_gaussian_moments(z_mean, z_variance)
+
+            if layer_index == depth - 1:
+                final_mean = raw_mean + _FINAL_GAUSS_BLEND * (gauss_mean - raw_mean)
+                rows.append(fnp.asarray(final_mean[None, :], dtype=fnp.float32))
+                break
+
+            raw_second = fnp.mean(raw * raw, axis=0)
+            target_mean = raw_mean + _HIDDEN_GAUSS_BLEND * (gauss_mean - raw_mean)
+            target_second = raw_second + _HIDDEN_GAUSS_BLEND * (gauss_second - raw_second)
+            target_variance = fnp.maximum(
+                target_second - target_mean * target_mean,
+                _EPS,
+            )
+
+            x = _match_mean_variance(raw, target_mean, target_variance)
+            rows.append(fnp.asarray(target_mean[None, :], dtype=fnp.float32))
+
+        return fnp.asarray(fnp.concatenate(rows, axis=0), dtype=fnp.float32)
+```

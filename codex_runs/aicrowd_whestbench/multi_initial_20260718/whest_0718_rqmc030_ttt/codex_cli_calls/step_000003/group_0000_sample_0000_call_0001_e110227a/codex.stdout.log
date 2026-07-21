@@ -1,0 +1,158 @@
+```python
+from __future__ import annotations
+
+import flopscope as flops
+import flopscope.numpy as fnp
+from whestbench import BaseEstimator
+
+
+_TARGET_FLOP_FRACTION = 0.90
+_TAIL_CLIP = 1e-12
+_ARRAY_BYTES_LIMIT = 96 * 1024 * 1024
+_FLOAT64_ITEMSIZE = 8
+
+
+def _first_primes(count: int) -> tuple[int, ...]:
+    primes = []
+    candidate = 2
+    while len(primes) < count:
+        ok = True
+        for prime in primes:
+            if prime * prime > candidate:
+                break
+            if candidate % prime == 0:
+                ok = False
+                break
+        if ok:
+            primes.append(candidate)
+        candidate += 1
+    return tuple(primes)
+
+
+def _lattice_generator(width: int) -> fnp.ndarray:
+    roots = fnp.sqrt(fnp.array(_first_primes(width), dtype=fnp.float64))
+    return roots - fnp.floor(roots)
+
+
+def _lattice_uniforms(
+    n_samples: int,
+    generator: fnp.ndarray,
+    shift: fnp.ndarray,
+    start: int,
+) -> fnp.ndarray:
+    indices = (fnp.arange(n_samples, dtype=fnp.float64) + float(start))[:, None]
+    values = indices * generator[None, :] + shift[None, :]
+    return values - fnp.floor(values)
+
+
+def _exact_first_layer_mean(weight: fnp.ndarray) -> fnp.ndarray:
+    variance = fnp.sum(weight * weight, axis=0)
+    return fnp.sqrt(variance) / fnp.sqrt(2.0 * fnp.pi)
+
+
+def _sample_count(budget: int, width: int, depth: int) -> int:
+    if depth <= 1:
+        return 0
+
+    try:
+        budget_int = int(budget)
+    except Exception:
+        budget_int = 1_000_000_000
+
+    w2 = width * width
+    first_layer_per_sample = w2 + width
+    later_layers_per_sample = (depth - 1) * (2 * w2 + width)
+    mean_per_sample = (depth - 1) * width
+    lattice_per_sample = 48 * width
+    per_sample = (
+        first_layer_per_sample
+        + later_layers_per_sample
+        + mean_per_sample
+        + lattice_per_sample
+    )
+
+    fixed = 2 * w2 + 32 * width
+    tracked = int(_TARGET_FLOP_FRACTION * budget_int)
+    n_samples = (tracked - fixed) // max(per_sample, 1)
+
+    if n_samples < 2:
+        return 2
+    return int(n_samples - (n_samples % 2))
+
+
+def _base_chunk_size(width: int) -> int:
+    max_rows = _ARRAY_BYTES_LIMIT // max(width * _FLOAT64_ITEMSIZE, 1)
+    return int(max(1, max_rows // 2))
+
+
+class Estimator(BaseEstimator):
+    def setup(self, context):
+        self._generator_cache = {}
+        self._setup_seed = getattr(context, "seed", None)
+
+    def _generator(self, width: int) -> fnp.ndarray:
+        cache = getattr(self, "_generator_cache", None)
+        if cache is None:
+            self._generator_cache = {}
+            cache = self._generator_cache
+
+        generator = cache.get(width)
+        if generator is None:
+            generator = _lattice_generator(width)
+            cache[width] = generator
+        return generator
+
+    def predict(self, mlp, budget):
+        width = mlp.width
+        depth = mlp.depth
+
+        if depth <= 0:
+            return fnp.zeros((0, width), dtype=fnp.float64)
+
+        first_mean = _exact_first_layer_mean(mlp.weights[0])
+        if depth == 1:
+            return fnp.stack((first_mean,), axis=0)
+
+        n_samples = _sample_count(budget, width, depth)
+        base_total = n_samples // 2
+
+        rng = fnp.random.default_rng(mlp.seed)
+        generator = self._generator(width)
+        shift = rng.random(width)
+
+        sums = [fnp.zeros(width, dtype=fnp.float64) for _ in range(depth - 1)]
+        base_chunk = _base_chunk_size(width)
+
+        done = 0
+        while done < base_total:
+            current = min(base_chunk, base_total - done)
+
+            uniforms = _lattice_uniforms(current, generator, shift, done)
+            uniforms = fnp.clip(uniforms, _TAIL_CLIP, 1.0 - _TAIL_CLIP)
+            normals = flops.stats.norm.ppf(uniforms)
+
+            first_preact = normals @ mlp.weights[0]
+            activations = fnp.concatenate(
+                (
+                    fnp.maximum(first_preact, 0.0),
+                    fnp.maximum(-first_preact, 0.0),
+                ),
+                axis=0,
+            )
+
+            for layer_index in range(1, depth):
+                activations = fnp.maximum(activations @ mlp.weights[layer_index], 0.0)
+                sums[layer_index - 1] = sums[layer_index - 1] + fnp.sum(
+                    activations,
+                    axis=0,
+                )
+
+            done += current
+
+        scale = 1.0 / float(2 * base_total)
+        rows = [first_mean]
+        for layer_sum in sums:
+            rows.append(layer_sum * scale)
+
+        return fnp.stack(rows, axis=0)
+```

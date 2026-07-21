@@ -1,0 +1,181 @@
+```python
+from __future__ import annotations
+
+import math
+
+import flopscope as flops
+import flopscope.numpy as fnp
+from whestbench import BaseEstimator
+
+
+_TARGET_FLOP_FRACTION = 0.10
+_MAX_WORKING_SET_BYTES = 100 * 1024 * 1024
+_FLOAT64_ITEMSIZE = 8
+_TAIL_CLIP = 1e-11
+_MIN_ANTITHETIC_SAMPLES = 32
+_WHITENING_EIGENVALUE_FLOOR = 1e-8
+_PRIME_CACHE: dict[int, tuple[int, ...]] = {}
+
+
+def _first_primes(count: int) -> tuple[int, ...]:
+    cached = _PRIME_CACHE.get(count)
+    if cached is not None:
+        return cached
+
+    primes = []
+    candidate = 2
+    while len(primes) < count:
+        is_prime = True
+        for prime in primes:
+            if prime * prime > candidate:
+                break
+            if candidate % prime == 0:
+                is_prime = False
+                break
+        if is_prime:
+            primes.append(candidate)
+        candidate += 1
+
+    result = tuple(primes)
+    _PRIME_CACHE[count] = result
+    return result
+
+
+def _mean_chi(dimension: int) -> float:
+    half_dimension = 0.5 * float(dimension)
+    return math.sqrt(2.0) * math.exp(
+        math.lgamma(half_dimension + 0.5) - math.lgamma(half_dimension)
+    )
+
+
+def _estimated_flops(n_samples: int, width: int, depth: int) -> int:
+    half_samples = max(n_samples // 2, 1)
+    hidden_layers = max(depth - 1, 0)
+
+    lattice = half_samples * (92 * width + 2)
+    first_projection = 2 * half_samples * width * width
+    gram = 2 * half_samples * half_samples * width
+    rotations = 4 * half_samples * half_samples * width
+    small_eigh = 13 * half_samples * half_samples * half_samples
+    first_layer = (
+        lattice
+        + first_projection
+        + gram
+        + rotations
+        + small_eigh
+        + 3 * n_samples * width
+    )
+
+    hidden = hidden_layers * (
+        n_samples * (2 * width * width + 5 * width)
+        + 2 * width * width
+        + 4 * width
+    )
+    return int(first_layer + hidden + depth * width)
+
+
+def _sample_count(budget: int | None, width: int, depth: int) -> int:
+    if budget is None:
+        budget = 2 * depth * width * width * 4096
+
+    activation_limited = _MAX_WORKING_SET_BYTES // max(width * _FLOAT64_ITEMSIZE, 1)
+    gram_limited = 2 * int(math.sqrt(_MAX_WORKING_SET_BYTES / _FLOAT64_ITEMSIZE))
+    memory_limited = int(max(2, min(activation_limited, gram_limited)))
+    memory_limited -= memory_limited & 1
+
+    target = int(_TARGET_FLOP_FRACTION * int(budget))
+    low_pairs = 1
+    high_pairs = max(memory_limited // 2, 1)
+    best_pairs = 1
+
+    while low_pairs <= high_pairs:
+        mid_pairs = (low_pairs + high_pairs) // 2
+        n_samples = 2 * mid_pairs
+        if _estimated_flops(n_samples, width, depth) <= target:
+            best_pairs = mid_pairs
+            low_pairs = mid_pairs + 1
+        else:
+            high_pairs = mid_pairs - 1
+
+    count = 2 * best_pairs
+    if count < _MIN_ANTITHETIC_SAMPLES:
+        count = min(memory_limited, _MIN_ANTITHETIC_SAMPLES)
+    return max(2, count - (count & 1))
+
+
+def _lattice_normal_samples(n_samples: int, width: int, rng) -> fnp.ndarray:
+    roots = fnp.sqrt(fnp.array(_first_primes(width), dtype=fnp.float64))
+    generator = roots - fnp.floor(roots)
+    shift = rng.random(width)
+
+    indices = fnp.arange(n_samples, dtype=fnp.float64)[:, None]
+    uniforms = indices * generator[None, :] + shift[None, :]
+    uniforms = uniforms - fnp.floor(uniforms)
+    uniforms = fnp.clip(uniforms, _TAIL_CLIP, 1.0 - _TAIL_CLIP)
+    return flops.stats.norm.ppf(uniforms)
+
+
+def _qmc_directions(n_samples: int, width: int, rng) -> fnp.ndarray:
+    normals = _lattice_normal_samples(n_samples, width, rng)
+    radii = fnp.sqrt(fnp.maximum(fnp.sum(normals * normals, axis=1), 1e-24))
+    return normals / radii[:, None]
+
+
+def _whitened_first_preactivations(
+    directions: fnp.ndarray, weights: fnp.ndarray
+) -> fnp.ndarray:
+    half_samples, width = directions.shape
+
+    projected = directions @ weights
+    gram = directions @ directions.T
+    eigenvalues, eigenvectors = fnp.linalg.eigh(gram)
+
+    angular_eigenvalues = (float(width) / float(half_samples)) * eigenvalues
+    inverse_scales = 1.0 / fnp.sqrt(
+        fnp.maximum(angular_eigenvalues, _WHITENING_EIGENVALUE_FLOOR)
+    )
+    return eigenvectors @ ((eigenvectors.T @ projected) * inverse_scales[:, None])
+
+
+def _exact_first_layer_mean(weights: fnp.ndarray) -> fnp.ndarray:
+    std = fnp.sqrt(fnp.sum(weights * weights, axis=0))
+    return std / fnp.sqrt(2.0 * fnp.pi)
+
+
+class Estimator(BaseEstimator):
+    def predict(self, mlp, budget: int | None) -> fnp.ndarray:
+        width = mlp.width
+        depth = mlp.depth
+        n_samples = _sample_count(budget, width, depth)
+        half_samples = n_samples // 2
+
+        rng = fnp.random.default_rng(mlp.seed)
+        half_directions = _qmc_directions(half_samples, width, rng)
+
+        first_mean = _exact_first_layer_mean(mlp.weights[0])
+        first_preactivations = _whitened_first_preactivations(
+            half_directions, mlp.weights[0]
+        )
+        first_preactivations = first_preactivations * _mean_chi(width)
+
+        activations = fnp.maximum(
+            fnp.concatenate((first_preactivations, -first_preactivations), axis=0),
+            0.0,
+        )
+
+        rows = [first_mean]
+        previous_mean = first_mean
+
+        for weights in mlp.weights[1:]:
+            preactivations = activations @ weights
+            activations = fnp.maximum(preactivations, 0.0)
+
+            linear_mean = previous_mean @ weights
+            absolute_mean = fnp.mean(fnp.abs(preactivations), axis=0)
+            layer_mean = fnp.maximum(0.5 * (linear_mean + absolute_mean), 0.0)
+
+            rows.append(layer_mean)
+            previous_mean = layer_mean
+
+        return fnp.asarray(fnp.stack(rows, axis=0), dtype=fnp.float32)
+```

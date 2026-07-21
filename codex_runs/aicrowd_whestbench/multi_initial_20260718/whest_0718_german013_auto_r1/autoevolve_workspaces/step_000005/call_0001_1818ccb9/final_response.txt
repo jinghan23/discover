@@ -1,0 +1,106 @@
+```python
+from __future__ import annotations
+
+import math
+
+import flopscope.numpy as fnp
+from whestbench import BaseEstimator
+
+
+_MAIN_FRACTION = 0.095
+_EXTRA_FRACTION = 0.01022
+_EXTRA_WEIGHT_SCALE = 1.22
+_FINAL_NORMAL_BLEND = 0.07
+_FIRST_MEAN_STRENGTH = 0.336
+_INV_SQRT_2PI = 0.3989422804014327
+_SQRT_2_OVER_PI = 0.7978845608028654
+_CDF_CUBIC = 0.044715
+_MIN_SAMPLES = 32
+_MAX_SAMPLES = 1_000_000
+_ARRAY_BYTES_LIMIT = 100 * 1024 * 1024
+_WORST_CASE_ITEMSIZE = 8
+
+
+def _radial_mean_factor(width: int) -> float:
+    return math.exp(
+        0.5 * math.log(2.0)
+        + math.lgamma(0.5 * (width + 1))
+        - math.lgamma(0.5 * width)
+        - 0.5 * math.log(width)
+    )
+
+
+def _sample_count(fraction: float, budget: int, width: int, depth: int) -> int:
+    per_sample = depth * (2 * width * width + width) + width * width
+    fixed = 9 * width**3 + 2 * (2 * width**3)
+    k = (int(fraction * budget) - fixed) // max(per_sample, 1)
+    max_k_by_bytes = _ARRAY_BYTES_LIMIT // max(width * _WORST_CASE_ITEMSIZE, 1)
+    min_k = max(_MIN_SAMPLES, 2 * width + 2)
+    k = int(max(min_k, min(_MAX_SAMPLES, max_k_by_bytes, k)))
+    return k - (k & 1)
+
+
+def _normal_relu_mean(mu, var):
+    var = fnp.maximum(var, 1e-12)
+    sigma = fnp.sqrt(var)
+    alpha = mu / sigma
+    pdf = _INV_SQRT_2PI * fnp.exp(-0.5 * alpha * alpha)
+    cdf = 0.5 * (
+        1.0
+        + fnp.tanh(_SQRT_2_OVER_PI * (alpha + _CDF_CUBIC * alpha * alpha * alpha))
+    )
+    return sigma * pdf + mu * cdf
+
+
+def _estimate_block(mlp, rng, k: int, radial_factor: float, sphere_mean):
+    width = mlp.width
+    u = rng.standard_normal((k // 2, width), dtype=fnp.float32)
+    u = u[:, ::-1]
+    norm2 = fnp.sum(u * u, axis=1, keepdims=True)
+    u = u * fnp.sqrt(float(width) / fnp.maximum(norm2, 1e-12))
+    x = fnp.concatenate([u, -u], axis=0)
+
+    covariance = (u.T @ u) / float(k // 2)
+    cholesky = fnp.linalg.cholesky(covariance)
+    folded_first_weight = fnp.linalg.solve(cholesky.T, mlp.weights[0])
+
+    x = fnp.maximum(x @ folded_first_weight, 0.0)
+    x = x + _FIRST_MEAN_STRENGTH * (sphere_mean - fnp.mean(x, axis=0))
+    for weight in mlp.weights[1:-1]:
+        x = fnp.maximum(x @ weight, 0.0)
+
+    z = x @ mlp.weights[-1]
+    sampled_final_mean = fnp.mean(fnp.maximum(z, 0.0), axis=0)
+    mu = fnp.mean(z, axis=0)
+    second = fnp.mean(z * z, axis=0)
+    normal_final_mean = _normal_relu_mean(mu, second - mu * mu)
+    return radial_factor * (
+        (1.0 - _FINAL_NORMAL_BLEND) * sampled_final_mean
+        + _FINAL_NORMAL_BLEND * normal_final_mean
+    )
+
+
+class Estimator(BaseEstimator):
+    def predict(self, mlp, budget):
+        width = mlp.width
+        depth = mlp.depth
+        rng = fnp.random.default_rng(mlp.seed)
+        radial_factor = _radial_mean_factor(width)
+        first_var = fnp.sum(mlp.weights[0] * mlp.weights[0], axis=0)
+        sphere_mean = (
+            fnp.sqrt(fnp.maximum(first_var, 1e-12))
+            * (_INV_SQRT_2PI / radial_factor)
+        )
+
+        k_main = _sample_count(_MAIN_FRACTION, budget, width, depth)
+        k_extra = _sample_count(_EXTRA_FRACTION, budget, width, depth)
+        main = _estimate_block(mlp, rng, k_main, radial_factor, sphere_mean)
+        extra = _estimate_block(mlp, rng, k_extra, radial_factor, sphere_mean)
+        extra_weight = _EXTRA_WEIGHT_SCALE * k_extra
+        final_mean = (k_main * main + extra_weight * extra) / (
+            float(k_main) + extra_weight
+        )
+
+        zero_rows = fnp.zeros((depth - 1, width), dtype=fnp.float32)
+        return fnp.concatenate([zero_rows, final_mean[None, :]], axis=0)
+```

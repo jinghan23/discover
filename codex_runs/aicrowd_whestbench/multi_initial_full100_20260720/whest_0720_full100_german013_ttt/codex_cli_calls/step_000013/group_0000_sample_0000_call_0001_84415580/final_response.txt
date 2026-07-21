@@ -1,0 +1,94 @@
+```python
+from __future__ import annotations
+
+import math
+
+import flopscope.numpy as fnp
+from whestbench import BaseEstimator
+
+
+_BUDGET_FRACTION = 0.24
+_MIN_SAMPLES = 32
+_MAX_SAMPLES = 1_000_000
+_MAX_BATCH_PAIRS = 256
+_ARRAY_BYTES_LIMIT = 192 * 1024 * 1024
+_WORST_CASE_ITEMSIZE = 8
+_EPS = 1e-6
+_INV_SQRT_2PI = 0.3989422804014327
+
+
+def _mean_gaussian_radius(width: int) -> float:
+    if width <= 0:
+        return 0.0
+    if width > 4096:
+        return math.sqrt(width - 0.5)
+    return math.sqrt(2.0) * math.exp(
+        math.lgamma(0.5 * (width + 1.0)) - math.lgamma(0.5 * width)
+    )
+
+
+def _sample_count(budget, width: int, depth: int) -> int:
+    per_sample = depth * (2 * width * width + width)
+    max_k_by_bytes = _ARRAY_BYTES_LIMIT // max(width * _WORST_CASE_ITEMSIZE, 1)
+
+    if budget is None:
+        k = min(_MAX_SAMPLES, max_k_by_bytes, 64)
+    else:
+        k = int(_BUDGET_FRACTION * float(budget)) // max(per_sample, 1)
+        k = max(_MIN_SAMPLES, min(_MAX_SAMPLES, max_k_by_bytes, int(k)))
+
+    return max(2, k - (k & 1))
+
+
+def _orthogonal_sphere_batch(rng, pairs: int, width: int, radius: float):
+    u = rng.standard_normal((pairs, width), dtype=fnp.float32)
+
+    if pairs == 1:
+        norm = fnp.sqrt(fnp.maximum(fnp.sum(u * u, axis=1, keepdims=True), _EPS))
+        q = u / norm
+    else:
+        gram = u @ u.T
+        eigval, eigvec = fnp.linalg.eigh(gram)
+        eigval = fnp.maximum(eigval, _EPS)
+        q = (eigvec / fnp.sqrt(eigval)) @ (eigvec.T @ u)
+
+    q = q * float(radius)
+    return fnp.concatenate([q, -q], axis=0)
+
+
+class Estimator(BaseEstimator):
+    def setup(self, context):
+        self._setup_seed = context.seed
+
+    def predict(self, mlp, budget):
+        width = int(mlp.width)
+        depth = int(mlp.depth)
+        k = _sample_count(budget, width, depth)
+        total_pairs = k // 2
+
+        rng = fnp.random.default_rng(mlp.seed)
+        radius = _mean_gaussian_radius(width)
+
+        max_pairs_by_bytes = max(
+            1, _ARRAY_BYTES_LIMIT // max(2 * width * _WORST_CASE_ITEMSIZE, 1)
+        )
+        batch_cap = max(1, min(_MAX_BATCH_PAIRS, max_pairs_by_bytes, width))
+
+        sums = fnp.zeros((depth, width), dtype=fnp.float32)
+        done_pairs = 0
+
+        while done_pairs < total_pairs:
+            pairs = min(batch_cap, total_pairs - done_pairs)
+            x = _orthogonal_sphere_batch(rng, pairs, width, radius)
+
+            for layer, weight in enumerate(mlp.weights):
+                x = fnp.maximum(x @ weight, 0.0)
+                sums[layer] = sums[layer] + fnp.sum(x, axis=0)
+
+            done_pairs += pairs
+
+        means = sums / float(2 * total_pairs)
+        first = fnp.sqrt(fnp.sum(mlp.weights[0] * mlp.weights[0], axis=0)) * _INV_SQRT_2PI
+        means[0] = first
+        return means
+```

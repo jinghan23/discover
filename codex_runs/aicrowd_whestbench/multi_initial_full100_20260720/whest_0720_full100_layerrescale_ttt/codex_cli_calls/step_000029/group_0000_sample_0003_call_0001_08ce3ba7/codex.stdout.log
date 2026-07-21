@@ -1,0 +1,101 @@
+```python
+from __future__ import annotations
+
+import flopscope as flops
+import flopscope.numpy as fnp
+from whestbench import BaseEstimator
+
+
+class Estimator(BaseEstimator):
+    def predict(self, mlp, budget):
+        width = int(mlp.width)
+        depth = int(mlp.depth)
+        rng = fnp.random.default_rng(int(mlp.seed))
+
+        mu = fnp.zeros(width)
+        var = fnp.ones(width)
+        rows = []
+        vars_ = []
+
+        for w in mlp.weights:
+            m = w.T @ mu
+            v = fnp.maximum((w * w).T @ var, 1e-12)
+            s = fnp.sqrt(v)
+            a = m / s
+            p = flops.stats.norm.pdf(a)
+            c = flops.stats.norm.cdf(a)
+
+            mu = m * c + s * p
+            ez2 = (m * m + v) * c + m * s * p
+            var = fnp.maximum(ez2 - mu * mu, 0.0)
+
+            rows.append(mu)
+            vars_.append(var)
+
+        diag = fnp.asarray(fnp.stack(rows, axis=0), dtype=fnp.float32)
+        diag_vars = fnp.stack(vars_, axis=0)
+
+        if depth <= 1:
+            return diag
+
+        if budget is None:
+            n_samples = 12288
+        else:
+            per_sample = max(1, depth * (2 * width * width + 8 * width))
+            n_samples = int((0.115 * float(budget)) / float(per_sample))
+            n_samples = max(1536, min(n_samples, 12288))
+
+        n_samples = max(2, 2 * (n_samples // 2))
+        half = n_samples // 2
+
+        base = fnp.asarray(rng.standard_normal((half, width), dtype=fnp.float32))
+        x = fnp.concatenate((base, -base), axis=0)
+        x = x - fnp.mean(x, axis=0)
+
+        cov = (x.T @ x) / float(n_samples)
+        vals, vecs = fnp.linalg.eigh(cov)
+        inv_sqrt = (vecs * (1.0 / fnp.sqrt(fnp.maximum(vals, 1e-12)))[None, :]) @ vecs.T
+        x = x @ inv_sqrt
+
+        for i, w in enumerate(mlp.weights[:-1]):
+            x = fnp.maximum(x @ w, 0.0)
+
+            if i < depth - 1:
+                xm = fnp.mean(x, axis=0)
+                xc = x - xm
+                xv = fnp.maximum(fnp.mean(xc * xc, axis=0), 1e-12)
+                matched = xc * fnp.sqrt(fnp.maximum(diag_vars[i], 1e-12) / xv) + diag[i]
+
+                if i == 0:
+                    x = -0.52 * x + 1.52 * matched
+                elif i == 1:
+                    x = 0.82 * x + 0.18 * matched
+                elif i == 2:
+                    x = 0.985 * x + 0.015 * matched
+                elif i == 3:
+                    x = 1.035 * x - 0.035 * matched
+
+        z = x @ mlp.weights[-1]
+        relu_z = fnp.maximum(z, 0.0)
+        final_mc = fnp.asarray(fnp.mean(relu_z, axis=0), dtype=fnp.float32)
+
+        z_mu = fnp.mean(z, axis=0)
+        zc = z - z_mu
+        z_var = fnp.maximum(fnp.mean(zc * zc, axis=0), 1e-12)
+        z_sigma = fnp.sqrt(z_var)
+        z_alpha = z_mu / z_sigma
+        final_norm = fnp.asarray(
+            z_mu * flops.stats.norm.cdf(z_alpha) + z_sigma * flops.stats.norm.pdf(z_alpha),
+            dtype=fnp.float32,
+        )
+
+        final_pred = fnp.asarray(
+            0.962 * final_mc + 0.033 * final_norm + 0.005 * diag[-1],
+            dtype=fnp.float32,
+        )
+
+        return fnp.asarray(
+            fnp.concatenate((diag[:-1], final_pred[None, :]), axis=0),
+            dtype=fnp.float32,
+        )
+```

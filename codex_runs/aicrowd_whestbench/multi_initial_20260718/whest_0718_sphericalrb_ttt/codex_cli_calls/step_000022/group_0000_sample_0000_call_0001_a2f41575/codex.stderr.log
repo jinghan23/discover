@@ -1,0 +1,419 @@
+OpenAI Codex v0.144.3
+--------
+workdir: /opt/tiger/discover
+model: gpt-5.5
+provider: openai
+approval: never
+sandbox: read-only
+reasoning effort: xhigh
+reasoning summaries: none
+session id: 019f7692-6989-7fc1-b1a9-1b5474ab2ae3
+--------
+user
+You are solving the ARC White-Box Estimation Challenge 2026
+(WhestBench) under the official evaluator contract.
+
+Task:
+- You receive the weights of a randomly initialized square ReLU MLP.
+- Inputs follow a standard normal distribution.
+- Predict the per-neuron post-ReLU activation mean for every layer.
+- Return a `flopscope.numpy.ndarray` with shape `(mlp.depth, mlp.width)`.
+
+Required submission interface:
+- Import `flopscope.numpy as fnp` for numerical operations.
+- Define `class Estimator(BaseEstimator)` with
+  `predict(self, mlp, budget)`.
+- Optional `setup(self, context)` and `teardown(self)` hooks follow the official
+  WhestBench API.
+- Seed predict-time randomness from `mlp.seed` and setup-time randomness from
+  `context.seed`.
+
+Official scoring:
+- For each MLP, compute final-layer MSE against the official Monte Carlo target.
+- Effective compute is `C = FLOPs + lambda * residual_wall_time`.
+- A valid MLP score is `final_layer_mse * max(0.1, C / flop_budget)`.
+- The suite score is the arithmetic mean of those per-MLP scores; lower is better.
+- Exceptions, invalid shapes/non-finite values, FLOP/time exhaustion, or combined
+  budget exhaustion use an all-zero prediction and multiplier 1.0 for that MLP.
+- All-layer MSE is diagnostic only.
+
+Do not use plain NumPy or uninstrumented numerical libraries to evade FLOP
+accounting. Residual Python or uninstrumented work is charged at the official
+lambda rate and can exhaust the combined budget.
+
+Fairness and data isolation:
+- Derive predictions only from the `mlp` weights and allowed setup context.
+- Do not inspect, search for, or read evaluation datasets, Hugging Face caches,
+  saved evaluation reports, target moments, or ground-truth files.
+- Do not hardcode values tied to public mini MLPs. Such candidates are invalid
+  even if they receive a low local score.
+
+Algorithm directions worth exploring:
+- Mean and diagonal-variance propagation through ReLU moments.
+- Full, structured, or low-rank covariance propagation.
+- Hybrid analytic propagation with compute-budgeted Monte Carlo probes.
+- Layer-wise corrections for correlation error in deep networks.
+- Allocating FLOPs to layers where final-layer MSE is most sensitive.
+
+
+Official evaluation suite for this run:
+- dataset: None@None
+- split / MLPs: None / first None
+- width / depth: None / None
+- FLOP budget per MLP: None
+- residual penalty lambda: None FLOPs/second
+- runner: None
+
+You are iteratively optimizing budget-adjusted final-layer score.
+Here is the last code we ran:
+```python
+from __future__ import annotations
+
+import math
+
+import flopscope as flops
+import flopscope.numpy as fnp
+from whestbench import BaseEstimator
+
+
+_TARGET_FLOP_FRACTION = 0.10
+_MAX_WORKING_SET_BYTES = 100 * 1024 * 1024
+_FLOAT64_ITEMSIZE = 8
+_TAIL_CLIP = 1e-11
+_MIN_ANTITHETIC_SAMPLES = 32
+_WHITENING_EIGENVALUE_FLOOR = 1e-8
+_PRIME_CACHE: dict[int, tuple[int, ...]] = {}
+
+
+def _first_primes(count: int) -> tuple[int, ...]:
+    cached = _PRIME_CACHE.get(count)
+    if cached is not None:
+        return cached
+
+    primes = []
+    candidate = 2
+    while len(primes) < count:
+        is_prime = True
+        for prime in primes:
+            if prime * prime > candidate:
+                break
+            if candidate % prime == 0:
+                is_prime = False
+                break
+        if is_prime:
+            primes.append(candidate)
+        candidate += 1
+
+    result = tuple(primes)
+    _PRIME_CACHE[count] = result
+    return result
+
+
+def _mean_chi(dimension: int) -> float:
+    half_dimension = 0.5 * float(dimension)
+    return math.sqrt(2.0) * math.exp(
+        math.lgamma(half_dimension + 0.5) - math.lgamma(half_dimension)
+    )
+
+
+def _sample_count(budget: int | None, width: int, depth: int) -> int:
+    if budget is None:
+        budget = 2 * depth * width * width * 4096
+
+    half_lattice_per_sample = (89 * width + 3 * width + 2) // 2
+    layer_per_sample = depth * (2 * width * width + 3 * width)
+    covariance_per_sample = width * width
+    fixed = 13 * width**3 + 2 * max(depth - 1, 0) * width * width + 8 * width
+    per_sample = half_lattice_per_sample + layer_per_sample + covariance_per_sample
+
+    budget_limited = (int(_TARGET_FLOP_FRACTION * int(budget)) - fixed) // max(
+        per_sample, 1
+    )
+    memory_limited = _MAX_WORKING_SET_BYTES // max(width * _FLOAT64_ITEMSIZE, 1)
+    count = int(max(_MIN_ANTITHETIC_SAMPLES, min(budget_limited, memory_limited)))
+    return count - (count & 1)
+
+
+def _lattice_normal_samples(n_samples: int, width: int, rng) -> fnp.ndarray:
+    roots = fnp.sqrt(fnp.array(_first_primes(width), dtype=fnp.float64))
+    generator = roots - fnp.floor(roots)
+    shift = rng.random(width)
+
+    indices = fnp.arange(n_samples, dtype=fnp.float64)[:, None]
+    uniforms = indices * generator[None, :] + shift[None, :]
+    uniforms = uniforms - fnp.floor(uniforms)
+    uniforms = fnp.clip(uniforms, _TAIL_CLIP, 1.0 - _TAIL_CLIP)
+    return flops.stats.norm.ppf(uniforms)
+
+
+def _qmc_directions(n_samples: int, width: int, rng) -> fnp.ndarray:
+    normals = _lattice_normal_samples(n_samples, width, rng)
+    radii = fnp.sqrt(fnp.maximum(fnp.sum(normals * normals, axis=1), 1e-24))
+    return normals / radii[:, None]
+
+
+def _angular_whitening_transform(directions: fnp.ndarray) -> fnp.ndarray:
+    n_samples, width = directions.shape
+    second = (directions.T @ directions) * (float(width) / float(n_samples))
+    eigenvalues, eigenvectors = fnp.linalg.eigh(second)
+    eigenvalues = fnp.maximum(eigenvalues, _WHITENING_EIGENVALUE_FLOOR)
+    return (eigenvectors / fnp.sqrt(eigenvalues)) @ eigenvectors.T
+
+
+def _exact_first_layer_mean(weights: fnp.ndarray) -> fnp.ndarray:
+    std = fnp.sqrt(fnp.sum(weights * weights, axis=0))
+    return std / fnp.sqrt(2.0 * fnp.pi)
+
+
+class Estimator(BaseEstimator):
+    def predict(self, mlp, budget: int | None) -> fnp.ndarray:
+        width = mlp.width
+        depth = mlp.depth
+        n_samples = _sample_count(budget, width, depth)
+        half_samples = n_samples // 2
+
+        rng = fnp.random.default_rng(mlp.seed)
+        half_directions = _qmc_directions(half_samples, width, rng)
+        whitening = _angular_whitening_transform(half_directions)
+
+        paired_directions = fnp.concatenate((half_directions, -half_directions), axis=0)
+        activations = paired_directions * _mean_chi(width)
+
+        first_weight = whitening @ mlp.weights[0]
+        first_mean = _exact_first_layer_mean(mlp.weights[0])
+        rows = [first_mean]
+
+        activations = fnp.maximum(activations @ first_weight, 0.0)
+        previous_mean = first_mean
+
+        for weights in mlp.weights[1:]:
+            preactivations = activations @ weights
+            activations = fnp.maximum(preactivations, 0.0)
+
+            linear_mean = previous_mean @ weights
+            absolute_mean = fnp.mean(fnp.abs(preactivations), axis=0)
+            layer_mean = fnp.maximum(0.5 * (linear_mean + absolute_mean), 0.0)
+
+            rows.append(layer_mean)
+            previous_mean = layer_mean
+
+        return fnp.asarray(fnp.stack(rows, axis=0), dtype=fnp.float32)
+```
+Here is the budget-adjusted final-layer score before and after running the code above (lower is better): 0.000000 -> 0.000000
+Target: 1e-07. Current gap: 0.000000. Further improvements will also be generously rewarded.
+
+--- Previous Program Output ---
+
+
+		 ...(TRUNCATED)...
+8319e-06 | 2.7627029e+10 | ok
+donna-clarke | 7.7869552e-08 | 7.6821834e-07 | 2.7570961e+10 | ok
+rebecca-walker | 9.8918659e-08 | 9.7349903e-07 | 2.7638318e+10 | ok
+monique-stevens | 1.4639806e-07 | 1.4430188e-06 | 2.7595115e+10 | ok
+keith-brock | 2.1410878e-07 | 2.1084002e-06 | 2.7621696e+10 | ok
+robert-huff | 9.7860728e-08 | 9.6514236e-07 | 2.7579473e+10 | ok
+kimberly-caldwell | 1.2545234e-07 | 1.2358073e-06 | 2.761194e+10 | ok
+annette-hansen | 2.0886422e-07 | 2.0569178e-06 | 2.7619513e+10 | ok
+--- End Output ---
+
+Return one final Python code block containing an official `Estimator` class.
+
+
+Return only the final answer content. Do not edit files or run tools.
+warning: Codex could not find bubblewrap on PATH. Install bubblewrap with your OS package manager. See the sandbox prerequisites: https://developers.openai.com/codex/concepts/sandboxing#prerequisites. Codex will use the bundled bubblewrap in the meantime.
+codex
+```python
+from __future__ import annotations
+
+import math
+
+import flopscope as flops
+import flopscope.numpy as fnp
+from whestbench import BaseEstimator
+
+
+_TARGET_FLOP_FRACTION = 0.075
+_DEFAULT_BUDGET = 2_800_000_000
+_MAX_WORKING_SET_BYTES = 72 * 1024 * 1024
+_FLOAT64_ITEMSIZE = 8
+_TAIL_CLIP = 1e-11
+_MIN_ANTITHETIC_SAMPLES = 8
+_VAR_FLOOR = 1e-20
+_PRIME_CACHE: dict[int, tuple[int, ...]] = {}
+
+
+def _first_primes(count: int) -> tuple[int, ...]:
+    cached = _PRIME_CACHE.get(count)
+    if cached is not None:
+        return cached
+
+    primes = []
+    candidate = 2
+    while len(primes) < count:
+        is_prime = True
+        for prime in primes:
+            if prime * prime > candidate:
+                break
+            if candidate % prime == 0:
+                is_prime = False
+                break
+        if is_prime:
+            primes.append(candidate)
+        candidate += 1
+
+    result = tuple(primes)
+    _PRIME_CACHE[count] = result
+    return result
+
+
+def _mean_chi(dimension: int) -> float:
+    half_dimension = 0.5 * float(dimension)
+    return math.sqrt(2.0) * math.exp(
+        math.lgamma(half_dimension + 0.5) - math.lgamma(half_dimension)
+    )
+
+
+def _sample_count(budget: int | None, width: int, depth: int) -> int:
+    if budget is None:
+        budget = _DEFAULT_BUDGET
+
+    usable = int(_TARGET_FLOP_FRACTION * int(budget))
+    per_sample = max(1, 2 * depth * width * width + 16 * depth * width)
+    fixed = 6 * depth * width * width + 16 * depth * width
+    count = (usable - fixed) // per_sample
+
+    memory_limited = _MAX_WORKING_SET_BYTES // max(width * _FLOAT64_ITEMSIZE, 1)
+    count = int(max(_MIN_ANTITHETIC_SAMPLES, min(count, memory_limited)))
+    count -= count & 1
+    return max(2, count)
+
+
+def _lattice_normal_samples(n_samples: int, width: int, rng) -> fnp.ndarray:
+    roots = fnp.sqrt(fnp.asarray(_first_primes(width), dtype=fnp.float64))
+    generator = roots - fnp.floor(roots)
+    shift = rng.random(width)
+
+    indices = fnp.arange(n_samples, dtype=fnp.float64)[:, None]
+    uniforms = indices * generator[None, :] + shift[None, :]
+    uniforms = uniforms - fnp.floor(uniforms)
+    uniforms = fnp.clip(uniforms, _TAIL_CLIP, 1.0 - _TAIL_CLIP)
+    return flops.stats.norm.ppf(uniforms)
+
+
+def _qmc_directions(n_samples: int, width: int, rng) -> fnp.ndarray:
+    normals = _lattice_normal_samples(n_samples, width, rng)
+    radii = fnp.sqrt(fnp.maximum(fnp.sum(normals * normals, axis=1), 1e-24))
+    return normals / radii[:, None]
+
+
+def _normal_relu_moments(mean: fnp.ndarray, var: fnp.ndarray) -> tuple[fnp.ndarray, fnp.ndarray]:
+    std = fnp.sqrt(fnp.maximum(var, _VAR_FLOOR))
+    alpha = mean / std
+    cdf = flops.stats.norm.cdf(alpha)
+    pdf = fnp.exp(-0.5 * alpha * alpha) / math.sqrt(2.0 * math.pi)
+
+    relu_mean = std * pdf + mean * cdf
+    relu_second = (mean * mean + var) * cdf + mean * std * pdf
+    return fnp.maximum(relu_mean, 0.0), fnp.maximum(relu_second, 0.0)
+
+
+def _match_moments(samples: fnp.ndarray, target_mean: fnp.ndarray, target_var: fnp.ndarray) -> fnp.ndarray:
+    sample_mean = fnp.mean(samples, axis=0)
+    centered = samples - sample_mean[None, :]
+    sample_var = fnp.mean(centered * centered, axis=0)
+    scale = fnp.sqrt(fnp.maximum(target_var, 0.0) / fnp.maximum(sample_var, _VAR_FLOOR))
+    scale = fnp.minimum(scale, 8.0)
+    return target_mean[None, :] + centered * scale[None, :]
+
+
+def _first_layer_mean_and_var(weights: fnp.ndarray, width: int) -> tuple[fnp.ndarray, fnp.ndarray]:
+    norm_sq = fnp.sum(weights * weights, axis=0)
+    mean = fnp.sqrt(norm_sq) / math.sqrt(2.0 * math.pi)
+
+    radial = _mean_chi(width)
+    second = norm_sq * (radial * radial) / (2.0 * float(width))
+    var = fnp.maximum(second - mean * mean, _VAR_FLOOR)
+    return mean, var
+
+
+def _maybe_whitened_first_preactivations(
+    directions: fnp.ndarray, weights: fnp.ndarray, width: int
+) -> fnp.ndarray:
+    half_samples = directions.shape[0]
+
+    if half_samples < width:
+        return directions @ weights
+
+    second = (directions.T @ directions) * (float(width) / float(half_samples))
+    eigenvalues, eigenvectors = fnp.linalg.eigh(second)
+    eigenvalues = fnp.maximum(eigenvalues, 1e-8)
+    whitening = (eigenvectors / fnp.sqrt(eigenvalues)[None, :]) @ eigenvectors.T
+    return directions @ (whitening @ weights)
+
+
+class Estimator(BaseEstimator):
+    def predict(self, mlp, budget: int | None) -> fnp.ndarray:
+        width = mlp.width
+        depth = mlp.depth
+        n_samples = _sample_count(budget, width, depth)
+        half_samples = n_samples // 2
+
+        rng = fnp.random.default_rng(mlp.seed)
+        half_directions = _qmc_directions(half_samples, width, rng)
+        radial = _mean_chi(width)
+
+        first_half = _maybe_whitened_first_preactivations(
+            half_directions, mlp.weights[0], width
+        ) * radial
+        pre0 = fnp.concatenate((first_half, -first_half), axis=0)
+
+        first_mean, layer_var = _first_layer_mean_and_var(mlp.weights[0], width)
+        activations = _match_moments(fnp.maximum(pre0, 0.0), first_mean, layer_var)
+
+        rows = [first_mean]
+        previous_mean = first_mean
+        previous_var = layer_var
+
+        sample_weight = float(n_samples) / float(n_samples + 64)
+
+        for weights in mlp.weights[1:]:
+            linear_mean = previous_mean @ weights
+            diag_var = previous_var @ (weights * weights)
+
+            pre = activations @ weights
+            pre_mean = fnp.mean(pre, axis=0)
+            pre = pre - pre_mean[None, :] + linear_mean[None, :]
+
+            centered = pre - linear_mean[None, :]
+            sample_var = fnp.mean(centered * centered, axis=0)
+            pre_var = fnp.maximum(
+                (1.0 - sample_weight) * diag_var + sample_weight * sample_var,
+                _VAR_FLOOR,
+            )
+
+            normal_mean, normal_second = _normal_relu_moments(linear_mean, pre_var)
+
+            raw = fnp.maximum(pre, 0.0)
+            sample_mean = fnp.mean(raw, axis=0)
+            sample_second = fnp.mean(raw * raw, axis=0)
+
+            layer_mean = fnp.maximum(
+                (1.0 - sample_weight) * normal_mean + sample_weight * sample_mean,
+                0.0,
+            )
+            layer_second = fnp.maximum(
+                (1.0 - sample_weight) * normal_second + sample_weight * sample_second,
+                layer_mean * layer_mean,
+            )
+            layer_var = fnp.maximum(layer_second - layer_mean * layer_mean, _VAR_FLOOR)
+
+            activations = _match_moments(raw, layer_mean, layer_var)
+
+            rows.append(layer_mean)
+            previous_mean = layer_mean
+            previous_var = layer_var
+
+        return fnp.asarray(fnp.stack(rows, axis=0), dtype=fnp.float32)
+```
+tokens used
+25,920

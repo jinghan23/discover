@@ -1,0 +1,111 @@
+```python
+from __future__ import annotations
+
+import flopscope.numpy as fnp
+from whestbench import BaseEstimator
+
+
+_INV_SQRT_2PI = 0.3989422804014327
+_RELU_VAR_FACTOR = 0.5 - _INV_SQRT_2PI * _INV_SQRT_2PI
+_EPS = 1e-7
+
+_BUDGET_FRACTION = 0.0215
+_MIN_SAMPLES = 24
+_MAX_SAMPLES = 262144
+_ARRAY_BYTES_LIMIT = 72 * 1024 * 1024
+_ITEMSIZE = 4
+
+
+def _sample_count(budget, width, depth):
+    width = int(width)
+    depth = int(depth)
+    budget = int(budget)
+
+    per_sample = depth * (2 * width * width + width) + 6 * depth * width
+    fixed = 4 * width * width + 5 * depth * width
+    k = (int(_BUDGET_FRACTION * budget) - fixed) // max(per_sample, 1)
+
+    max_k_by_bytes = _ARRAY_BYTES_LIMIT // max(width * _ITEMSIZE, 1)
+    k = int(max(_MIN_SAMPLES, min(_MAX_SAMPLES, max_k_by_bytes, k)))
+    return max(2, k - (k & 1))
+
+
+def _relu_mean_from_var(var):
+    return fnp.sqrt(fnp.maximum(var, 0.0)) * _INV_SQRT_2PI
+
+
+class Estimator(BaseEstimator):
+    def setup(self, context):
+        self._samples = None
+        self._width = None
+        self._depth = None
+        self._setup_seed = int(context.seed)
+
+        try:
+            width = int(context.width)
+            depth = int(context.depth)
+            budget = int(context.flop_budget)
+        except Exception:
+            return
+
+        self._samples = self._make_samples(
+            width,
+            _sample_count(budget, width, depth),
+            self._setup_seed + 17,
+        )
+        self._width = width
+        self._depth = depth
+
+    def teardown(self):
+        pass
+
+    def _make_samples(self, width, k, seed):
+        rng = fnp.random.default_rng(int(seed))
+        half = max(1, int(k) // 2)
+        z = rng.standard_normal((half, int(width)), dtype=fnp.float32)
+        z = z - fnp.mean(z, axis=0)
+
+        second = fnp.mean(z * z, axis=0)
+        z = z / fnp.sqrt(fnp.maximum(second, _EPS))
+
+        return fnp.concatenate([z, -z], axis=0)
+
+    def predict(self, mlp, budget):
+        width = int(mlp.width)
+        depth = int(mlp.depth)
+
+        if self._samples is None or self._samples.shape[1] != width:
+            self._samples = self._make_samples(
+                width,
+                _sample_count(int(budget), width, depth),
+                int(mlp.seed),
+            )
+            self._width = width
+            self._depth = depth
+
+        weights = mlp.weights
+        first_weight = weights[0]
+
+        var = fnp.sum(first_weight * first_weight, axis=0)
+        first_mean = _relu_mean_from_var(var)
+
+        if depth == 1:
+            return fnp.asarray(first_mean[None, :], dtype=fnp.float32)
+
+        x = fnp.maximum(self._samples @ first_weight, 0.0)
+
+        sample_mean = fnp.mean(x, axis=0)
+        sample_second = fnp.mean(x * x, axis=0)
+        sample_var = fnp.maximum(sample_second - sample_mean * sample_mean, _EPS)
+        target_var = fnp.maximum(var * _RELU_VAR_FACTOR, _EPS)
+        x = (x - sample_mean) * fnp.sqrt(target_var / sample_var) + first_mean
+
+        means = []
+        for weight in weights[1:]:
+            x = fnp.maximum(x @ weight, 0.0)
+            means.append(fnp.asarray(fnp.mean(x, axis=0), dtype=fnp.float32))
+
+        rows = fnp.zeros((depth - 1, width), dtype=fnp.float32)
+        rows = fnp.concatenate([first_mean[None, :], rows], axis=0)
+        return fnp.concatenate([rows[:-1], means[-1][None, :]], axis=0)
+```

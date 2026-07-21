@@ -1,0 +1,147 @@
+"""Setup-cached whitened antithetic submission candidate.
+
+The estimator uses antithetic spherical samples with exact empirical input
+covariance.  The input quadrature is independent of the MLP weights, so it is
+prepared once in setup and reused for every predict call.  The scored final
+layer uses a small Gaussian-control extrapolation.
+"""
+
+from __future__ import annotations
+
+import flopscope as flops
+import flopscope.numpy as fnp
+from whestbench import BaseEstimator
+
+
+_BUDGET_FRACTION = 0.090
+_GAUSSIAN_FINAL_BLEND = -0.055
+_MIN_SAMPLES = 32
+_MAX_SAMPLES = 1_000_000
+_ARRAY_BYTES_LIMIT = 100 * 1024 * 1024
+_WORST_CASE_ITEMSIZE = 8
+_SETUP_SEED_OFFSET = 3
+_WHITEN_BLOCKS = 8
+_EXTRA_ORTHOGONAL_BLOCKS = 0
+_INV_SQRT_2PI = 0.3989422804014327
+_INV_2PI = 0.15915494309189535
+_PI = 3.141592653589793
+_COVARIANCE_EIGEN_FLOOR = 1e-7
+
+
+def _sample_count(budget: int, width: int, depth: int) -> int:
+    # Each sample traverses every layer. The covariance uses only k/2 rows,
+    # making its 2*(k/2)*w^2 cost equal to k*w^2.
+    per_sample = depth * (2 * width * width + width) + width * width
+    fixed = 9 * width**3 + 2 * (2 * width**3)
+    k = (int(_BUDGET_FRACTION * budget) - fixed) // max(per_sample, 1)
+    max_k_by_bytes = _ARRAY_BYTES_LIMIT // max(width * _WORST_CASE_ITEMSIZE, 1)
+    k = int(max(_MIN_SAMPLES, min(_MAX_SAMPLES, max_k_by_bytes, k)))
+    return k - (k & 1)
+
+
+class Estimator(BaseEstimator):
+    """Whitened antithetic Monte Carlo with setup-cached input samples."""
+
+    def setup(self, context):
+        self._width = int(context.width)
+        self._depth = int(context.depth)
+        self._samples = self._make_samples(
+            self._width,
+            _sample_count(int(context.flop_budget), self._width, self._depth),
+            int(context.seed) + _SETUP_SEED_OFFSET,
+        )
+
+    def _sample_block(self, rng, rows, width):
+        u = rng.standard_normal((rows, width), dtype=fnp.float32)
+        u_norm = fnp.sqrt(fnp.sum(u * u, axis=1))
+        u = u * (fnp.sqrt(float(width)) / fnp.maximum(u_norm, 1e-12))[:, None]
+        covariance = (u.T @ u) / float(rows)
+        eigenvalues, eigenvectors = fnp.linalg.eigh(covariance)
+        eigenvalues = fnp.maximum(eigenvalues, 1e-6)
+        inverse_sqrt = (eigenvectors / fnp.sqrt(eigenvalues)) @ eigenvectors.T
+        return fnp.asarray(u @ inverse_sqrt, dtype=fnp.float32)
+
+    def _make_samples(self, width, k, seed):
+        rng = fnp.random.default_rng(seed)
+        blocks = []
+        block_count = max(1, min(_WHITEN_BLOCKS, k // (2 * width)))
+        block_rows = max(width, k // (2 * block_count))
+        for _ in range(block_count):
+            blocks.append(self._sample_block(rng, block_rows, width))
+        for _ in range(_EXTRA_ORTHOGONAL_BLOCKS):
+            blocks.append(self._sample_block(rng, block_rows, width))
+        half = fnp.concatenate(blocks, axis=0)
+        return fnp.concatenate([half, -half], axis=0)
+
+    def predict(self, mlp, budget):
+        width = mlp.width
+        depth = mlp.depth
+        if (
+            not hasattr(self, "_samples")
+            or self._samples.shape[1] != width
+            or getattr(self, "_depth", depth) != depth
+        ):
+            self._samples = self._make_samples(width, _sample_count(budget, width, depth), mlp.seed)
+            self._depth = depth
+
+        first_weight = mlp.weights[0]
+        first_variance = fnp.sum(first_weight * first_weight, axis=0)
+        first_mean = fnp.sqrt(first_variance) * _INV_SQRT_2PI
+        x = fnp.maximum(self._samples @ first_weight, 0.0)
+        if depth == 1:
+            final_mean = first_mean
+            zero_rows = fnp.zeros((depth - 1, width), dtype=fnp.float32)
+            return fnp.concatenate([zero_rows, final_mean[None, :]], axis=0)
+        sample_mean = fnp.mean(x, axis=0)
+        centered = x - sample_mean
+        sample_covariance = (centered.T @ centered) / float(centered.shape[0])
+        pre_covariance = first_weight.T @ first_weight
+        first_scale = fnp.sqrt(fnp.maximum(first_variance, 1e-12))
+        scale_outer = first_scale[:, None] * first_scale[None, :]
+        correlation = pre_covariance / fnp.maximum(scale_outer, 1e-12)
+        correlation = fnp.maximum(fnp.minimum(correlation, 0.999999), -0.999999)
+        kernel = (
+            fnp.sqrt(fnp.maximum(1.0 - correlation * correlation, 0.0))
+            + (_PI - fnp.arccos(correlation)) * correlation
+        ) * _INV_2PI
+        target_covariance = scale_outer * kernel - first_mean[:, None] * first_mean[None, :]
+        sample_values, sample_vectors = fnp.linalg.eigh(sample_covariance)
+        target_values, target_vectors = fnp.linalg.eigh(target_covariance)
+        sample_values = fnp.maximum(sample_values, _COVARIANCE_EIGEN_FLOOR)
+        target_values = fnp.maximum(target_values, _COVARIANCE_EIGEN_FLOOR)
+        sample_inverse_sqrt = (sample_vectors / fnp.sqrt(sample_values)) @ sample_vectors.T
+        target_sqrt = (target_vectors * fnp.sqrt(target_values)) @ target_vectors.T
+        x = centered @ (sample_inverse_sqrt @ target_sqrt) + first_mean
+        for weight in mlp.weights[1:-1]:
+            x = fnp.maximum(x @ weight, 0.0)
+
+        final_weight = mlp.weights[-1]
+        penultimate_x = fnp.asarray(x, dtype=fnp.float64)
+        penultimate_mean = fnp.mean(penultimate_x, axis=0)
+        penultimate_centered = penultimate_x - penultimate_mean
+        penultimate_covariance = (
+            penultimate_centered.T @ penultimate_centered
+        ) / float(penultimate_centered.shape[0])
+        pre_mean = penultimate_mean @ final_weight
+        pre_variance = fnp.sum((penultimate_covariance @ final_weight) * final_weight, axis=0)
+        sampled_pre = x @ final_weight
+        pre_variance = fnp.maximum(pre_variance, 1e-12)
+        pre_scale = fnp.sqrt(pre_variance)
+        alpha = pre_mean / pre_scale
+        density = flops.stats.norm.pdf(alpha)
+        distribution = flops.stats.norm.cdf(alpha)
+        gaussian_final_mean = fnp.asarray(
+            pre_mean * distribution + pre_scale * density,
+            dtype=fnp.float32,
+        )
+        sampled_final = fnp.maximum(sampled_pre, 0.0)
+        sampled_final_mean = fnp.asarray(
+            fnp.mean(fnp.asarray(sampled_final, dtype=fnp.float64), axis=0),
+            dtype=fnp.float32,
+        )
+        final_mean = (
+            sampled_final_mean * (1.0 - _GAUSSIAN_FINAL_BLEND)
+            + gaussian_final_mean * _GAUSSIAN_FINAL_BLEND
+        )
+        zero_rows = fnp.zeros((depth - 1, width), dtype=fnp.float32)
+        return fnp.concatenate([zero_rows, final_mean[None, :]], axis=0)

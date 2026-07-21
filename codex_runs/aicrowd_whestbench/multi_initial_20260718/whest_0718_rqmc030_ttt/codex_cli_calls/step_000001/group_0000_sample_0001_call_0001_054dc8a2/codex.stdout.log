@@ -1,0 +1,87 @@
+```python
+from __future__ import annotations
+
+import flopscope as flops
+import flopscope.numpy as fnp
+from whestbench import BaseEstimator
+
+
+_TARGET_FLOP_FRACTION = 0.95
+_TAIL_CLIP = 1e-12
+_ARRAY_BYTES_LIMIT = 96 * 1024 * 1024
+_FLOAT64_ITEMSIZE = 8
+
+
+def _first_primes(count: int) -> tuple[int, ...]:
+    primes = []
+    candidate = 2
+    while len(primes) < count:
+        ok = True
+        for prime in primes:
+            if prime * prime > candidate:
+                break
+            if candidate % prime == 0:
+                ok = False
+                break
+        if ok:
+            primes.append(candidate)
+        candidate += 1
+    return tuple(primes)
+
+
+def _lattice_generator(width: int) -> fnp.ndarray:
+    roots = fnp.sqrt(fnp.array(_first_primes(width), dtype=fnp.float64))
+    return roots - fnp.floor(roots)
+
+
+def _lattice_uniforms(n_samples: int, generator: fnp.ndarray, shift: fnp.ndarray) -> fnp.ndarray:
+    indices = fnp.arange(n_samples, dtype=fnp.float64)[:, None]
+    values = indices * generator[None, :] + shift[None, :]
+    return values - fnp.floor(values)
+
+
+def _exact_first_layer_mean(weight: fnp.ndarray) -> fnp.ndarray:
+    variance = fnp.sum(weight * weight, axis=0)
+    return fnp.sqrt(variance) / fnp.sqrt(2.0 * fnp.pi)
+
+
+def _sample_count(budget: int, width: int, depth: int) -> int:
+    # Antithetic samples share one uniform lattice point, so ppf work is paid once
+    # and each point contributes two forward passes.
+    lattice_per_base = 89 * width
+    forward_per_base = 2 * depth * (2 * width * width + width)
+    mean_per_base = 2 * max(depth - 1, 0) * width
+    per_base = lattice_per_base + forward_per_base + mean_per_base
+    fixed = 2 * width * width + 10 * width
+    tracked = int(_TARGET_FLOP_FRACTION * int(budget))
+    n_base = (tracked - fixed) // per_base
+    max_base_by_bytes = _ARRAY_BYTES_LIMIT // max(2 * width * _FLOAT64_ITEMSIZE, 1)
+    return int(max(1, min(n_base, max_base_by_bytes)))
+
+
+class Estimator(BaseEstimator):
+    def predict(self, mlp, budget):
+        width = mlp.width
+        depth = mlp.depth
+        n_base = _sample_count(budget, width, depth)
+
+        rng = fnp.random.default_rng(mlp.seed)
+        generator = _lattice_generator(width)
+        shift = rng.random(width)
+
+        uniforms = _lattice_uniforms(n_base, generator, shift)
+        uniforms = fnp.clip(uniforms, _TAIL_CLIP, 1.0 - _TAIL_CLIP)
+
+        z = flops.stats.norm.ppf(uniforms)
+        activations = fnp.concatenate((z, -z), axis=0)
+
+        rows = []
+        for layer_index, weight in enumerate(mlp.weights):
+            activations = fnp.maximum(activations @ weight, 0.0)
+            if layer_index == 0:
+                rows.append(_exact_first_layer_mean(weight))
+            else:
+                rows.append(fnp.mean(activations, axis=0))
+
+        return fnp.stack(rows, axis=0)
+```

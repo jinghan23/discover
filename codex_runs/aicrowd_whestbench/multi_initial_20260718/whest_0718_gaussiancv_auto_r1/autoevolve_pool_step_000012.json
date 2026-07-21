@@ -1,0 +1,2736 @@
+{
+  "initial_states": [
+    {
+      "code": "from __future__ import annotations\n\nimport flopscope.numpy as fnp\nimport flopscope as flops\nfrom whestbench import BaseEstimator\n\n\nclass Estimator(BaseEstimator):\n    def predict(self, mlp, budget):\n        width = int(mlp.width)\n        depth = int(mlp.depth)\n        d_mu = fnp.zeros(width)\n        d_var = fnp.ones(width)\n        diag_rows = []\n        diag_vars = []\n        for w in mlp.weights:\n            d_mu_pre = w.T @ d_mu\n            d_var_pre = (w * w).T @ d_var\n            d_var_pre = fnp.maximum(d_var_pre, 1e-12)\n            d_sigma = fnp.sqrt(d_var_pre)\n            d_alpha = d_mu_pre / d_sigma\n            d_phi = flops.stats.norm.pdf(d_alpha)\n            d_cdf = flops.stats.norm.cdf(d_alpha)\n            d_mu = d_mu_pre * d_cdf + d_sigma * d_phi\n            d_ez2 = (d_mu_pre * d_mu_pre + d_var_pre) * d_cdf + d_mu_pre * d_sigma * d_phi\n            d_var = fnp.maximum(d_ez2 - d_mu * d_mu, 0.0)\n            diag_rows.append(d_mu)\n            diag_vars.append(d_var)\n\n        if depth == 1:\n            return fnp.asarray(fnp.stack(diag_rows, axis=0), dtype=fnp.float32)\n\n        per_sample = max(1, depth * (2 * width * width + 4 * width))\n        n_samples = max(1024, int((0.625 * float(budget)) / float(per_sample)))\n        n_samples = min(n_samples, 13744)\n        n_samples = 2 * max(1, n_samples // 2)\n\n        rng = fnp.random.default_rng(int(mlp.seed) + 2)\n        eye = fnp.eye(width, dtype=fnp.float64)\n        half_samples = n_samples // 2\n        x0 = fnp.asarray(rng.standard_normal((half_samples, width), dtype=fnp.float32))\n        x = fnp.concatenate([x0, -x0], axis=0)\n\n        for i, w in enumerate(mlp.weights[:-1]):\n            z = x @ w\n            if i == 0:\n                t_cov = w.T @ w\n                z_center = z - fnp.mean(z, axis=0)\n                sample_cov = (z_center.T @ z_center) / float(n_samples)\n                s_vals, s_vecs = fnp.linalg.eigh(sample_cov)\n                t_vals, t_vecs = fnp.linalg.eigh(t_cov)\n                inv_sqrt = s_vecs @ (\n                    fnp.diag(1.0 / fnp.sqrt(fnp.maximum(s_vals, 1e-12))) @ s_vecs.T\n                )\n                target_sqrt = t_vecs @ (\n                    fnp.diag(fnp.sqrt(fnp.maximum(t_vals, 1e-12))) @ t_vecs.T\n                )\n                z = z_center @ (inv_sqrt @ target_sqrt)\n\n            x = fnp.maximum(z, 0.0)\n            if i == 0:\n                x_mean0 = fnp.mean(x, axis=0)\n                x_center = x - x_mean0\n                sample_cov = (x_center.T @ x_center) / float(n_samples)\n                s_vals, s_vecs = fnp.linalg.eigh(sample_cov)\n\n                sigma0 = fnp.sqrt(fnp.maximum(fnp.diagonal(t_cov), 1e-12))\n                scale0 = fnp.maximum(sigma0[:, None] * sigma0[None, :], 1e-12)\n                rho0 = fnp.clip(t_cov / scale0, -0.999999, 0.999999)\n                root0 = fnp.sqrt(fnp.maximum(1.0 - rho0 * rho0, 0.0))\n                pi = 3.141592653589793\n                kernel0 = (root0 + (pi - fnp.arccos(rho0)) * rho0) / (2.0 * pi)\n                target_second = (sigma0[:, None] * sigma0[None, :]) * kernel0\n                target_cov = target_second - diag_rows[0][:, None] * diag_rows[0][None, :]\n                target_cov = 0.5 * (target_cov + target_cov.T)\n                target_cov = target_cov * (1.0 - eye) + eye * diag_vars[0][None, :]\n\n                t_vals, t_vecs = fnp.linalg.eigh(target_cov)\n                inv_sqrt = s_vecs @ (\n                    fnp.diag(1.0 / fnp.sqrt(fnp.maximum(s_vals, 1e-12))) @ s_vecs.T\n                )\n                target_sqrt = t_vecs @ (\n                    fnp.diag(fnp.sqrt(fnp.maximum(t_vals, 1e-12))) @ t_vecs.T\n                )\n                x_full = x_center @ (inv_sqrt @ target_sqrt) + diag_rows[0]\n                x = (\n                    diag_rows[0]\n                    - 0.245 * (x_mean0 - diag_rows[0])\n                    + 1.455 * (x_full - diag_rows[0])\n                    - 0.455 * x_center\n                )\n\n        z = x @ mlp.weights[-1]\n        z64 = fnp.asarray(z, dtype=fnp.float64)\n        z_mean = fnp.mean(z64, axis=0)\n        z_center = z64 - z_mean\n        z_var = fnp.mean(z_center * z_center, axis=0)\n        z_sigma = fnp.sqrt(fnp.maximum(z_var, 1e-12))\n        z_alpha = z_mean / z_sigma\n        z_cdf = flops.stats.norm.cdf(z_alpha)\n        z_phi = flops.stats.norm.pdf(z_alpha)\n        final_gauss = z_mean * z_cdf + z_sigma * z_phi\n        z_alpha_md = d_mu_pre / z_sigma\n        final_mixed_diag = d_mu_pre * flops.stats.norm.cdf(z_alpha_md) + z_sigma * flops.stats.norm.pdf(z_alpha_md)\n        final_mc = fnp.sum(fnp.maximum(z64, 0.0), axis=0) / float(n_samples)\n        final = 0.99965 * (\n            1.03700 * final_mc\n            - 0.0425 * final_gauss\n            + 0.00550 * final_mixed_diag\n        )\n\n        return fnp.asarray(fnp.stack(list(diag_rows[:-1]) + [final], axis=0), dtype=fnp.float32)\n",
+      "construction": [
+        {
+          "adjusted_final_layer_score": 9.482536058775817e-08,
+          "all_layers_mse": 0.0010538659989833832,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67981626428.66584,
+          "final_layer_mse": 3.7940395714031183e-07,
+          "flops_used": 65914109312,
+          "mlp_index": 0,
+          "mlp_name": "daniel-harrison",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 2.192679158509066e-07,
+          "all_layers_mse": 0.0009419079287908971,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67088683284.821236,
+          "final_layer_mse": 8.889855962479487e-07,
+          "flops_used": 65914109312,
+          "mlp_index": 1,
+          "mlp_name": "dustin-robinson",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.4496478244810023e-07,
+          "all_layers_mse": 0.000865188252646476,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67166236378.254616,
+          "final_layer_mse": 5.870571726518392e-07,
+          "flops_used": 65914109312,
+          "mlp_index": 2,
+          "mlp_name": "cole-martin",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.044406293579984e-07,
+          "all_layers_mse": 0.00038619106635451317,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67140466682.615005,
+          "final_layer_mse": 4.2311071979383996e-07,
+          "flops_used": 65914109312,
+          "mlp_index": 3,
+          "mlp_name": "donna-clarke",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 9.839564867152271e-08,
+          "all_layers_mse": 0.0005410899175330997,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67142545394.60155,
+          "final_layer_mse": 3.9860890410636785e-07,
+          "flops_used": 65914109312,
+          "mlp_index": 4,
+          "mlp_name": "rebecca-walker",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 2.687352494722336e-07,
+          "all_layers_mse": 0.0006383643485605717,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67193144895.138466,
+          "final_layer_mse": 1.087848886527354e-06,
+          "flops_used": 65914109312,
+          "mlp_index": 5,
+          "mlp_name": "monique-stevens",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.1526319325147918e-07,
+          "all_layers_mse": 0.000959805038291961,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67195773832.50209,
+          "final_layer_mse": 4.6657083885293105e-07,
+          "flops_used": 65914109312,
+          "mlp_index": 6,
+          "mlp_name": "keith-brock",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.4908338678158717e-07,
+          "all_layers_mse": 0.0007104045944288373,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67181889675.55972,
+          "final_layer_mse": 6.035954243088781e-07,
+          "flops_used": 65914109312,
+          "mlp_index": 7,
+          "mlp_name": "robert-huff",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.8566046518703438e-07,
+          "all_layers_mse": 0.00068663340061903,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67160689048.471176,
+          "final_layer_mse": 7.519226983276894e-07,
+          "flops_used": 65914109312,
+          "mlp_index": 8,
+          "mlp_name": "kimberly-caldwell",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.018178048049032e-07,
+          "all_layers_mse": 0.0007817627629265189,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67204923890.53317,
+          "final_layer_mse": 4.1208949141946505e-07,
+          "flops_used": 65914109312,
+          "mlp_index": 9,
+          "mlp_name": "annette-hansen",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        }
+      ],
+      "id": "32cb3951-d448-40bd-a4be-7ad947807ab1",
+      "metadata": {
+        "baseline_all_layers_mse": 0.000785627873847261,
+        "baseline_final_layer_mse": 0.0009320092955022119,
+        "challenge": "ARC White-Box Estimation Challenge 2026",
+        "initial_adjusted_final_layer_score": 1.4824544364135236e-07,
+        "initial_all_layers_mse": 0.0007565213309135288,
+        "initial_estimator_path": "/opt/tiger/discover/codex_runs/aicrowd_whestbench/multi_initial_20260718/initial_states/gaussiancv/estimator.py",
+        "initial_final_layer_mse": 5.999193689376625e-07,
+        "official_suite": {
+          "dataset": "aicrowd/arc-whestbench-public-2026",
+          "depth": 32,
+          "flop_budget": 272000000000,
+          "lambda_flops_per_second": 100000000000.0,
+          "n_mlps": 10,
+          "revision": "v1-phase1",
+          "runner": "subprocess",
+          "split": "mini",
+          "width": 256
+        }
+      },
+      "observation": "",
+      "parent_values": [],
+      "parents": [],
+      "timestep": -1,
+      "type": "State",
+      "value": -1.4824544364135236e-07
+    }
+  ],
+  "states": [
+    {
+      "code": "from __future__ import annotations\n\nimport flopscope.numpy as fnp\nimport flopscope as flops\nfrom whestbench import BaseEstimator\n\n\nclass Estimator(BaseEstimator):\n    def predict(self, mlp, budget):\n        width = int(mlp.width)\n        depth = int(mlp.depth)\n        d_mu = fnp.zeros(width)\n        d_var = fnp.ones(width)\n        diag_rows = []\n        diag_vars = []\n        for w in mlp.weights:\n            d_mu_pre = w.T @ d_mu\n            d_var_pre = (w * w).T @ d_var\n            d_var_pre = fnp.maximum(d_var_pre, 1e-12)\n            d_sigma = fnp.sqrt(d_var_pre)\n            d_alpha = d_mu_pre / d_sigma\n            d_phi = flops.stats.norm.pdf(d_alpha)\n            d_cdf = flops.stats.norm.cdf(d_alpha)\n            d_mu = d_mu_pre * d_cdf + d_sigma * d_phi\n            d_ez2 = (d_mu_pre * d_mu_pre + d_var_pre) * d_cdf + d_mu_pre * d_sigma * d_phi\n            d_var = fnp.maximum(d_ez2 - d_mu * d_mu, 0.0)\n            diag_rows.append(d_mu)\n            diag_vars.append(d_var)\n\n        if depth == 1:\n            return fnp.asarray(fnp.stack(diag_rows, axis=0), dtype=fnp.float32)\n\n        per_sample = max(1, depth * (2 * width * width + 4 * width))\n        n_samples = max(1024, int((0.625 * float(budget)) / float(per_sample)))\n        n_samples = min(n_samples, 13744)\n        n_samples = 2 * max(1, n_samples // 2)\n\n        rng = fnp.random.default_rng(int(mlp.seed) + 2)\n        eye = fnp.eye(width, dtype=fnp.float64)\n        half_samples = n_samples // 2\n        x0 = fnp.asarray(rng.standard_normal((half_samples, width), dtype=fnp.float32))\n        x = fnp.concatenate([x0, -x0], axis=0)\n\n        for i, w in enumerate(mlp.weights[:-1]):\n            z = x @ w\n            if i == 0:\n                t_cov = w.T @ w\n                z_center = z - fnp.mean(z, axis=0)\n                sample_cov = (z_center.T @ z_center) / float(n_samples)\n                s_vals, s_vecs = fnp.linalg.eigh(sample_cov)\n                t_vals, t_vecs = fnp.linalg.eigh(t_cov)\n                inv_sqrt = s_vecs @ (\n                    fnp.diag(1.0 / fnp.sqrt(fnp.maximum(s_vals, 1e-12))) @ s_vecs.T\n                )\n                target_sqrt = t_vecs @ (\n                    fnp.diag(fnp.sqrt(fnp.maximum(t_vals, 1e-12))) @ t_vecs.T\n                )\n                z = z_center @ (inv_sqrt @ target_sqrt)\n\n            x = fnp.maximum(z, 0.0)\n            if i == 0:\n                x_mean0 = fnp.mean(x, axis=0)\n                x_center = x - x_mean0\n                sample_cov = (x_center.T @ x_center) / float(n_samples)\n                s_vals, s_vecs = fnp.linalg.eigh(sample_cov)\n\n                sigma0 = fnp.sqrt(fnp.maximum(fnp.diagonal(t_cov), 1e-12))\n                scale0 = fnp.maximum(sigma0[:, None] * sigma0[None, :], 1e-12)\n                rho0 = fnp.clip(t_cov / scale0, -0.999999, 0.999999)\n                root0 = fnp.sqrt(fnp.maximum(1.0 - rho0 * rho0, 0.0))\n                pi = 3.141592653589793\n                kernel0 = (root0 + (pi - fnp.arccos(rho0)) * rho0) / (2.0 * pi)\n                target_second = (sigma0[:, None] * sigma0[None, :]) * kernel0\n                target_cov = target_second - diag_rows[0][:, None] * diag_rows[0][None, :]\n                target_cov = 0.5 * (target_cov + target_cov.T)\n                target_cov = target_cov * (1.0 - eye) + eye * diag_vars[0][None, :]\n\n                t_vals, t_vecs = fnp.linalg.eigh(target_cov)\n                inv_sqrt = s_vecs @ (\n                    fnp.diag(1.0 / fnp.sqrt(fnp.maximum(s_vals, 1e-12))) @ s_vecs.T\n                )\n                target_sqrt = t_vecs @ (\n                    fnp.diag(fnp.sqrt(fnp.maximum(t_vals, 1e-12))) @ t_vecs.T\n                )\n                x_full = x_center @ (inv_sqrt @ target_sqrt) + diag_rows[0]\n                x = (\n                    diag_rows[0]\n                    - 0.245 * (x_mean0 - diag_rows[0])\n                    + 1.455 * (x_full - diag_rows[0])\n                    - 0.455 * x_center\n                )\n\n        z = x @ mlp.weights[-1]\n        z64 = fnp.asarray(z, dtype=fnp.float64)\n        z_mean = fnp.mean(z64, axis=0)\n        z_center = z64 - z_mean\n        z_var = fnp.mean(z_center * z_center, axis=0)\n        z_sigma = fnp.sqrt(fnp.maximum(z_var, 1e-12))\n        z_alpha = z_mean / z_sigma\n        z_cdf = flops.stats.norm.cdf(z_alpha)\n        z_phi = flops.stats.norm.pdf(z_alpha)\n        final_gauss = z_mean * z_cdf + z_sigma * z_phi\n        z_alpha_md = d_mu_pre / z_sigma\n        final_mixed_diag = d_mu_pre * flops.stats.norm.cdf(z_alpha_md) + z_sigma * flops.stats.norm.pdf(z_alpha_md)\n        final_mc = fnp.sum(fnp.maximum(z64, 0.0), axis=0) / float(n_samples)\n        final = 0.99965 * (\n            1.03700 * final_mc\n            - 0.0425 * final_gauss\n            + 0.00550 * final_mixed_diag\n        )\n\n        return fnp.asarray(fnp.stack(list(diag_rows[:-1]) + [final], axis=0), dtype=fnp.float32)\n",
+      "construction": [
+        {
+          "adjusted_final_layer_score": 9.482536058775817e-08,
+          "all_layers_mse": 0.0010538659989833832,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67981626428.66584,
+          "final_layer_mse": 3.7940395714031183e-07,
+          "flops_used": 65914109312,
+          "mlp_index": 0,
+          "mlp_name": "daniel-harrison",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 2.192679158509066e-07,
+          "all_layers_mse": 0.0009419079287908971,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67088683284.821236,
+          "final_layer_mse": 8.889855962479487e-07,
+          "flops_used": 65914109312,
+          "mlp_index": 1,
+          "mlp_name": "dustin-robinson",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.4496478244810023e-07,
+          "all_layers_mse": 0.000865188252646476,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67166236378.254616,
+          "final_layer_mse": 5.870571726518392e-07,
+          "flops_used": 65914109312,
+          "mlp_index": 2,
+          "mlp_name": "cole-martin",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.044406293579984e-07,
+          "all_layers_mse": 0.00038619106635451317,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67140466682.615005,
+          "final_layer_mse": 4.2311071979383996e-07,
+          "flops_used": 65914109312,
+          "mlp_index": 3,
+          "mlp_name": "donna-clarke",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 9.839564867152271e-08,
+          "all_layers_mse": 0.0005410899175330997,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67142545394.60155,
+          "final_layer_mse": 3.9860890410636785e-07,
+          "flops_used": 65914109312,
+          "mlp_index": 4,
+          "mlp_name": "rebecca-walker",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 2.687352494722336e-07,
+          "all_layers_mse": 0.0006383643485605717,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67193144895.138466,
+          "final_layer_mse": 1.087848886527354e-06,
+          "flops_used": 65914109312,
+          "mlp_index": 5,
+          "mlp_name": "monique-stevens",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.1526319325147918e-07,
+          "all_layers_mse": 0.000959805038291961,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67195773832.50209,
+          "final_layer_mse": 4.6657083885293105e-07,
+          "flops_used": 65914109312,
+          "mlp_index": 6,
+          "mlp_name": "keith-brock",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.4908338678158717e-07,
+          "all_layers_mse": 0.0007104045944288373,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67181889675.55972,
+          "final_layer_mse": 6.035954243088781e-07,
+          "flops_used": 65914109312,
+          "mlp_index": 7,
+          "mlp_name": "robert-huff",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.8566046518703438e-07,
+          "all_layers_mse": 0.00068663340061903,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67160689048.471176,
+          "final_layer_mse": 7.519226983276894e-07,
+          "flops_used": 65914109312,
+          "mlp_index": 8,
+          "mlp_name": "kimberly-caldwell",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.018178048049032e-07,
+          "all_layers_mse": 0.0007817627629265189,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67204923890.53317,
+          "final_layer_mse": 4.1208949141946505e-07,
+          "flops_used": 65914109312,
+          "mlp_index": 9,
+          "mlp_name": "annette-hansen",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        }
+      ],
+      "id": "32cb3951-d448-40bd-a4be-7ad947807ab1",
+      "metadata": {
+        "baseline_all_layers_mse": 0.000785627873847261,
+        "baseline_final_layer_mse": 0.0009320092955022119,
+        "challenge": "ARC White-Box Estimation Challenge 2026",
+        "initial_adjusted_final_layer_score": 1.4824544364135236e-07,
+        "initial_all_layers_mse": 0.0007565213309135288,
+        "initial_estimator_path": "/opt/tiger/discover/codex_runs/aicrowd_whestbench/multi_initial_20260718/initial_states/gaussiancv/estimator.py",
+        "initial_final_layer_mse": 5.999193689376625e-07,
+        "official_suite": {
+          "dataset": "aicrowd/arc-whestbench-public-2026",
+          "depth": 32,
+          "flop_budget": 272000000000,
+          "lambda_flops_per_second": 100000000000.0,
+          "n_mlps": 10,
+          "revision": "v1-phase1",
+          "runner": "subprocess",
+          "split": "mini",
+          "width": 256
+        }
+      },
+      "observation": "",
+      "parent_values": [],
+      "parents": [],
+      "timestep": -1,
+      "type": "State",
+      "value": -1.4824544364135236e-07
+    },
+    {
+      "code": "from __future__ import annotations\n\nimport flopscope.numpy as fnp\nimport flopscope as flops\nfrom whestbench import BaseEstimator\n\n\nclass Estimator(BaseEstimator):\n    def predict(self, mlp, budget):\n        width = int(mlp.width)\n        depth = int(mlp.depth)\n        d_mu = fnp.zeros(width)\n        d_var = fnp.ones(width)\n        diag_rows = []\n        diag_vars = []\n        for w in mlp.weights:\n            d_mu_pre = w.T @ d_mu\n            d_var_pre = (w * w).T @ d_var\n            d_var_pre = fnp.maximum(d_var_pre, 1e-12)\n            d_sigma = fnp.sqrt(d_var_pre)\n            d_alpha = d_mu_pre / d_sigma\n            d_phi = flops.stats.norm.pdf(d_alpha)\n            d_cdf = flops.stats.norm.cdf(d_alpha)\n            d_mu = d_mu_pre * d_cdf + d_sigma * d_phi\n            d_ez2 = (d_mu_pre * d_mu_pre + d_var_pre) * d_cdf + d_mu_pre * d_sigma * d_phi\n            d_var = fnp.maximum(d_ez2 - d_mu * d_mu, 0.0)\n            diag_rows.append(d_mu)\n            diag_vars.append(d_var)\n\n        if depth == 1:\n            return fnp.asarray(fnp.stack(diag_rows, axis=0), dtype=fnp.float32)\n\n        per_sample = max(1, depth * (2 * width * width + 4 * width))\n        n_samples = max(1024, int((0.625 * float(budget)) / float(per_sample)))\n        n_samples = min(n_samples, 13744)\n        n_samples = 2 * max(1, n_samples // 2)\n\n        rng = fnp.random.default_rng(int(mlp.seed) + 2)\n        eye = fnp.eye(width, dtype=fnp.float64)\n        half_samples = n_samples // 2\n        x0 = fnp.asarray(rng.standard_normal((half_samples, width), dtype=fnp.float32))\n        x = fnp.concatenate([x0, -x0], axis=0)\n\n        for i, w in enumerate(mlp.weights[:-1]):\n            z = x @ w\n            if i == 0:\n                t_cov = w.T @ w\n                z_center = z - fnp.mean(z, axis=0)\n                sample_cov = (z_center.T @ z_center) / float(n_samples)\n                s_vals, s_vecs = fnp.linalg.eigh(sample_cov)\n                t_vals, t_vecs = fnp.linalg.eigh(t_cov)\n                inv_sqrt = s_vecs @ (\n                    fnp.diag(1.0 / fnp.sqrt(fnp.maximum(s_vals, 1e-12))) @ s_vecs.T\n                )\n                target_sqrt = t_vecs @ (\n                    fnp.diag(fnp.sqrt(fnp.maximum(t_vals, 1e-12))) @ t_vecs.T\n                )\n                z = z_center @ (inv_sqrt @ target_sqrt)\n\n            x = fnp.maximum(z, 0.0)\n            if i == 0:\n                x_mean0 = fnp.mean(x, axis=0)\n                x_center = x - x_mean0\n                sample_cov = (x_center.T @ x_center) / float(n_samples)\n                s_vals, s_vecs = fnp.linalg.eigh(sample_cov)\n\n                sigma0 = fnp.sqrt(fnp.maximum(fnp.diagonal(t_cov), 1e-12))\n                scale0 = fnp.maximum(sigma0[:, None] * sigma0[None, :], 1e-12)\n                rho0 = fnp.clip(t_cov / scale0, -0.999999, 0.999999)\n                root0 = fnp.sqrt(fnp.maximum(1.0 - rho0 * rho0, 0.0))\n                pi = 3.141592653589793\n                kernel0 = (root0 + (pi - fnp.arccos(rho0)) * rho0) / (2.0 * pi)\n                target_second = (sigma0[:, None] * sigma0[None, :]) * kernel0\n                target_cov = target_second - diag_rows[0][:, None] * diag_rows[0][None, :]\n                target_cov = 0.5 * (target_cov + target_cov.T)\n                target_cov = target_cov * (1.0 - eye) + eye * diag_vars[0][None, :]\n\n                t_vals, t_vecs = fnp.linalg.eigh(target_cov)\n                inv_sqrt = s_vecs @ (\n                    fnp.diag(1.0 / fnp.sqrt(fnp.maximum(s_vals, 1e-12))) @ s_vecs.T\n                )\n                target_sqrt = t_vecs @ (\n                    fnp.diag(fnp.sqrt(fnp.maximum(t_vals, 1e-12))) @ t_vecs.T\n                )\n                x_full = x_center @ (inv_sqrt @ target_sqrt) + diag_rows[0]\n                x = (\n                    diag_rows[0]\n                    - 0.245 * (x_mean0 - diag_rows[0])\n                    + 1.455 * (x_full - diag_rows[0])\n                    - 0.455 * x_center\n                )\n\n        z = x @ mlp.weights[-1]\n        z64 = fnp.asarray(z, dtype=fnp.float64)\n        z_mean = fnp.mean(z64, axis=0)\n        z_center = z64 - z_mean\n        z_var = fnp.mean(z_center * z_center, axis=0)\n        z_sigma = fnp.sqrt(fnp.maximum(z_var, 1e-12))\n        z_alpha = z_mean / z_sigma\n        z_cdf = flops.stats.norm.cdf(z_alpha)\n        z_phi = flops.stats.norm.pdf(z_alpha)\n        final_gauss = z_mean * z_cdf + z_sigma * z_phi\n        z_alpha_md = d_mu_pre / z_sigma\n        final_mixed_diag = d_mu_pre * flops.stats.norm.cdf(z_alpha_md) + z_sigma * flops.stats.norm.pdf(z_alpha_md)\n        final_mc = fnp.sum(fnp.maximum(z64, 0.0), axis=0) / float(n_samples)\n        final = 0.99965 * (\n            1.03700 * final_mc\n            - 0.0425 * final_gauss\n            + 0.00400 * final_mixed_diag\n            + 0.00150 * diag_rows[-1]\n        )\n\n        return fnp.asarray(fnp.stack(list(diag_rows[:-1]) + [final], axis=0), dtype=fnp.float32)\n",
+      "construction": [
+        {
+          "adjusted_final_layer_score": 9.472900922464866e-08,
+          "all_layers_mse": 0.0010538659989833832,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67887631533.44214,
+          "final_layer_mse": 3.795432235165208e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 0,
+          "mlp_name": "daniel-harrison",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 2.1909928576081277e-07,
+          "all_layers_mse": 0.0009419078705832362,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67083774609.26592,
+          "final_layer_mse": 8.883669124770677e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 1,
+          "mlp_name": "dustin-robinson",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.454091934271804e-07,
+          "all_layers_mse": 0.0008651883690617979,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67099157450.49536,
+          "final_layer_mse": 5.894455625821138e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 2,
+          "mlp_name": "cole-martin",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.0429608898918223e-07,
+          "all_layers_mse": 0.00038619106635451317,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67083214325.605034,
+          "final_layer_mse": 4.228857619636983e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 3,
+          "mlp_name": "donna-clarke",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 9.836166029807725e-08,
+          "all_layers_mse": 0.0005410899175330997,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67114514587.22174,
+          "final_layer_mse": 3.98637638454602e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 4,
+          "mlp_name": "rebecca-walker",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 2.685421411021308e-07,
+          "all_layers_mse": 0.0006383643485605717,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67171817375.12171,
+          "final_layer_mse": 1.0874123290705029e-06,
+          "flops_used": 65914109824,
+          "mlp_index": 5,
+          "mlp_name": "monique-stevens",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.1508914654696577e-07,
+          "all_layers_mse": 0.000959805038291961,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67149350149.33169,
+          "final_layer_mse": 4.6618839633083553e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 6,
+          "mlp_name": "keith-brock",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.4868751137469158e-07,
+          "all_layers_mse": 0.0007104045944288373,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67131821540.890335,
+          "final_layer_mse": 6.024416165928415e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 7,
+          "mlp_name": "robert-huff",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.857614319900835e-07,
+          "all_layers_mse": 0.00068663340061903,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67102645812.33084,
+          "final_layer_mse": 7.529823733420926e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 8,
+          "mlp_name": "kimberly-caldwell",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.0143876527874648e-07,
+          "all_layers_mse": 0.0007817627629265189,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67115974901.01874,
+          "final_layer_mse": 4.110995064365852e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 9,
+          "mlp_name": "annette-hansen",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        }
+      ],
+      "id": "4d3fd094-b095-4bd7-989f-804c5d1c70fa",
+      "metadata": {},
+      "observation": "pass score=1.48141e-07",
+      "parent_values": [
+        -1.4824544364135236e-07
+      ],
+      "parents": [
+        {
+          "id": "32cb3951-d448-40bd-a4be-7ad947807ab1",
+          "timestep": -1
+        }
+      ],
+      "timestep": 0,
+      "type": "State",
+      "value": -1.4814142339925195e-07
+    },
+    {
+      "code": "from __future__ import annotations\n\nimport flopscope.numpy as fnp\nimport flopscope as flops\nfrom whestbench import BaseEstimator\n\n\nclass Estimator(BaseEstimator):\n    def predict(self, mlp, budget):\n        width = int(mlp.width)\n        depth = int(mlp.depth)\n        d_mu = fnp.zeros(width)\n        d_var = fnp.ones(width)\n        diag_rows = []\n        diag_vars = []\n\n        for w in mlp.weights:\n            d_mu_pre = w.T @ d_mu\n            d_var_pre = (w * w).T @ d_var\n            d_var_pre = fnp.maximum(d_var_pre, 1e-12)\n            d_sigma = fnp.sqrt(d_var_pre)\n            d_alpha = d_mu_pre / d_sigma\n            d_phi = flops.stats.norm.pdf(d_alpha)\n            d_cdf = flops.stats.norm.cdf(d_alpha)\n            d_mu = d_mu_pre * d_cdf + d_sigma * d_phi\n            d_ez2 = (d_mu_pre * d_mu_pre + d_var_pre) * d_cdf + d_mu_pre * d_sigma * d_phi\n            d_var = fnp.maximum(d_ez2 - d_mu * d_mu, 0.0)\n            diag_rows.append(d_mu)\n            diag_vars.append(d_var)\n\n        if depth == 1:\n            return fnp.asarray(fnp.stack(diag_rows, axis=0), dtype=fnp.float32)\n\n        per_sample = max(1, depth * (2 * width * width + 4 * width))\n        n_samples = max(1024, int((0.625 * float(budget)) / float(per_sample)))\n        n_samples = min(n_samples, 13744)\n        n_samples = 2 * max(1, n_samples // 2)\n\n        rng = fnp.random.default_rng(int(mlp.seed) + 2)\n        eye = fnp.eye(width, dtype=fnp.float64)\n        half_samples = n_samples // 2\n        x0 = fnp.asarray(rng.standard_normal((half_samples, width), dtype=fnp.float32))\n        x = fnp.concatenate([x0, -x0], axis=0)\n\n        for i, w in enumerate(mlp.weights[:-1]):\n            z = x @ w\n            if i == 0:\n                t_cov = w.T @ w\n                z_center = z - fnp.mean(z, axis=0)\n                sample_cov = (z_center.T @ z_center) / float(n_samples)\n                s_vals, s_vecs = fnp.linalg.eigh(sample_cov)\n                t_vals, t_vecs = fnp.linalg.eigh(t_cov)\n                inv_sqrt = s_vecs @ (\n                    fnp.diag(1.0 / fnp.sqrt(fnp.maximum(s_vals, 1e-12))) @ s_vecs.T\n                )\n                target_sqrt = t_vecs @ (\n                    fnp.diag(fnp.sqrt(fnp.maximum(t_vals, 1e-12))) @ t_vecs.T\n                )\n                z = z_center @ (inv_sqrt @ target_sqrt)\n\n            x = fnp.maximum(z, 0.0)\n            if i == 0:\n                x_mean0 = fnp.mean(x, axis=0)\n                x_center = x - x_mean0\n                sample_cov = (x_center.T @ x_center) / float(n_samples)\n                s_vals, s_vecs = fnp.linalg.eigh(sample_cov)\n\n                sigma0 = fnp.sqrt(fnp.maximum(fnp.diagonal(t_cov), 1e-12))\n                scale0 = fnp.maximum(sigma0[:, None] * sigma0[None, :], 1e-12)\n                rho0 = fnp.clip(t_cov / scale0, -0.999999, 0.999999)\n                root0 = fnp.sqrt(fnp.maximum(1.0 - rho0 * rho0, 0.0))\n                pi = 3.141592653589793\n                kernel0 = (root0 + (pi - fnp.arccos(rho0)) * rho0) / (2.0 * pi)\n                target_second = (sigma0[:, None] * sigma0[None, :]) * kernel0\n                target_cov = target_second - diag_rows[0][:, None] * diag_rows[0][None, :]\n                target_cov = 0.5 * (target_cov + target_cov.T)\n                target_cov = target_cov * (1.0 - eye) + eye * diag_vars[0][None, :]\n\n                t_vals, t_vecs = fnp.linalg.eigh(target_cov)\n                inv_sqrt = s_vecs @ (\n                    fnp.diag(1.0 / fnp.sqrt(fnp.maximum(s_vals, 1e-12))) @ s_vecs.T\n                )\n                target_sqrt = t_vecs @ (\n                    fnp.diag(fnp.sqrt(fnp.maximum(t_vals, 1e-12))) @ t_vecs.T\n                )\n                x_full = x_center @ (inv_sqrt @ target_sqrt) + diag_rows[0]\n                x = (\n                    diag_rows[0]\n                    - 0.245 * (x_mean0 - diag_rows[0])\n                    + 1.455 * (x_full - diag_rows[0])\n                    - 0.455 * x_center\n                )\n\n        z = x @ mlp.weights[-1]\n        z64 = fnp.asarray(z, dtype=fnp.float64)\n        z_mean = fnp.mean(z64, axis=0)\n        z_center = z64 - z_mean\n        z_var = fnp.mean(z_center * z_center, axis=0)\n        z_sigma = fnp.sqrt(fnp.maximum(z_var, 1e-12))\n        z_alpha = z_mean / z_sigma\n        z_cdf = flops.stats.norm.cdf(z_alpha)\n        z_phi = flops.stats.norm.pdf(z_alpha)\n        final_gauss = z_mean * z_cdf + z_sigma * z_phi\n        z_alpha_md = d_mu_pre / z_sigma\n        final_mixed_diag = d_mu_pre * flops.stats.norm.cdf(z_alpha_md) + z_sigma * flops.stats.norm.pdf(z_alpha_md)\n        final_mc = fnp.sum(fnp.maximum(z64, 0.0), axis=0) / float(n_samples)\n        final = 0.99965 * (\n            1.03700 * final_mc\n            - 0.0425 * final_gauss\n            + 0.00400 * final_mixed_diag\n            + 0.00150 * diag_rows[-1]\n        )\n\n        return fnp.asarray(fnp.stack(list(diag_rows[:-1]) + [final], axis=0), dtype=fnp.float32)",
+      "construction": [
+        {
+          "adjusted_final_layer_score": 9.47357382864029e-08,
+          "all_layers_mse": 0.0010538659989833832,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67892453921.7335,
+          "final_layer_mse": 3.795432235165208e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 0,
+          "mlp_name": "daniel-harrison",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 2.195001398203964e-07,
+          "all_layers_mse": 0.0009419078705832362,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67206508023.43905,
+          "final_layer_mse": 8.883669124770677e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 1,
+          "mlp_name": "dustin-robinson",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.4571774427140201e-07,
+          "all_layers_mse": 0.0008651883690617979,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67241538418.231606,
+          "final_layer_mse": 5.894455625821138e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 2,
+          "mlp_name": "cole-martin",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.0440032824182598e-07,
+          "all_layers_mse": 0.00038619106635451317,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67150260982.80966,
+          "final_layer_mse": 4.228857619636983e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 3,
+          "mlp_name": "donna-clarke",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 9.847062626804776e-08,
+          "all_layers_mse": 0.0005410899175330997,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67188864676.0565,
+          "final_layer_mse": 3.98637638454602e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 4,
+          "mlp_name": "rebecca-walker",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 2.6863741234279125e-07,
+          "all_layers_mse": 0.0006383643485605717,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67195648057.16097,
+          "final_layer_mse": 1.0874123290705029e-06,
+          "flops_used": 65914109824,
+          "mlp_index": 5,
+          "mlp_name": "monique-stevens",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.1517015470030944e-07,
+          "all_layers_mse": 0.000959805038291961,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67196614769.99342,
+          "final_layer_mse": 4.6618839633083553e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 6,
+          "mlp_name": "keith-brock",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.4877881768074874e-07,
+          "all_layers_mse": 0.0007104045944288373,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67173045975.862144,
+          "final_layer_mse": 6.024416165928415e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 7,
+          "mlp_name": "robert-huff",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.8606199712159638e-07,
+          "all_layers_mse": 0.00068663340061903,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67211219025.55048,
+          "final_layer_mse": 7.529823733420926e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 8,
+          "mlp_name": "kimberly-caldwell",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.015066153718054e-07,
+          "all_layers_mse": 0.0007817627629265189,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67160867256.81841,
+          "final_layer_mse": 4.110995064365852e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 9,
+          "mlp_name": "annette-hansen",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        }
+      ],
+      "id": "475a0f8a-6bc4-48a6-be0c-5ef1aa772d92",
+      "metadata": {},
+      "observation": "pass score=1.48298e-07",
+      "parent_values": [
+        -1.4824544364135236e-07
+      ],
+      "parents": [
+        {
+          "id": "32cb3951-d448-40bd-a4be-7ad947807ab1",
+          "timestep": -1
+        }
+      ],
+      "timestep": 0,
+      "type": "State",
+      "value": -1.4829795741053262e-07
+    },
+    {
+      "code": "from __future__ import annotations\n\nimport flopscope.numpy as fnp\nimport flopscope as flops\nfrom whestbench import BaseEstimator\n\n\nclass Estimator(BaseEstimator):\n    def predict(self, mlp, budget):\n        width = int(mlp.width)\n        depth = int(mlp.depth)\n        d_mu = fnp.zeros(width, dtype=fnp.float32)\n        d_var = fnp.ones(width, dtype=fnp.float32)\n        diag_rows = []\n        diag_vars = []\n        for w in mlp.weights:\n            d_mu_pre = w.T @ d_mu\n            d_var_pre = (w * w).T @ d_var\n            d_var_pre = fnp.maximum(d_var_pre, 1e-12)\n            d_sigma = fnp.sqrt(d_var_pre)\n            d_alpha = d_mu_pre / d_sigma\n            d_phi = flops.stats.norm.pdf(d_alpha)\n            d_cdf = flops.stats.norm.cdf(d_alpha)\n            d_mu = d_mu_pre * d_cdf + d_sigma * d_phi\n            d_ez2 = (d_mu_pre * d_mu_pre + d_var_pre) * d_cdf + d_mu_pre * d_sigma * d_phi\n            d_var = fnp.maximum(d_ez2 - d_mu * d_mu, 0.0)\n            diag_rows.append(d_mu)\n            diag_vars.append(d_var)\n\n        if depth == 1:\n            return fnp.asarray(fnp.stack(diag_rows, axis=0), dtype=fnp.float32)\n\n        per_sample = max(1, depth * (2 * width * width + 4 * width))\n        n_samples = max(1024, int((0.625 * float(budget)) / float(per_sample)))\n        n_samples = min(n_samples, 13744)\n        n_samples = 2 * max(1, n_samples // 2)\n\n        rng = fnp.random.default_rng(int(mlp.seed) + 2)\n        eye = fnp.eye(width, dtype=fnp.float32)\n        half_samples = n_samples // 2\n        x0 = fnp.asarray(rng.standard_normal((half_samples, width), dtype=fnp.float32))\n        x = fnp.concatenate([x0, -x0], axis=0)\n\n        for i, w in enumerate(mlp.weights[:-1]):\n            z = x @ w\n            if i == 0:\n                t_cov = w.T @ w\n                z_center = z - fnp.mean(z, axis=0)\n                sample_cov = (z_center.T @ z_center) / float(n_samples)\n                s_vals, s_vecs = fnp.linalg.eigh(sample_cov)\n                t_vals, t_vecs = fnp.linalg.eigh(t_cov)\n                inv_sqrt = s_vecs @ (\n                    fnp.diag(1.0 / fnp.sqrt(fnp.maximum(s_vals, 1e-12))) @ s_vecs.T\n                )\n                target_sqrt = t_vecs @ (\n                    fnp.diag(fnp.sqrt(fnp.maximum(t_vals, 1e-12))) @ t_vecs.T\n                )\n                z = z_center @ (inv_sqrt @ target_sqrt)\n\n            x = fnp.maximum(z, 0.0)\n            if i == 0:\n                x_mean0 = fnp.mean(x, axis=0)\n                x_center = x - x_mean0\n                sample_cov = (x_center.T @ x_center) / float(n_samples)\n                s_vals, s_vecs = fnp.linalg.eigh(sample_cov)\n\n                sigma0 = fnp.sqrt(fnp.maximum(fnp.diagonal(t_cov), 1e-12))\n                scale0 = fnp.maximum(sigma0[:, None] * sigma0[None, :], 1e-12)\n                rho0 = fnp.clip(t_cov / scale0, -0.999999, 0.999999)\n                root0 = fnp.sqrt(fnp.maximum(1.0 - rho0 * rho0, 0.0))\n                pi = 3.141592653589793\n                kernel0 = (root0 + (pi - fnp.arccos(rho0)) * rho0) / (2.0 * pi)\n                target_second = (sigma0[:, None] * sigma0[None, :]) * kernel0\n                target_cov = target_second - diag_rows[0][:, None] * diag_rows[0][None, :]\n                target_cov = 0.5 * (target_cov + target_cov.T)\n                target_cov = target_cov * (1.0 - eye) + eye * diag_vars[0][None, :]\n\n                t_vals, t_vecs = fnp.linalg.eigh(target_cov)\n                inv_sqrt = s_vecs @ (\n                    fnp.diag(1.0 / fnp.sqrt(fnp.maximum(s_vals, 1e-12))) @ s_vecs.T\n                )\n                target_sqrt = t_vecs @ (\n                    fnp.diag(fnp.sqrt(fnp.maximum(t_vals, 1e-12))) @ t_vecs.T\n                )\n                x_full = x_center @ (inv_sqrt @ target_sqrt) + diag_rows[0]\n                x = (\n                    diag_rows[0]\n                    - 0.245 * (x_mean0 - diag_rows[0])\n                    + 1.455 * (x_full - diag_rows[0])\n                    - 0.455 * x_center\n                )\n        z = x @ mlp.weights[-1]\n        z64 = fnp.asarray(z, dtype=fnp.float32)\n        z_mean = fnp.mean(z64, axis=0)\n        z_center = z64 - z_mean\n        z_var = fnp.mean(z_center * z_center, axis=0)\n        z_sigma = fnp.sqrt(fnp.maximum(z_var, 1e-12))\n        z_alpha = z_mean / z_sigma\n        z_cdf = flops.stats.norm.cdf(z_alpha)\n        z_phi = flops.stats.norm.pdf(z_alpha)\n        final_gauss = z_mean * z_cdf + z_sigma * z_phi\n        z_alpha_md = d_mu_pre / z_sigma\n        final_mixed_diag = d_mu_pre * flops.stats.norm.cdf(z_alpha_md) + z_sigma * flops.stats.norm.pdf(z_alpha_md)\n        final_mc = fnp.sum(fnp.maximum(z64, 0.0), axis=0) / float(n_samples)\n        final = 0.99965 * (\n            1.03700 * final_mc\n            - 0.0425 * final_gauss\n            + 0.00400 * final_mixed_diag\n            + 0.00150 * diag_rows[-1]\n        )\n\n        return fnp.asarray(fnp.stack(list(diag_rows[:-1]) + [final], axis=0), dtype=fnp.float32)\n",
+      "construction": [
+        {
+          "adjusted_final_layer_score": 9.434050494795572e-08,
+          "all_layers_mse": 0.0010538659989833832,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67629365725.21746,
+          "final_layer_mse": 3.794301051129878e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 0,
+          "mlp_name": "daniel-harrison",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 2.1952753686348933e-07,
+          "all_layers_mse": 0.0009419079287908971,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67196992514.42969,
+          "final_layer_mse": 8.886036084732041e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 1,
+          "mlp_name": "dustin-robinson",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.4557580290910395e-07,
+          "all_layers_mse": 0.0008651885436847806,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67182881114.77911,
+          "final_layer_mse": 5.893855359317968e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 2,
+          "mlp_name": "cole-martin",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.0397618764295166e-07,
+          "all_layers_mse": 0.0003861910954583436,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 66876492006.478905,
+          "final_layer_mse": 4.228918442095164e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 3,
+          "mlp_name": "donna-clarke",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 9.845270619793022e-08,
+          "all_layers_mse": 0.0005410899175330997,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67182011632.02345,
+          "final_layer_mse": 3.9860574929662107e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 4,
+          "mlp_name": "rebecca-walker",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 2.685122128701659e-07,
+          "all_layers_mse": 0.0006383642321452498,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67181349647.937416,
+          "final_layer_mse": 1.0871368658627034e-06,
+          "flops_used": 65914109824,
+          "mlp_index": 5,
+          "mlp_name": "monique-stevens",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.1514228713343286e-07,
+          "all_layers_mse": 0.0009598049218766391,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67163235423.861145,
+          "final_layer_mse": 4.6630722749796405e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 6,
+          "mlp_name": "keith-brock",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.487730259638531e-07,
+          "all_layers_mse": 0.0007104046526364982,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67160494727.78857,
+          "final_layer_mse": 6.025307470736152e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 7,
+          "mlp_name": "robert-huff",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.860292685948331e-07,
+          "all_layers_mse": 0.00068663340061903,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67183836279.21164,
+          "final_layer_mse": 7.531567689511576e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 8,
+          "mlp_name": "kimberly-caldwell",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.014750200253626e-07,
+          "all_layers_mse": 0.0007817627629265189,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67143908245.263695,
+          "final_layer_mse": 4.1107534798356937e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 9,
+          "mlp_name": "annette-hansen",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        }
+      ],
+      "id": "8cd94f60-9c3f-41f1-a8af-508a4cf08c78",
+      "metadata": {},
+      "observation": "pass score=1.4818e-07",
+      "parent_values": [
+        -1.4814142339925195e-07,
+        -1.4824544364135236e-07
+      ],
+      "parents": [
+        {
+          "id": "4d3fd094-b095-4bd7-989f-804c5d1c70fa",
+          "timestep": 0
+        },
+        {
+          "id": "32cb3951-d448-40bd-a4be-7ad947807ab1",
+          "timestep": -1
+        }
+      ],
+      "timestep": 1,
+      "type": "State",
+      "value": -1.481804553149078e-07
+    },
+    {
+      "code": "from __future__ import annotations\n\nimport flopscope.numpy as fnp\nimport flopscope as flops\nfrom whestbench import BaseEstimator\n\n\nclass Estimator(BaseEstimator):\n    def predict(self, mlp, budget):\n        width = int(mlp.width)\n        depth = int(mlp.depth)\n\n        d_mu = fnp.zeros(width, dtype=fnp.float32)\n        d_var = fnp.ones(width, dtype=fnp.float32)\n        diag_rows = []\n        diag_vars = []\n\n        for w in mlp.weights:\n            d_mu_pre = w.T @ d_mu\n            d_var_pre = (w * w).T @ d_var\n            d_var_pre = fnp.maximum(d_var_pre, 1e-12)\n            d_sigma = fnp.sqrt(d_var_pre)\n            d_alpha = d_mu_pre / d_sigma\n            d_phi = flops.stats.norm.pdf(d_alpha)\n            d_cdf = flops.stats.norm.cdf(d_alpha)\n\n            d_mu = d_mu_pre * d_cdf + d_sigma * d_phi\n            d_ez2 = (d_mu_pre * d_mu_pre + d_var_pre) * d_cdf + d_mu_pre * d_sigma * d_phi\n            d_var = fnp.maximum(d_ez2 - d_mu * d_mu, 0.0)\n\n            diag_rows.append(d_mu)\n            diag_vars.append(d_var)\n\n        if depth == 1:\n            return fnp.asarray(fnp.stack(diag_rows, axis=0), dtype=fnp.float32)\n\n        per_sample = max(1, depth * (2 * width * width + 4 * width))\n        n_samples = max(1024, int((0.625 * float(budget)) / float(per_sample)))\n        n_samples = min(n_samples, 13744)\n        n_samples = 2 * max(1, n_samples // 2)\n\n        rng = fnp.random.default_rng(int(mlp.seed) + 2)\n        eye = fnp.eye(width, dtype=fnp.float32)\n\n        half_samples = n_samples // 2\n        x0 = fnp.asarray(rng.standard_normal((half_samples, width), dtype=fnp.float32))\n        x = fnp.concatenate([x0, -x0], axis=0)\n\n        for i, w in enumerate(mlp.weights[:-1]):\n            z = x @ w\n\n            if i == 0:\n                t_cov = w.T @ w\n                z_center = z - fnp.mean(z, axis=0)\n                sample_cov = (z_center.T @ z_center) / float(n_samples)\n\n                s_vals, s_vecs = fnp.linalg.eigh(sample_cov)\n                t_vals, t_vecs = fnp.linalg.eigh(t_cov)\n\n                inv_sqrt = s_vecs @ (\n                    fnp.diag(1.0 / fnp.sqrt(fnp.maximum(s_vals, 1e-12))) @ s_vecs.T\n                )\n                target_sqrt = t_vecs @ (\n                    fnp.diag(fnp.sqrt(fnp.maximum(t_vals, 1e-12))) @ t_vecs.T\n                )\n                z = z_center @ (inv_sqrt @ target_sqrt)\n\n            x = fnp.maximum(z, 0.0)\n\n            if i == 0:\n                x_mean0 = fnp.mean(x, axis=0)\n                x_center = x - x_mean0\n                sample_cov = (x_center.T @ x_center) / float(n_samples)\n                s_vals, s_vecs = fnp.linalg.eigh(sample_cov)\n\n                sigma0 = fnp.sqrt(fnp.maximum(fnp.diagonal(t_cov), 1e-12))\n                scale0 = fnp.maximum(sigma0[:, None] * sigma0[None, :], 1e-12)\n                rho0 = fnp.clip(t_cov / scale0, -0.999999, 0.999999)\n                root0 = fnp.sqrt(fnp.maximum(1.0 - rho0 * rho0, 0.0))\n\n                pi = 3.141592653589793\n                kernel0 = (root0 + (pi - fnp.arccos(rho0)) * rho0) / (2.0 * pi)\n                target_second = (sigma0[:, None] * sigma0[None, :]) * kernel0\n                target_cov = target_second - diag_rows[0][:, None] * diag_rows[0][None, :]\n                target_cov = 0.5 * (target_cov + target_cov.T)\n                target_cov = target_cov * (1.0 - eye) + eye * diag_vars[0][None, :]\n\n                t_vals, t_vecs = fnp.linalg.eigh(target_cov)\n\n                inv_sqrt = s_vecs @ (\n                    fnp.diag(1.0 / fnp.sqrt(fnp.maximum(s_vals, 1e-12))) @ s_vecs.T\n                )\n                target_sqrt = t_vecs @ (\n                    fnp.diag(fnp.sqrt(fnp.maximum(t_vals, 1e-12))) @ t_vecs.T\n                )\n                x_full = x_center @ (inv_sqrt @ target_sqrt) + diag_rows[0]\n\n                x = (\n                    diag_rows[0]\n                    - 0.245 * (x_mean0 - diag_rows[0])\n                    + 1.455 * (x_full - diag_rows[0])\n                    - 0.455 * x_center\n                )\n\n        z = x @ mlp.weights[-1]\n        z64 = fnp.asarray(z, dtype=fnp.float32)\n        z_mean = fnp.mean(z64, axis=0)\n        z_center = z64 - z_mean\n        z_var = fnp.mean(z_center * z_center, axis=0)\n        z_sigma = fnp.sqrt(fnp.maximum(z_var, 1e-12))\n\n        z_alpha = z_mean / z_sigma\n        z_cdf = flops.stats.norm.cdf(z_alpha)\n        z_phi = flops.stats.norm.pdf(z_alpha)\n        final_gauss = z_mean * z_cdf + z_sigma * z_phi\n\n        z_alpha_md = d_mu_pre / z_sigma\n        final_mixed_diag = (\n            d_mu_pre * flops.stats.norm.cdf(z_alpha_md)\n            + z_sigma * flops.stats.norm.pdf(z_alpha_md)\n        )\n\n        final_mc = fnp.sum(fnp.maximum(z64, 0.0), axis=0) / float(n_samples)\n        final = 0.99965 * (\n            1.03700 * final_mc\n            - 0.0425 * final_gauss\n            + 0.00400 * final_mixed_diag\n            + 0.00150 * diag_rows[-1]\n        )\n\n        return fnp.asarray(fnp.stack(list(diag_rows[:-1]) + [final], axis=0), dtype=fnp.float32)",
+      "construction": [
+        {
+          "adjusted_final_layer_score": 9.442712937323229e-08,
+          "all_layers_mse": 0.0010538659989833832,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67691463706.78961,
+          "final_layer_mse": 3.794301051129878e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 0,
+          "mlp_name": "daniel-harrison",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 2.1851829381196489e-07,
+          "all_layers_mse": 0.0009419079287908971,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 66888064993.32011,
+          "final_layer_mse": 8.886036084732041e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 1,
+          "mlp_name": "dustin-robinson",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.449280792962152e-07,
+          "all_layers_mse": 0.0008651885436847806,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 66883958233.29508,
+          "final_layer_mse": 5.893855359317968e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 2,
+          "mlp_name": "cole-martin",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.0397838972065422e-07,
+          "all_layers_mse": 0.0003861910954583436,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 66877908361.85038,
+          "final_layer_mse": 4.228918442095164e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 3,
+          "mlp_name": "donna-clarke",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 9.798837323134877e-08,
+          "all_layers_mse": 0.0005410899175330997,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 66865160790.97807,
+          "final_layer_mse": 3.9860574929662107e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 4,
+          "mlp_name": "rebecca-walker",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 2.683442194273235e-07,
+          "all_layers_mse": 0.0006383642321452498,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67139317942.55793,
+          "final_layer_mse": 1.0871368658627034e-06,
+          "flops_used": 65914109824,
+          "mlp_index": 5,
+          "mlp_name": "monique-stevens",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.1514706040845333e-07,
+          "all_layers_mse": 0.0009598049218766391,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67166019705.830215,
+          "final_layer_mse": 4.6630722749796405e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 6,
+          "mlp_name": "keith-brock",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.4872108653498584e-07,
+          "all_layers_mse": 0.0007104046526364982,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67137047750.65005,
+          "final_layer_mse": 6.025307470736152e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 7,
+          "mlp_name": "robert-huff",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.8596798304550524e-07,
+          "all_layers_mse": 0.00068663340061903,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67161703211.96139,
+          "final_layer_mse": 7.531567689511576e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 8,
+          "mlp_name": "kimberly-caldwell",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.0152682891903242e-07,
+          "all_layers_mse": 0.0007817627629265189,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67178189111.6482,
+          "final_layer_mse": 4.1107534798356937e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 9,
+          "mlp_name": "annette-hansen",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        }
+      ],
+      "id": "e29bc054-1a7e-4fb4-b991-c324cb03f510",
+      "metadata": {},
+      "observation": "pass score=1.47955e-07",
+      "parent_values": [
+        -1.4814142339925195e-07,
+        -1.4824544364135236e-07
+      ],
+      "parents": [
+        {
+          "id": "4d3fd094-b095-4bd7-989f-804c5d1c70fa",
+          "timestep": 0
+        },
+        {
+          "id": "32cb3951-d448-40bd-a4be-7ad947807ab1",
+          "timestep": -1
+        }
+      ],
+      "timestep": 1,
+      "type": "State",
+      "value": -1.4795474437687154e-07
+    },
+    {
+      "code": "from __future__ import annotations\n\nimport flopscope.numpy as fnp\nimport flopscope as flops\nfrom whestbench import BaseEstimator\n\nflops.configure(symmetry_warnings=False)\n\n\nclass Estimator(BaseEstimator):\n    def predict(self, mlp, budget):\n        width = int(mlp.width)\n        depth = int(mlp.depth)\n\n        d_mu = fnp.zeros(width, dtype=fnp.float32)\n        d_var = fnp.ones(width, dtype=fnp.float32)\n        diag_rows = []\n        diag_vars = []\n\n        for w in mlp.weights:\n            d_mu_pre = w.T @ d_mu\n            d_var_pre = (w * w).T @ d_var\n            d_var_pre = fnp.maximum(d_var_pre, 1e-12)\n            d_sigma = fnp.sqrt(d_var_pre)\n            d_alpha = d_mu_pre / d_sigma\n            d_phi = flops.stats.norm.pdf(d_alpha)\n            d_cdf = flops.stats.norm.cdf(d_alpha)\n\n            d_mu = d_mu_pre * d_cdf + d_sigma * d_phi\n            d_ez2 = (d_mu_pre * d_mu_pre + d_var_pre) * d_cdf + d_mu_pre * d_sigma * d_phi\n            d_var = fnp.maximum(d_ez2 - d_mu * d_mu, 0.0)\n\n            diag_rows.append(d_mu)\n            diag_vars.append(d_var)\n\n        if depth == 1:\n            return fnp.asarray(fnp.stack(diag_rows, axis=0), dtype=fnp.float32)\n\n        per_sample = max(1, depth * (2 * width * width + 4 * width))\n        n_samples = max(1024, int((0.625 * float(budget)) / float(per_sample)))\n        n_samples = min(n_samples, 13744)\n        n_samples = 2 * max(1, n_samples // 2)\n\n        rng = fnp.random.default_rng(int(mlp.seed) + 2)\n        eye = fnp.eye(width, dtype=fnp.float32)\n\n        half_samples = n_samples // 2\n        x0 = fnp.asarray(rng.standard_normal((half_samples, width), dtype=fnp.float32))\n        x = fnp.concatenate([x0, -x0], axis=0)\n\n        for i, w in enumerate(mlp.weights[:-1]):\n            z = x @ w\n\n            if i == 0:\n                t_cov = w.T @ w\n                z_center = z - fnp.mean(z, axis=0)\n                sample_cov = (z_center.T @ z_center) / float(n_samples)\n\n                s_vals, s_vecs = fnp.linalg.eigh(sample_cov)\n                t_vals, t_vecs = fnp.linalg.eigh(t_cov)\n\n                inv_sqrt = s_vecs @ (\n                    fnp.diag(1.0 / fnp.sqrt(fnp.maximum(s_vals, 1e-12))) @ s_vecs.T\n                )\n                target_sqrt = t_vecs @ (\n                    fnp.diag(fnp.sqrt(fnp.maximum(t_vals, 1e-12))) @ t_vecs.T\n                )\n                z = z_center @ (inv_sqrt @ target_sqrt)\n\n            x = fnp.maximum(z, 0.0)\n\n            if i == 0:\n                x_mean0 = fnp.mean(x, axis=0)\n                x_center = x - x_mean0\n                sample_cov = (x_center.T @ x_center) / float(n_samples)\n                s_vals, s_vecs = fnp.linalg.eigh(sample_cov)\n\n                sigma0 = fnp.sqrt(fnp.maximum(fnp.diagonal(t_cov), 1e-12))\n                scale0 = fnp.maximum(sigma0[:, None] * sigma0[None, :], 1e-12)\n                rho0 = fnp.clip(t_cov / scale0, -0.999999, 0.999999)\n                root0 = fnp.sqrt(fnp.maximum(1.0 - rho0 * rho0, 0.0))\n\n                pi = 3.141592653589793\n                kernel0 = (root0 + (pi - fnp.arccos(rho0)) * rho0) / (2.0 * pi)\n                target_second = (sigma0[:, None] * sigma0[None, :]) * kernel0\n                target_cov = target_second - diag_rows[0][:, None] * diag_rows[0][None, :]\n                target_cov = 0.5 * (target_cov + target_cov.T)\n                target_cov = target_cov * (1.0 - eye) + eye * diag_vars[0][None, :]\n\n                t_vals, t_vecs = fnp.linalg.eigh(target_cov)\n\n                inv_sqrt = s_vecs @ (\n                    fnp.diag(1.0 / fnp.sqrt(fnp.maximum(s_vals, 1e-12))) @ s_vecs.T\n                )\n                target_sqrt = t_vecs @ (\n                    fnp.diag(fnp.sqrt(fnp.maximum(t_vals, 1e-12))) @ t_vecs.T\n                )\n                x_full = x_center @ (inv_sqrt @ target_sqrt) + diag_rows[0]\n\n                x = (\n                    diag_rows[0]\n                    - 0.245 * (x_mean0 - diag_rows[0])\n                    + 1.455 * (x_full - diag_rows[0])\n                    - 0.455 * x_center\n                )\n\n        z = x @ mlp.weights[-1]\n        z64 = fnp.asarray(z, dtype=fnp.float32)\n        z_mean = fnp.mean(z64, axis=0)\n        z_center = z64 - z_mean\n        z_var = fnp.mean(z_center * z_center, axis=0)\n        z_sigma = fnp.sqrt(fnp.maximum(z_var, 1e-12))\n\n        z_alpha = z_mean / z_sigma\n        z_cdf = flops.stats.norm.cdf(z_alpha)\n        z_phi = flops.stats.norm.pdf(z_alpha)\n        final_gauss = z_mean * z_cdf + z_sigma * z_phi\n\n        z_alpha_md = d_mu_pre / z_sigma\n        final_mixed_diag = (\n            d_mu_pre * flops.stats.norm.cdf(z_alpha_md)\n            + z_sigma * flops.stats.norm.pdf(z_alpha_md)\n        )\n\n        final_mc = fnp.sum(fnp.maximum(z64, 0.0), axis=0) / float(n_samples)\n        final = 0.99965 * (\n            1.03700 * final_mc\n            - 0.0425 * final_gauss\n            + 0.00400 * final_mixed_diag\n            + 0.00150 * diag_rows[-1]\n        )\n\n        return fnp.asarray(fnp.stack(list(diag_rows[:-1]) + [final], axis=0), dtype=fnp.float32)\n",
+      "construction": [
+        {
+          "adjusted_final_layer_score": 9.412376901767867e-08,
+          "all_layers_mse": 0.0010538659989833832,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67473995415.26854,
+          "final_layer_mse": 3.794301051129878e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 0,
+          "mlp_name": "daniel-harrison",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 2.1940506404579276e-07,
+          "all_layers_mse": 0.0009419079287908971,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67159503800.569176,
+          "final_layer_mse": 8.886036084732041e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 1,
+          "mlp_name": "dustin-robinson",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.4547246289561714e-07,
+          "all_layers_mse": 0.0008651885436847806,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67135189948.378204,
+          "final_layer_mse": 5.893855359317968e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 2,
+          "mlp_name": "cole-martin",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.0437200097417604e-07,
+          "all_layers_mse": 0.0003861910954583436,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67131075365.24355,
+          "final_layer_mse": 4.228918442095164e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 3,
+          "mlp_name": "donna-clarke",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 9.843521905613144e-08,
+          "all_layers_mse": 0.0005410899175330997,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67170078782.13942,
+          "final_layer_mse": 3.9860574929662107e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 4,
+          "mlp_name": "rebecca-walker",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 2.6807438736720453e-07,
+          "all_layers_mse": 0.0006383642321452498,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67071806369.124054,
+          "final_layer_mse": 1.0871368658627034e-06,
+          "flops_used": 65914109824,
+          "mlp_index": 5,
+          "mlp_name": "monique-stevens",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.1513668105795389e-07,
+          "all_layers_mse": 0.0009598049218766391,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67159965364.037155,
+          "final_layer_mse": 4.6630722749796405e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 6,
+          "mlp_name": "keith-brock",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.486062223312539e-07,
+          "all_layers_mse": 0.0007104046526364982,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67085194689.9277,
+          "final_layer_mse": 6.025307470736152e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 7,
+          "mlp_name": "robert-huff",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.859553902798446e-07,
+          "all_layers_mse": 0.00068663340061903,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67157155377.565025,
+          "final_layer_mse": 7.531567689511576e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 8,
+          "mlp_name": "kimberly-caldwell",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.0134132873533594e-07,
+          "all_layers_mse": 0.0007817627629265189,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67055447501.83642,
+          "final_layer_mse": 4.1107534798356937e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 9,
+          "mlp_name": "annette-hansen",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        }
+      ],
+      "id": "289d0017-1e54-44e1-b36c-9b39372a7762",
+      "metadata": {},
+      "observation": "pass score=1.48092e-07",
+      "parent_values": [
+        -1.4795474437687154e-07,
+        -1.4814142339925195e-07,
+        -1.4824544364135236e-07
+      ],
+      "parents": [
+        {
+          "id": "e29bc054-1a7e-4fb4-b991-c324cb03f510",
+          "timestep": 1
+        },
+        {
+          "id": "4d3fd094-b095-4bd7-989f-804c5d1c70fa",
+          "timestep": 0
+        },
+        {
+          "id": "32cb3951-d448-40bd-a4be-7ad947807ab1",
+          "timestep": -1
+        }
+      ],
+      "timestep": 2,
+      "type": "State",
+      "value": -1.4809225257609889e-07
+    },
+    {
+      "code": "from __future__ import annotations\n\nimport flopscope.numpy as fnp\nimport flopscope as flops\nfrom whestbench import BaseEstimator\n\nflops.configure(symmetry_warnings=False)\n\n\nclass Estimator(BaseEstimator):\n    def predict(self, mlp, budget):\n        width = int(mlp.width)\n        depth = int(mlp.depth)\n\n        d_mu = fnp.zeros(width, dtype=fnp.float32)\n        d_var = fnp.ones(width, dtype=fnp.float32)\n        diag_rows = []\n        diag_vars = []\n\n        for w in mlp.weights:\n            d_mu_pre = w.T @ d_mu\n            d_var_pre = (w * w).T @ d_var\n            d_var_pre = fnp.maximum(d_var_pre, 1e-12)\n            d_sigma = fnp.sqrt(d_var_pre)\n            d_alpha = d_mu_pre / d_sigma\n            d_phi = flops.stats.norm.pdf(d_alpha)\n            d_cdf = flops.stats.norm.cdf(d_alpha)\n\n            d_mu = d_mu_pre * d_cdf + d_sigma * d_phi\n            d_ez2 = (d_mu_pre * d_mu_pre + d_var_pre) * d_cdf + d_mu_pre * d_sigma * d_phi\n            d_var = fnp.maximum(d_ez2 - d_mu * d_mu, 0.0)\n\n            diag_rows.append(d_mu)\n            diag_vars.append(d_var)\n\n        if depth == 1:\n            return fnp.asarray(fnp.stack(diag_rows, axis=0), dtype=fnp.float32)\n\n        per_sample = max(1, depth * (2 * width * width + 4 * width))\n        n_samples = max(1024, int((0.625 * float(budget)) / float(per_sample)))\n        n_samples = min(n_samples, 13744)\n        n_samples = 2 * max(1, n_samples // 2)\n\n        rng = fnp.random.default_rng(int(mlp.seed) + 2)\n        eye = fnp.eye(width, dtype=fnp.float32)\n\n        half_samples = n_samples // 2\n        x0 = fnp.asarray(rng.standard_normal((half_samples, width), dtype=fnp.float32))\n        x = fnp.concatenate([x0, -x0], axis=0)\n\n        for i, w in enumerate(mlp.weights[:-1]):\n            z = x @ w\n\n            if i == 0:\n                t_cov = w.T @ w\n                z_center = z - fnp.mean(z, axis=0)\n                sample_cov = (z_center.T @ z_center) / float(n_samples)\n\n                s_vals, s_vecs = fnp.linalg.eigh(sample_cov)\n                t_vals, t_vecs = fnp.linalg.eigh(t_cov)\n\n                inv_sqrt = s_vecs @ (\n                    fnp.diag(1.0 / fnp.sqrt(fnp.maximum(s_vals, 1e-12))) @ s_vecs.T\n                )\n                target_sqrt = t_vecs @ (\n                    fnp.diag(fnp.sqrt(fnp.maximum(t_vals, 1e-12))) @ t_vecs.T\n                )\n                z = z_center @ (inv_sqrt @ target_sqrt)\n\n            x = fnp.maximum(z, 0.0)\n\n            if i == 0:\n                x_mean0 = fnp.mean(x, axis=0)\n                x_center = x - x_mean0\n                sample_cov = (x_center.T @ x_center) / float(n_samples)\n                s_vals, s_vecs = fnp.linalg.eigh(sample_cov)\n\n                sigma0 = fnp.sqrt(fnp.maximum(fnp.diagonal(t_cov), 1e-12))\n                scale0 = fnp.maximum(sigma0[:, None] * sigma0[None, :], 1e-12)\n                rho0 = fnp.clip(t_cov / scale0, -0.999999, 0.999999)\n                root0 = fnp.sqrt(fnp.maximum(1.0 - rho0 * rho0, 0.0))\n\n                pi = 3.141592653589793\n                kernel0 = (root0 + (pi - fnp.arccos(rho0)) * rho0) / (2.0 * pi)\n                target_second = (sigma0[:, None] * sigma0[None, :]) * kernel0\n                target_cov = target_second - diag_rows[0][:, None] * diag_rows[0][None, :]\n                target_cov = 0.5 * (target_cov + target_cov.T)\n                target_cov = target_cov * (1.0 - eye) + eye * diag_vars[0][None, :]\n\n                t_vals, t_vecs = fnp.linalg.eigh(target_cov)\n\n                inv_sqrt = s_vecs @ (\n                    fnp.diag(1.0 / fnp.sqrt(fnp.maximum(s_vals, 1e-12))) @ s_vecs.T\n                )\n                target_sqrt = t_vecs @ (\n                    fnp.diag(fnp.sqrt(fnp.maximum(t_vals, 1e-12))) @ t_vecs.T\n                )\n                x_full = x_center @ (inv_sqrt @ target_sqrt) + diag_rows[0]\n\n                x = (\n                    diag_rows[0]\n                    - 0.245 * (x_mean0 - diag_rows[0])\n                    + 1.455 * (x_full - diag_rows[0])\n                    - 0.455 * x_center\n                )\n\n        z = x @ mlp.weights[-1]\n        z64 = fnp.asarray(z, dtype=fnp.float32)\n        z_mean = fnp.mean(z64, axis=0)\n        z_center = z64 - z_mean\n        z_var = fnp.mean(z_center * z_center, axis=0)\n        z_sigma = fnp.sqrt(fnp.maximum(z_var, 1e-12))\n\n        z_alpha = z_mean / z_sigma\n        z_cdf = flops.stats.norm.cdf(z_alpha)\n        z_phi = flops.stats.norm.pdf(z_alpha)\n        final_gauss = z_mean * z_cdf + z_sigma * z_phi\n\n        z_alpha_md = d_mu_pre / z_sigma\n        final_mixed_diag = (\n            d_mu_pre * flops.stats.norm.cdf(z_alpha_md)\n            + z_sigma * flops.stats.norm.pdf(z_alpha_md)\n        )\n\n        final_mc = fnp.sum(fnp.maximum(z64, 0.0), axis=0) / float(n_samples)\n        final = 0.99965 * (\n            1.03700 * final_mc\n            - 0.0425 * final_gauss\n            + 0.00400 * final_mixed_diag\n            + 0.00150 * diag_rows[-1]\n        )\n\n        return fnp.asarray(fnp.stack(list(diag_rows[:-1]) + [final], axis=0), dtype=fnp.float32)",
+      "construction": [
+        {
+          "adjusted_final_layer_score": 9.426137200531362e-08,
+          "all_layers_mse": 0.0010538659989833832,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67572638122.13957,
+          "final_layer_mse": 3.794301051129878e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 0,
+          "mlp_name": "daniel-harrison",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 2.191619390789206e-07,
+          "all_layers_mse": 0.0009419079287908971,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67085083676.2768,
+          "final_layer_mse": 8.886036084732041e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 1,
+          "mlp_name": "dustin-robinson",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.4560312238587671e-07,
+          "all_layers_mse": 0.0008651885436847806,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67195488987.26523,
+          "final_layer_mse": 5.893855359317968e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 2,
+          "mlp_name": "cole-martin",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.0449511808440224e-07,
+          "all_layers_mse": 0.0003861910954583436,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67210263116.0599,
+          "final_layer_mse": 4.228918442095164e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 3,
+          "mlp_name": "donna-clarke",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 9.84725304543032e-08,
+          "all_layers_mse": 0.0005410899175330997,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67195539278.68426,
+          "final_layer_mse": 3.9860574929662107e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 4,
+          "mlp_name": "rebecca-walker",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 2.686591676759025e-07,
+          "all_layers_mse": 0.0006383642321452498,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67218117518.125175,
+          "final_layer_mse": 1.0871368658627034e-06,
+          "flops_used": 65914109824,
+          "mlp_index": 5,
+          "mlp_name": "monique-stevens",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.1520932565438876e-07,
+          "all_layers_mse": 0.0009598049218766391,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67202339423.59507,
+          "final_layer_mse": 4.6630722749796405e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 6,
+          "mlp_name": "keith-brock",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.4882402051432738e-07,
+          "all_layers_mse": 0.0007104046526364982,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67183515159.18791,
+          "final_layer_mse": 6.025307470736152e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 7,
+          "mlp_name": "robert-huff",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.8599349763090952e-07,
+          "all_layers_mse": 0.00068663340061903,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67170917717.51463,
+          "final_layer_mse": 7.531567689511576e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 8,
+          "mlp_name": "kimberly-caldwell",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.0151688173756105e-07,
+          "all_layers_mse": 0.0007817627629265189,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67171607268.74888,
+          "final_layer_mse": 4.1107534798356937e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 9,
+          "mlp_name": "annette-hansen",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        }
+      ],
+      "id": "6c8f571e-2a73-4481-90ed-835a8f8b86ad",
+      "metadata": {},
+      "observation": "pass score=1.4822e-07",
+      "parent_values": [
+        -1.4795474437687154e-07,
+        -1.4814142339925195e-07,
+        -1.4824544364135236e-07
+      ],
+      "parents": [
+        {
+          "id": "e29bc054-1a7e-4fb4-b991-c324cb03f510",
+          "timestep": 1
+        },
+        {
+          "id": "4d3fd094-b095-4bd7-989f-804c5d1c70fa",
+          "timestep": 0
+        },
+        {
+          "id": "32cb3951-d448-40bd-a4be-7ad947807ab1",
+          "timestep": -1
+        }
+      ],
+      "timestep": 2,
+      "type": "State",
+      "value": -1.4821969752219057e-07
+    },
+    {
+      "code": "from __future__ import annotations\n\nimport flopscope.numpy as fnp\nimport flopscope as flops\nfrom whestbench import BaseEstimator\n\n\nclass Estimator(BaseEstimator):\n    def predict(self, mlp, budget):\n        width = int(mlp.width)\n        depth = int(mlp.depth)\n\n        d_mu = fnp.zeros(width, dtype=fnp.float32)\n        d_var = fnp.ones(width, dtype=fnp.float32)\n        diag_rows = []\n        diag_vars = []\n\n        for w in mlp.weights:\n            d_mu_pre = w.T @ d_mu\n            d_var_pre = (w * w).T @ d_var\n            d_var_pre = fnp.maximum(d_var_pre, 1e-12)\n            d_sigma = fnp.sqrt(d_var_pre)\n            d_alpha = d_mu_pre / d_sigma\n            d_phi = flops.stats.norm.pdf(d_alpha)\n            d_cdf = flops.stats.norm.cdf(d_alpha)\n\n            d_mu = d_mu_pre * d_cdf + d_sigma * d_phi\n            d_ez2 = (d_mu_pre * d_mu_pre + d_var_pre) * d_cdf + d_mu_pre * d_sigma * d_phi\n            d_var = fnp.maximum(d_ez2 - d_mu * d_mu, 0.0)\n\n            diag_rows.append(d_mu)\n            diag_vars.append(d_var)\n\n        if depth == 1:\n            return fnp.asarray(fnp.stack(diag_rows, axis=0), dtype=fnp.float32)\n\n        per_sample = max(1, depth * (2 * width * width + 4 * width))\n        n_samples = max(1024, int((0.625 * float(budget)) / float(per_sample)))\n        n_samples = min(n_samples, 13744)\n        n_samples = 2 * max(1, n_samples // 2)\n\n        rng = fnp.random.default_rng(int(mlp.seed) + 2)\n        eye = fnp.eye(width, dtype=fnp.float32)\n\n        half_samples = n_samples // 2\n        x0 = fnp.asarray(rng.standard_normal((half_samples, width), dtype=fnp.float32))\n        x = fnp.concatenate([x0, -x0], axis=0)\n\n        for i, w in enumerate(mlp.weights[:-1]):\n            z = x @ w\n\n            if i == 0:\n                t_cov = w.T @ w\n                z_center = z - fnp.mean(z, axis=0)\n                sample_cov = (z_center.T @ z_center) / float(n_samples)\n\n                s_vals, s_vecs = fnp.linalg.eigh(sample_cov)\n                t_vals, t_vecs = fnp.linalg.eigh(t_cov)\n\n                inv_sqrt = s_vecs @ (\n                    fnp.diag(1.0 / fnp.sqrt(fnp.maximum(s_vals, 1e-12))) @ s_vecs.T\n                )\n                target_sqrt = t_vecs @ (\n                    fnp.diag(fnp.sqrt(fnp.maximum(t_vals, 1e-12))) @ t_vecs.T\n                )\n                z = z_center @ (inv_sqrt @ target_sqrt)\n\n            x = fnp.maximum(z, 0.0)\n\n            if i == 0:\n                x_mean0 = fnp.mean(x, axis=0)\n                x_center = x - x_mean0\n                sample_cov = (x_center.T @ x_center) / float(n_samples)\n                s_vals, s_vecs = fnp.linalg.eigh(sample_cov)\n\n                sigma0 = fnp.sqrt(fnp.maximum(fnp.diagonal(t_cov), 1e-12))\n                scale0 = fnp.maximum(sigma0[:, None] * sigma0[None, :], 1e-12)\n                rho0 = fnp.clip(t_cov / scale0, -0.999999, 0.999999)\n                root0 = fnp.sqrt(fnp.maximum(1.0 - rho0 * rho0, 0.0))\n\n                pi = 3.141592653589793\n                kernel0 = (root0 + (pi - fnp.arccos(rho0)) * rho0) / (2.0 * pi)\n                target_second = (sigma0[:, None] * sigma0[None, :]) * kernel0\n                target_cov = target_second - diag_rows[0][:, None] * diag_rows[0][None, :]\n                target_cov = 0.5 * (target_cov + target_cov.T)\n                target_cov = target_cov * (1.0 - eye) + eye * diag_vars[0][None, :]\n\n                t_vals, t_vecs = fnp.linalg.eigh(target_cov)\n\n                inv_sqrt = s_vecs @ (\n                    fnp.diag(1.0 / fnp.sqrt(fnp.maximum(s_vals, 1e-12))) @ s_vecs.T\n                )\n                target_sqrt = t_vecs @ (\n                    fnp.diag(fnp.sqrt(fnp.maximum(t_vals, 1e-12))) @ t_vecs.T\n                )\n                x_full = x_center @ (inv_sqrt @ target_sqrt) + diag_rows[0]\n\n                x = (\n                    diag_rows[0]\n                    - 0.245 * (x_mean0 - diag_rows[0])\n                    + 1.455 * (x_full - diag_rows[0])\n                    - 0.455 * x_center\n                )\n\n        z = x @ mlp.weights[-1]\n        z64 = fnp.asarray(z, dtype=fnp.float32)\n        z_mean = fnp.mean(z64, axis=0)\n        z_center = z64 - z_mean\n        z_var = fnp.mean(z_center * z_center, axis=0)\n        z_sigma = fnp.sqrt(fnp.maximum(z_var, 1e-12))\n\n        z_alpha = z_mean / z_sigma\n        z_cdf = flops.stats.norm.cdf(z_alpha)\n        z_phi = flops.stats.norm.pdf(z_alpha)\n        final_gauss = z_mean * z_cdf + z_sigma * z_phi\n\n        z_alpha_md = d_mu_pre / z_sigma\n        final_mixed_diag = (\n            d_mu_pre * flops.stats.norm.cdf(z_alpha_md)\n            + z_sigma * flops.stats.norm.pdf(z_alpha_md)\n        )\n\n        final_mc = fnp.sum(fnp.maximum(z64, 0.0), axis=0) / float(n_samples)\n        final = 0.99965 * (\n            1.03700 * final_mc\n            - 0.0425 * final_gauss\n            + 0.00400 * final_mixed_diag\n            + 0.00150 * diag_rows[-1]\n        )\n\n        return fnp.asarray(fnp.stack(list(diag_rows[:-1]) + [final], axis=0), dtype=fnp.float32)\n",
+      "construction": [
+        {
+          "adjusted_final_layer_score": 9.428623379167586e-08,
+          "all_layers_mse": 0.0010538659989833832,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67590460655.98547,
+          "final_layer_mse": 3.794301051129878e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 0,
+          "mlp_name": "daniel-harrison",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 2.1829181043690836e-07,
+          "all_layers_mse": 0.0009419079287908971,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 66818738830.98185,
+          "final_layer_mse": 8.886036084732041e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 1,
+          "mlp_name": "dustin-robinson",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.4475043973420956e-07,
+          "all_layers_mse": 0.0008651885436847806,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 66801978004.87101,
+          "final_layer_mse": 5.893855359317968e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 2,
+          "mlp_name": "cole-martin",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.0385302998947474e-07,
+          "all_layers_mse": 0.0003861910954583436,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 66797278178.63047,
+          "final_layer_mse": 4.228918442095164e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 3,
+          "mlp_name": "donna-clarke",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 9.78419533581282e-08,
+          "all_layers_mse": 0.0005410899175330997,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 66765247015.057205,
+          "final_layer_mse": 3.9860574929662107e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 4,
+          "mlp_name": "rebecca-walker",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 2.6599125706227436e-07,
+          "all_layers_mse": 0.0006383642321452498,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 66550610316.69199,
+          "final_layer_mse": 1.0871368658627034e-06,
+          "flops_used": 65914109824,
+          "mlp_index": 5,
+          "mlp_name": "monique-stevens",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.1387881835135018e-07,
+          "all_layers_mse": 0.0009598049218766391,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 66426245970.4262,
+          "final_layer_mse": 4.6630722749796405e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 6,
+          "mlp_name": "keith-brock",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.471373721470473e-07,
+          "all_layers_mse": 0.0007104046526364982,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 66422112760.84006,
+          "final_layer_mse": 6.025307470736152e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 7,
+          "mlp_name": "robert-huff",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.8392234561631028e-07,
+          "all_layers_mse": 0.00068663340061903,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 66422928226.88639,
+          "final_layer_mse": 7.531567689511576e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 8,
+          "mlp_name": "kimberly-caldwell",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.0039225231943756e-07,
+          "all_layers_mse": 0.0007817627629265189,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 66427463395.29574,
+          "final_layer_mse": 4.1107534798356937e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 9,
+          "mlp_name": "annette-hansen",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        }
+      ],
+      "id": "d45fde30-8d54-491e-938a-ec2341ed119f",
+      "metadata": {},
+      "observation": "pass score=1.47035e-07",
+      "parent_values": [
+        -1.4795474437687154e-07,
+        -1.4814142339925195e-07,
+        -1.4824544364135236e-07
+      ],
+      "parents": [
+        {
+          "id": "e29bc054-1a7e-4fb4-b991-c324cb03f510",
+          "timestep": 1
+        },
+        {
+          "id": "4d3fd094-b095-4bd7-989f-804c5d1c70fa",
+          "timestep": 0
+        },
+        {
+          "id": "32cb3951-d448-40bd-a4be-7ad947807ab1",
+          "timestep": -1
+        }
+      ],
+      "timestep": 3,
+      "type": "State",
+      "value": -1.4703455128068163e-07
+    },
+    {
+      "code": "from __future__ import annotations\n\nimport flopscope.numpy as fnp\nimport flopscope as flops\nfrom whestbench import BaseEstimator\n\n\nclass Estimator(BaseEstimator):\n    def predict(self, mlp, budget):\n        width = int(mlp.width)\n        depth = int(mlp.depth)\n\n        d_mu = fnp.zeros(width, dtype=fnp.float32)\n        d_var = fnp.ones(width, dtype=fnp.float32)\n        diag_rows = []\n        diag_vars = []\n\n        for w in mlp.weights:\n            d_mu_pre = w.T @ d_mu\n            d_var_pre = (w * w).T @ d_var\n            d_var_pre = fnp.maximum(d_var_pre, 1e-12)\n            d_sigma = fnp.sqrt(d_var_pre)\n            d_alpha = d_mu_pre / d_sigma\n            d_phi = flops.stats.norm.pdf(d_alpha)\n            d_cdf = flops.stats.norm.cdf(d_alpha)\n\n            d_mu = d_mu_pre * d_cdf + d_sigma * d_phi\n            d_ez2 = (d_mu_pre * d_mu_pre + d_var_pre) * d_cdf + d_mu_pre * d_sigma * d_phi\n            d_var = fnp.maximum(d_ez2 - d_mu * d_mu, 0.0)\n\n            diag_rows.append(d_mu)\n            diag_vars.append(d_var)\n\n        if depth == 1:\n            return fnp.asarray(fnp.stack(diag_rows, axis=0), dtype=fnp.float32)\n\n        per_sample = max(1, depth * (2 * width * width + 4 * width))\n        n_samples = max(1024, int((0.625 * float(budget)) / float(per_sample)))\n        n_samples = min(n_samples, 13744)\n        n_samples = 2 * max(1, n_samples // 2)\n\n        rng = fnp.random.default_rng(int(mlp.seed) + 2)\n        eye = fnp.eye(width, dtype=fnp.float32)\n\n        half_samples = n_samples // 2\n        x0 = fnp.asarray(rng.standard_normal((half_samples, width), dtype=fnp.float32))\n        x = fnp.concatenate([x0, -x0], axis=0)\n\n        for i, w in enumerate(mlp.weights[:-1]):\n            z = x @ w\n\n            if i == 0:\n                t_cov = w.T @ w\n                z_center = z - fnp.mean(z, axis=0)\n                sample_cov = (z_center.T @ z_center) / float(n_samples)\n\n                s_vals, s_vecs = fnp.linalg.eigh(sample_cov)\n                t_vals, t_vecs = fnp.linalg.eigh(t_cov)\n\n                inv_sqrt = s_vecs @ (\n                    fnp.diag(1.0 / fnp.sqrt(fnp.maximum(s_vals, 1e-12))) @ s_vecs.T\n                )\n                target_sqrt = t_vecs @ (\n                    fnp.diag(fnp.sqrt(fnp.maximum(t_vals, 1e-12))) @ t_vecs.T\n                )\n                z = z_center @ (inv_sqrt @ target_sqrt)\n\n            x = fnp.maximum(z, 0.0)\n\n            if i == 0:\n                x_mean0 = fnp.mean(x, axis=0)\n                x_center = x - x_mean0\n                sample_cov = (x_center.T @ x_center) / float(n_samples)\n                s_vals, s_vecs = fnp.linalg.eigh(sample_cov)\n\n                sigma0 = fnp.sqrt(fnp.maximum(fnp.diagonal(t_cov), 1e-12))\n                scale0 = fnp.maximum(sigma0[:, None] * sigma0[None, :], 1e-12)\n                rho0 = fnp.clip(t_cov / scale0, -0.999999, 0.999999)\n                root0 = fnp.sqrt(fnp.maximum(1.0 - rho0 * rho0, 0.0))\n\n                pi = 3.141592653589793\n                kernel0 = (root0 + (pi - fnp.arccos(rho0)) * rho0) / (2.0 * pi)\n                target_second = (sigma0[:, None] * sigma0[None, :]) * kernel0\n                target_cov = target_second - diag_rows[0][:, None] * diag_rows[0][None, :]\n                target_cov = 0.5 * (target_cov + target_cov.T)\n                target_cov = target_cov * (1.0 - eye) + eye * diag_vars[0][None, :]\n\n                t_vals, t_vecs = fnp.linalg.eigh(target_cov)\n\n                inv_sqrt = s_vecs @ (\n                    fnp.diag(1.0 / fnp.sqrt(fnp.maximum(s_vals, 1e-12))) @ s_vecs.T\n                )\n                target_sqrt = t_vecs @ (\n                    fnp.diag(fnp.sqrt(fnp.maximum(t_vals, 1e-12))) @ t_vecs.T\n                )\n                x_full = x_center @ (inv_sqrt @ target_sqrt) + diag_rows[0]\n\n                x = (\n                    diag_rows[0]\n                    - 0.245 * (x_mean0 - diag_rows[0])\n                    + 1.455 * (x_full - diag_rows[0])\n                    - 0.455 * x_center\n                )\n\n        z = x @ mlp.weights[-1]\n        z64 = fnp.asarray(z, dtype=fnp.float32)\n        z_mean = fnp.mean(z64, axis=0)\n        z_center = z64 - z_mean\n        z_var = fnp.mean(z_center * z_center, axis=0)\n        z_sigma = fnp.sqrt(fnp.maximum(z_var, 1e-12))\n\n        z_alpha = z_mean / z_sigma\n        z_cdf = flops.stats.norm.cdf(z_alpha)\n        z_phi = flops.stats.norm.pdf(z_alpha)\n        final_gauss = z_mean * z_cdf + z_sigma * z_phi\n\n        z_alpha_md = d_mu_pre / z_sigma\n        final_mixed_diag = (\n            d_mu_pre * flops.stats.norm.cdf(z_alpha_md)\n            + z_sigma * flops.stats.norm.pdf(z_alpha_md)\n        )\n\n        final_mc = fnp.sum(fnp.maximum(z64, 0.0), axis=0) / float(n_samples)\n        final = 0.99965 * (\n            1.03700 * final_mc\n            - 0.0425 * final_gauss\n            + 0.00400 * final_mixed_diag\n            + 0.00150 * diag_rows[-1]\n        )\n\n        return fnp.asarray(fnp.stack(list(diag_rows[:-1]) + [final], axis=0), dtype=fnp.float32)",
+      "construction": [
+        {
+          "adjusted_final_layer_score": 9.335372296825387e-08,
+          "all_layers_mse": 0.0010538659989833832,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 66921976683.436035,
+          "final_layer_mse": 3.794301051129878e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 0,
+          "mlp_name": "daniel-harrison",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 2.1715906131396115e-07,
+          "all_layers_mse": 0.0009419079287908971,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 66472006318.86542,
+          "final_layer_mse": 8.886036084732041e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 1,
+          "mlp_name": "dustin-robinson",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.4412407590961072e-07,
+          "all_layers_mse": 0.0008651885436847806,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 66512912614.04574,
+          "final_layer_mse": 5.893855359317968e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 2,
+          "mlp_name": "cole-martin",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.0344532416444001e-07,
+          "all_layers_mse": 0.0003861910954583436,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 66535045681.29599,
+          "final_layer_mse": 4.228918442095164e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 3,
+          "mlp_name": "donna-clarke",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 9.746242309339482e-08,
+          "all_layers_mse": 0.0005410899175330997,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 66506263715.92104,
+          "final_layer_mse": 3.9860574929662107e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 4,
+          "mlp_name": "rebecca-walker",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 2.6558151136519953e-07,
+          "all_layers_mse": 0.0006383642321452498,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 66448092562.8525,
+          "final_layer_mse": 1.0871368658627034e-06,
+          "flops_used": 65914109824,
+          "mlp_index": 5,
+          "mlp_name": "monique-stevens",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.1404193036814238e-07,
+          "all_layers_mse": 0.0009598049218766391,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 66521390257.17795,
+          "final_layer_mse": 4.6630722749796405e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 6,
+          "mlp_name": "keith-brock",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.472846271121785e-07,
+          "all_layers_mse": 0.0007104046526364982,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 66488587958.5129,
+          "final_layer_mse": 6.025307470736152e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 7,
+          "mlp_name": "robert-huff",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.8413368085902135e-07,
+          "all_layers_mse": 0.00068663340061903,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 66499251229.46322,
+          "final_layer_mse": 7.531567689511576e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 8,
+          "mlp_name": "kimberly-caldwell",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.0051652283815108e-07,
+          "all_layers_mse": 0.0007817627629265189,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 66509690610.4666,
+          "final_layer_mse": 4.1107534798356937e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 9,
+          "mlp_name": "annette-hansen",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        }
+      ],
+      "id": "d9b1ebc0-f207-4a33-aaae-0784d847cc5d",
+      "metadata": {},
+      "observation": "pass score=1.4671e-07",
+      "parent_values": [
+        -1.4795474437687154e-07,
+        -1.4814142339925195e-07,
+        -1.4824544364135236e-07
+      ],
+      "parents": [
+        {
+          "id": "e29bc054-1a7e-4fb4-b991-c324cb03f510",
+          "timestep": 1
+        },
+        {
+          "id": "4d3fd094-b095-4bd7-989f-804c5d1c70fa",
+          "timestep": 0
+        },
+        {
+          "id": "32cb3951-d448-40bd-a4be-7ad947807ab1",
+          "timestep": -1
+        }
+      ],
+      "timestep": 3,
+      "type": "State",
+      "value": -1.4671028799923532e-07
+    },
+    {
+      "code": "from __future__ import annotations\n\nimport flopscope.numpy as fnp\nimport flopscope as flops\nfrom whestbench import BaseEstimator\n\n\nclass Estimator(BaseEstimator):\n    def predict(self, mlp, budget):\n        width = int(mlp.width)\n        depth = int(mlp.depth)\n\n        d_mu = fnp.zeros(width, dtype=fnp.float32)\n        d_var = fnp.ones(width, dtype=fnp.float32)\n        diag_rows = []\n        diag_vars = []\n\n        for w in mlp.weights:\n            d_mu_pre = w.T @ d_mu\n            d_var_pre = (w * w).T @ d_var\n            d_var_pre = fnp.maximum(d_var_pre, 1e-12)\n            d_sigma = fnp.sqrt(d_var_pre)\n            d_alpha = d_mu_pre / d_sigma\n            d_phi = flops.stats.norm.pdf(d_alpha)\n            d_cdf = flops.stats.norm.cdf(d_alpha)\n\n            d_mu = d_mu_pre * d_cdf + d_sigma * d_phi\n            d_ez2 = (d_mu_pre * d_mu_pre + d_var_pre) * d_cdf + d_mu_pre * d_sigma * d_phi\n            d_var = fnp.maximum(d_ez2 - d_mu * d_mu, 0.0)\n\n            diag_rows.append(d_mu)\n            diag_vars.append(d_var)\n\n        if depth == 1:\n            return fnp.asarray(fnp.stack(diag_rows, axis=0), dtype=fnp.float32)\n\n        per_sample = max(1, depth * (2 * width * width + 4 * width))\n        n_samples = max(1024, int((0.625 * float(budget)) / float(per_sample)))\n        n_samples = min(n_samples, 13744)\n        n_samples = 2 * max(1, n_samples // 2)\n\n        rng = fnp.random.default_rng(int(mlp.seed) + 2)\n        eye = fnp.eye(width, dtype=fnp.float32)\n\n        half_samples = n_samples // 2\n        x0 = fnp.asarray(rng.standard_normal((half_samples, width), dtype=fnp.float32))\n        x = fnp.concatenate([x0, -x0], axis=0)\n\n        for i, w in enumerate(mlp.weights[:-1]):\n            z = x @ w\n\n            if i == 0:\n                t_cov = w.T @ w\n                z_center = z - fnp.mean(z, axis=0)\n                sample_cov = (z_center.T @ z_center) / float(n_samples)\n\n                s_vals, s_vecs = fnp.linalg.eigh(sample_cov)\n                t_vals, t_vecs = fnp.linalg.eigh(t_cov)\n\n                inv_sqrt = s_vecs @ (\n                    fnp.diag(1.0 / fnp.sqrt(fnp.maximum(s_vals, 1e-12))) @ s_vecs.T\n                )\n                target_sqrt = t_vecs @ (\n                    fnp.diag(fnp.sqrt(fnp.maximum(t_vals, 1e-12))) @ t_vecs.T\n                )\n                z = z_center @ (inv_sqrt @ target_sqrt)\n\n            x = fnp.maximum(z, 0.0)\n\n            if i == 0:\n                x_mean0 = fnp.mean(x, axis=0)\n                x_center = x - x_mean0\n                sample_cov = (x_center.T @ x_center) / float(n_samples)\n                s_vals, s_vecs = fnp.linalg.eigh(sample_cov)\n\n                sigma0 = fnp.sqrt(fnp.maximum(fnp.diagonal(t_cov), 1e-12))\n                scale0 = fnp.maximum(sigma0[:, None] * sigma0[None, :], 1e-12)\n                rho0 = fnp.clip(t_cov / scale0, -0.999999, 0.999999)\n                root0 = fnp.sqrt(fnp.maximum(1.0 - rho0 * rho0, 0.0))\n\n                pi = 3.141592653589793\n                kernel0 = (root0 + (pi - fnp.arccos(rho0)) * rho0) / (2.0 * pi)\n                target_second = (sigma0[:, None] * sigma0[None, :]) * kernel0\n                target_cov = target_second - diag_rows[0][:, None] * diag_rows[0][None, :]\n                target_cov = 0.5 * (target_cov + target_cov.T)\n                target_cov = target_cov * (1.0 - eye) + eye * diag_vars[0][None, :]\n\n                t_vals, t_vecs = fnp.linalg.eigh(target_cov)\n\n                inv_sqrt = s_vecs @ (\n                    fnp.diag(1.0 / fnp.sqrt(fnp.maximum(s_vals, 1e-12))) @ s_vecs.T\n                )\n                target_sqrt = t_vecs @ (\n                    fnp.diag(fnp.sqrt(fnp.maximum(t_vals, 1e-12))) @ t_vecs.T\n                )\n                x_full = x_center @ (inv_sqrt @ target_sqrt) + diag_rows[0]\n\n                x = (\n                    diag_rows[0]\n                    - 0.245 * (x_mean0 - diag_rows[0])\n                    + 1.455 * (x_full - diag_rows[0])\n                    - 0.455 * x_center\n                )\n\n        z = x @ mlp.weights[-1]\n        z64 = fnp.asarray(z, dtype=fnp.float32)\n        z_mean = fnp.mean(z64, axis=0)\n        z_center = z64 - z_mean\n        z_var = fnp.mean(z_center * z_center, axis=0)\n        z_sigma = fnp.sqrt(fnp.maximum(z_var, 1e-12))\n\n        z_alpha = z_mean / z_sigma\n        z_cdf = flops.stats.norm.cdf(z_alpha)\n        z_phi = flops.stats.norm.pdf(z_alpha)\n        final_gauss = z_mean * z_cdf + z_sigma * z_phi\n\n        z_alpha_md = d_mu_pre / z_sigma\n        final_mixed_diag = (\n            d_mu_pre * flops.stats.norm.cdf(z_alpha_md)\n            + z_sigma * flops.stats.norm.pdf(z_alpha_md)\n        )\n\n        final_mc = fnp.sum(fnp.maximum(z64, 0.0), axis=0) / float(n_samples)\n        final = 0.99965 * (\n            1.03700 * final_mc\n            - 0.0425 * final_gauss\n            + 0.00400 * final_mixed_diag\n            + 0.00150 * diag_rows[-1]\n        )\n\n        return fnp.asarray(fnp.stack(list(diag_rows[:-1]) + [final], axis=0), dtype=fnp.float32)\n",
+      "construction": [
+        {
+          "adjusted_final_layer_score": 9.440070651487823e-08,
+          "all_layers_mse": 0.0010538659989833832,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67672522095.73805,
+          "final_layer_mse": 3.794301051129878e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 0,
+          "mlp_name": "daniel-harrison",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 2.195355278457814e-07,
+          "all_layers_mse": 0.0009419079287908971,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67199438540.03966,
+          "final_layer_mse": 8.886036084732041e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 1,
+          "mlp_name": "dustin-robinson",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.4551631338423332e-07,
+          "all_layers_mse": 0.0008651885436847806,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67155426842.86654,
+          "final_layer_mse": 5.893855359317968e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 2,
+          "mlp_name": "cole-martin",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.0451734447362796e-07,
+          "all_layers_mse": 0.0003861910954583436,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67224558917.580246,
+          "final_layer_mse": 4.228918442095164e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 3,
+          "mlp_name": "donna-clarke",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 9.842697446274217e-08,
+          "all_layers_mse": 0.0005410899175330997,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67164452848.73068,
+          "final_layer_mse": 3.9860574929662107e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 4,
+          "mlp_name": "rebecca-walker",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 2.6840882576155237e-07,
+          "all_layers_mse": 0.0006383642321452498,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67155482349.691986,
+          "final_layer_mse": 1.0871368658627034e-06,
+          "flops_used": 65914109824,
+          "mlp_index": 5,
+          "mlp_name": "monique-stevens",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.1515803498136635e-07,
+          "all_layers_mse": 0.0009598049218766391,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67172421244.67909,
+          "final_layer_mse": 4.6630722749796405e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 6,
+          "mlp_name": "keith-brock",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.488367726591365e-07,
+          "all_layers_mse": 0.0007104046526364982,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67189271850.286125,
+          "final_layer_mse": 6.025307470736152e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 7,
+          "mlp_name": "robert-huff",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.8597847770456741e-07,
+          "all_layers_mse": 0.00068663340061903,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67165493322.31104,
+          "final_layer_mse": 7.531567689511576e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 8,
+          "mlp_name": "kimberly-caldwell",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.0153946895589079e-07,
+          "all_layers_mse": 0.0007817627629265189,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67186552760.89728,
+          "final_layer_mse": 4.1107534798356937e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 9,
+          "mlp_name": "annette-hansen",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        }
+      ],
+      "id": "a6235b57-4f53-4fa6-8d6a-7940e5199064",
+      "metadata": {},
+      "observation": "pass score=1.48232e-07",
+      "parent_values": [
+        -1.4671028799923532e-07,
+        -1.4795474437687154e-07,
+        -1.4814142339925195e-07,
+        -1.4824544364135236e-07
+      ],
+      "parents": [
+        {
+          "id": "d9b1ebc0-f207-4a33-aaae-0784d847cc5d",
+          "timestep": 3
+        },
+        {
+          "id": "e29bc054-1a7e-4fb4-b991-c324cb03f510",
+          "timestep": 1
+        },
+        {
+          "id": "4d3fd094-b095-4bd7-989f-804c5d1c70fa",
+          "timestep": 0
+        },
+        {
+          "id": "32cb3951-d448-40bd-a4be-7ad947807ab1",
+          "timestep": -1
+        }
+      ],
+      "timestep": 4,
+      "type": "State",
+      "value": -1.4823184467437766e-07
+    },
+    {
+      "code": "from __future__ import annotations\n\nimport flopscope.numpy as fnp\nimport flopscope as flops\nfrom whestbench import BaseEstimator\n\n\nclass Estimator(BaseEstimator):\n    def predict(self, mlp, budget):\n        width = int(mlp.width)\n        depth = int(mlp.depth)\n\n        d_mu = fnp.zeros(width, dtype=fnp.float32)\n        d_var = fnp.ones(width, dtype=fnp.float32)\n        diag_rows = []\n        diag_vars = []\n\n        for w in mlp.weights:\n            d_mu_pre = w.T @ d_mu\n            d_var_pre = (w * w).T @ d_var\n            d_var_pre = fnp.maximum(d_var_pre, 1e-12)\n            d_sigma = fnp.sqrt(d_var_pre)\n            d_alpha = d_mu_pre / d_sigma\n            d_phi = flops.stats.norm.pdf(d_alpha)\n            d_cdf = flops.stats.norm.cdf(d_alpha)\n\n            d_mu = d_mu_pre * d_cdf + d_sigma * d_phi\n            d_ez2 = (d_mu_pre * d_mu_pre + d_var_pre) * d_cdf + d_mu_pre * d_sigma * d_phi\n            d_var = fnp.maximum(d_ez2 - d_mu * d_mu, 0.0)\n\n            diag_rows.append(d_mu)\n            diag_vars.append(d_var)\n\n        if depth == 1:\n            return fnp.asarray(fnp.stack(diag_rows, axis=0), dtype=fnp.float32)\n\n        per_sample = max(1, depth * (2 * width * width + 4 * width))\n        n_samples = max(1024, int((0.625 * float(budget)) / float(per_sample)))\n        n_samples = min(n_samples, 13744)\n        n_samples = 2 * max(1, n_samples // 2)\n\n        rng = fnp.random.default_rng(int(mlp.seed) + 2)\n        eye = fnp.eye(width, dtype=fnp.float32)\n\n        half_samples = n_samples // 2\n        x0 = fnp.asarray(rng.standard_normal((half_samples, width), dtype=fnp.float32))\n        x = fnp.concatenate([x0, -x0], axis=0)\n\n        for i, w in enumerate(mlp.weights[:-1]):\n            z = x @ w\n\n            if i == 0:\n                t_cov = w.T @ w\n                z_center = z - fnp.mean(z, axis=0)\n                sample_cov = (z_center.T @ z_center) / float(n_samples)\n\n                s_vals, s_vecs = fnp.linalg.eigh(sample_cov)\n                t_vals, t_vecs = fnp.linalg.eigh(t_cov)\n\n                inv_sqrt = s_vecs @ (\n                    fnp.diag(1.0 / fnp.sqrt(fnp.maximum(s_vals, 1e-12))) @ s_vecs.T\n                )\n                target_sqrt = t_vecs @ (\n                    fnp.diag(fnp.sqrt(fnp.maximum(t_vals, 1e-12))) @ t_vecs.T\n                )\n                z = z_center @ (inv_sqrt @ target_sqrt)\n\n            x = fnp.maximum(z, 0.0)\n\n            if i == 0:\n                x_mean0 = fnp.mean(x, axis=0)\n                x_center = x - x_mean0\n                sample_cov = (x_center.T @ x_center) / float(n_samples)\n                s_vals, s_vecs = fnp.linalg.eigh(sample_cov)\n\n                sigma0 = fnp.sqrt(fnp.maximum(fnp.diagonal(t_cov), 1e-12))\n                scale0 = fnp.maximum(sigma0[:, None] * sigma0[None, :], 1e-12)\n                rho0 = fnp.clip(t_cov / scale0, -0.999999, 0.999999)\n                root0 = fnp.sqrt(fnp.maximum(1.0 - rho0 * rho0, 0.0))\n\n                pi = 3.141592653589793\n                kernel0 = (root0 + (pi - fnp.arccos(rho0)) * rho0) / (2.0 * pi)\n                target_second = (sigma0[:, None] * sigma0[None, :]) * kernel0\n                target_cov = target_second - diag_rows[0][:, None] * diag_rows[0][None, :]\n                target_cov = 0.5 * (target_cov + target_cov.T)\n                target_cov = target_cov * (1.0 - eye) + eye * diag_vars[0][None, :]\n\n                t_vals, t_vecs = fnp.linalg.eigh(target_cov)\n\n                inv_sqrt = s_vecs @ (\n                    fnp.diag(1.0 / fnp.sqrt(fnp.maximum(s_vals, 1e-12))) @ s_vecs.T\n                )\n                target_sqrt = t_vecs @ (\n                    fnp.diag(fnp.sqrt(fnp.maximum(t_vals, 1e-12))) @ t_vecs.T\n                )\n                x_full = x_center @ (inv_sqrt @ target_sqrt) + diag_rows[0]\n\n                x = (\n                    diag_rows[0]\n                    - 0.245 * (x_mean0 - diag_rows[0])\n                    + 1.455 * (x_full - diag_rows[0])\n                    - 0.455 * x_center\n                )\n\n        z = x @ mlp.weights[-1]\n        z64 = fnp.asarray(z, dtype=fnp.float32)\n        z_mean = fnp.mean(z64, axis=0)\n        z_center = z64 - z_mean\n        z_var = fnp.mean(z_center * z_center, axis=0)\n        z_sigma = fnp.sqrt(fnp.maximum(z_var, 1e-12))\n\n        z_alpha = z_mean / z_sigma\n        z_cdf = flops.stats.norm.cdf(z_alpha)\n        z_phi = flops.stats.norm.pdf(z_alpha)\n        final_gauss = z_mean * z_cdf + z_sigma * z_phi\n\n        z_alpha_md = d_mu_pre / z_sigma\n        final_mixed_diag = (\n            d_mu_pre * flops.stats.norm.cdf(z_alpha_md)\n            + z_sigma * flops.stats.norm.pdf(z_alpha_md)\n        )\n\n        final_mc = fnp.sum(fnp.maximum(z64, 0.0), axis=0) / float(n_samples)\n        final = 0.99965 * (\n            1.03700 * final_mc\n            - 0.0425 * final_gauss\n            + 0.00400 * final_mixed_diag\n            + 0.00150 * diag_rows[-1]\n        )\n\n        return fnp.asarray(fnp.stack(list(diag_rows[:-1]) + [final], axis=0), dtype=fnp.float32)",
+      "construction": [
+        {
+          "adjusted_final_layer_score": 9.436649024884735e-08,
+          "all_layers_mse": 0.0010538659989833832,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67647993666.82589,
+          "final_layer_mse": 3.794301051129878e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 0,
+          "mlp_name": "daniel-harrison",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 2.1948434466709203e-07,
+          "all_layers_mse": 0.0009419079287908971,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67183771459.160446,
+          "final_layer_mse": 8.886036084732041e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 1,
+          "mlp_name": "dustin-robinson",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.4554215565256459e-07,
+          "all_layers_mse": 0.0008651885436847806,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67167352987.228035,
+          "final_layer_mse": 5.893855359317968e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 2,
+          "mlp_name": "cole-martin",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.0397943747409029e-07,
+          "all_layers_mse": 0.0003861910954583436,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 66878582266.86537,
+          "final_layer_mse": 4.228918442095164e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 3,
+          "mlp_name": "donna-clarke",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 9.843613403020908e-08,
+          "all_layers_mse": 0.0005410899175330997,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67170703140.79344,
+          "final_layer_mse": 3.9860574929662107e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 4,
+          "mlp_name": "rebecca-walker",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 2.6838555223454606e-07,
+          "all_layers_mse": 0.0006383642321452498,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67149659348.42646,
+          "final_layer_mse": 1.0871368658627034e-06,
+          "flops_used": 65914109824,
+          "mlp_index": 5,
+          "mlp_name": "monique-stevens",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.1486838902558805e-07,
+          "all_layers_mse": 0.0009598049218766391,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67003468898.83101,
+          "final_layer_mse": 4.6630722749796405e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 6,
+          "mlp_name": "keith-brock",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.4872974475690632e-07,
+          "all_layers_mse": 0.0007104046526364982,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67140956325.23119,
+          "final_layer_mse": 6.025307470736152e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 7,
+          "mlp_name": "robert-huff",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.8572998823296298e-07,
+          "all_layers_mse": 0.00068663340061903,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67075752196.608185,
+          "final_layer_mse": 7.531567689511576e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 8,
+          "mlp_name": "kimberly-caldwell",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.0146743690405641e-07,
+          "all_layers_mse": 0.0007817627629265189,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67138890651.7607,
+          "final_layer_mse": 4.1107534798356937e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 9,
+          "mlp_name": "annette-hansen",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        }
+      ],
+      "id": "e9441814-b066-4ec9-a6fd-1a6e58fea8ec",
+      "metadata": {},
+      "observation": "pass score=1.48099e-07",
+      "parent_values": [
+        -1.4671028799923532e-07,
+        -1.4795474437687154e-07,
+        -1.4814142339925195e-07,
+        -1.4824544364135236e-07
+      ],
+      "parents": [
+        {
+          "id": "d9b1ebc0-f207-4a33-aaae-0784d847cc5d",
+          "timestep": 3
+        },
+        {
+          "id": "e29bc054-1a7e-4fb4-b991-c324cb03f510",
+          "timestep": 1
+        },
+        {
+          "id": "4d3fd094-b095-4bd7-989f-804c5d1c70fa",
+          "timestep": 0
+        },
+        {
+          "id": "32cb3951-d448-40bd-a4be-7ad947807ab1",
+          "timestep": -1
+        }
+      ],
+      "timestep": 4,
+      "type": "State",
+      "value": -1.480989673226863e-07
+    },
+    {
+      "code": "from __future__ import annotations\n\nimport flopscope.numpy as fnp\nimport flopscope as flops\nfrom whestbench import BaseEstimator\n\n\nclass Estimator(BaseEstimator):\n    def predict(self, mlp, budget):\n        width = int(mlp.width)\n        depth = int(mlp.depth)\n\n        d_mu = fnp.zeros(width, dtype=fnp.float32)\n        d_var = fnp.ones(width, dtype=fnp.float32)\n        diag_rows = []\n        diag_vars = []\n\n        for w in mlp.weights:\n            d_mu_pre = w.T @ d_mu\n            d_var_pre = (w * w).T @ d_var\n            d_var_pre = fnp.maximum(d_var_pre, 1e-12)\n            d_sigma = fnp.sqrt(d_var_pre)\n            d_alpha = d_mu_pre / d_sigma\n            d_phi = flops.stats.norm.pdf(d_alpha)\n            d_cdf = flops.stats.norm.cdf(d_alpha)\n\n            d_mu = d_mu_pre * d_cdf + d_sigma * d_phi\n            d_ez2 = (d_mu_pre * d_mu_pre + d_var_pre) * d_cdf + d_mu_pre * d_sigma * d_phi\n            d_var = fnp.maximum(d_ez2 - d_mu * d_mu, 0.0)\n\n            diag_rows.append(d_mu)\n            diag_vars.append(d_var)\n\n        if depth == 1:\n            return fnp.asarray(fnp.stack(diag_rows, axis=0), dtype=fnp.float32)\n\n        per_sample = max(1, depth * (2 * width * width + 4 * width))\n        n_samples = max(1024, int((0.625 * float(budget)) / float(per_sample)))\n        n_samples = min(n_samples, 13744)\n        n_samples = 2 * max(1, n_samples // 2)\n\n        rng = fnp.random.default_rng(int(mlp.seed) + 2)\n        eye = fnp.eye(width, dtype=fnp.float32)\n\n        half_samples = n_samples // 2\n        x0 = fnp.asarray(rng.standard_normal((half_samples, width), dtype=fnp.float32))\n        x = fnp.concatenate([x0, -x0], axis=0)\n\n        for i, w in enumerate(mlp.weights[:-1]):\n            z = x @ w\n\n            if i == 0:\n                t_cov = w.T @ w\n                z_center = z - fnp.mean(z, axis=0)\n                sample_cov = (z_center.T @ z_center) / float(n_samples)\n\n                s_vals, s_vecs = fnp.linalg.eigh(sample_cov)\n                t_vals, t_vecs = fnp.linalg.eigh(t_cov)\n\n                inv_sqrt = s_vecs @ (\n                    fnp.diag(1.0 / fnp.sqrt(fnp.maximum(s_vals, 1e-12))) @ s_vecs.T\n                )\n                target_sqrt = t_vecs @ (\n                    fnp.diag(fnp.sqrt(fnp.maximum(t_vals, 1e-12))) @ t_vecs.T\n                )\n                z = z_center @ (inv_sqrt @ target_sqrt)\n            x = fnp.maximum(z, 0.0)\n\n            if i == 0:\n                x_mean0 = fnp.mean(x, axis=0)\n                x_center = x - x_mean0\n                sample_cov = (x_center.T @ x_center) / float(n_samples)\n                s_vals, s_vecs = fnp.linalg.eigh(sample_cov)\n\n                sigma0 = fnp.sqrt(fnp.maximum(fnp.diagonal(t_cov), 1e-12))\n                scale0 = fnp.maximum(sigma0[:, None] * sigma0[None, :], 1e-12)\n                rho0 = fnp.clip(t_cov / scale0, -0.999999, 0.999999)\n                root0 = fnp.sqrt(fnp.maximum(1.0 - rho0 * rho0, 0.0))\n\n                pi = 3.141592653589793\n                kernel0 = (root0 + (pi - fnp.arccos(rho0)) * rho0) / (2.0 * pi)\n                target_second = (sigma0[:, None] * sigma0[None, :]) * kernel0\n                target_cov = target_second - diag_rows[0][:, None] * diag_rows[0][None, :]\n                target_cov = 0.5 * (target_cov + target_cov.T)\n                target_cov = target_cov * (1.0 - eye) + eye * diag_vars[0][None, :]\n\n                t_vals, t_vecs = fnp.linalg.eigh(target_cov)\n\n                inv_sqrt = s_vecs @ (\n                    fnp.diag(1.0 / fnp.sqrt(fnp.maximum(s_vals, 1e-12))) @ s_vecs.T\n                )\n                target_sqrt = t_vecs @ (\n                    fnp.diag(fnp.sqrt(fnp.maximum(t_vals, 1e-12))) @ t_vecs.T\n                )\n                x_full = x_center @ (inv_sqrt @ target_sqrt) + diag_rows[0]\n\n                x = (\n                    diag_rows[0]\n                    - 0.280 * (x_mean0 - diag_rows[0])\n                    + 1.500 * (x_full - diag_rows[0])\n                    - 0.500 * x_center\n                )\n        z = x @ mlp.weights[-1]\n        z64 = fnp.asarray(z, dtype=fnp.float32)\n        z_mean = fnp.mean(z64, axis=0)\n        z_center = z64 - z_mean\n        z_var = fnp.mean(z_center * z_center, axis=0)\n        z_sigma = fnp.sqrt(fnp.maximum(z_var, 1e-12))\n\n        z_alpha = z_mean / z_sigma\n        z_cdf = flops.stats.norm.cdf(z_alpha)\n        z_phi = flops.stats.norm.pdf(z_alpha)\n        final_gauss = z_mean * z_cdf + z_sigma * z_phi\n\n        z_alpha_md = d_mu_pre / z_sigma\n        final_mixed_diag = (\n            d_mu_pre * flops.stats.norm.cdf(z_alpha_md)\n            + z_sigma * flops.stats.norm.pdf(z_alpha_md)\n        )\n\n        final_mc = fnp.sum(fnp.maximum(z64, 0.0), axis=0) / float(n_samples)\n        final = 0.99965 * (\n            1.03850 * final_mc\n            - 0.0425 * final_gauss\n            + 0.00400 * final_mixed_diag\n        )\n\n        return fnp.asarray(fnp.stack(list(diag_rows[:-1]) + [final], axis=0), dtype=fnp.float32)\n",
+      "construction": [
+        {
+          "adjusted_final_layer_score": 9.888936552785362e-08,
+          "all_layers_mse": 0.0010538664646446705,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67689727209.51053,
+          "final_layer_mse": 3.9737059864819457e-07,
+          "flops_used": 65914109312,
+          "mlp_index": 0,
+          "mlp_name": "daniel-harrison",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 2.1590068870446248e-07,
+          "all_layers_mse": 0.0009419074631296098,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67164901979.26971,
+          "final_layer_mse": 8.743404009692313e-07,
+          "flops_used": 65914109312,
+          "mlp_index": 1,
+          "mlp_name": "dustin-robinson",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.451148701004638e-07,
+          "all_layers_mse": 0.0008651884854771197,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67107145078.48235,
+          "final_layer_mse": 5.881824449716078e-07,
+          "flops_used": 65914109312,
+          "mlp_index": 2,
+          "mlp_name": "cole-martin",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.0067639357711475e-07,
+          "all_layers_mse": 0.00038619060069322586,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67154869772.49595,
+          "final_layer_mse": 4.077735411556205e-07,
+          "flops_used": 65914109312,
+          "mlp_index": 3,
+          "mlp_name": "donna-clarke",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.0255925015270377e-07,
+          "all_layers_mse": 0.000541090383194387,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67162857912.48294,
+          "final_layer_mse": 4.1535034256412473e-07,
+          "flops_used": 65914109312,
+          "mlp_index": 4,
+          "mlp_name": "rebecca-walker",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 2.7307366303600615e-07,
+          "all_layers_mse": 0.000638364814221859,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67170536480.84613,
+          "final_layer_mse": 1.1057829851779388e-06,
+          "flops_used": 65914109312,
+          "mlp_index": 5,
+          "mlp_name": "monique-stevens",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.0978940012961241e-07,
+          "all_layers_mse": 0.0009598042233847082,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67199457027.02018,
+          "final_layer_mse": 4.443892578365194e-07,
+          "flops_used": 65914109312,
+          "mlp_index": 6,
+          "mlp_name": "keith-brock",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.470256901814836e-07,
+          "all_layers_mse": 0.0007104044780135155,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67133316732.94517,
+          "final_layer_mse": 5.956950985819276e-07,
+          "flops_used": 65914109312,
+          "mlp_index": 7,
+          "mlp_name": "robert-huff",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.8866461511630578e-07,
+          "all_layers_mse": 0.0006866337498649955,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67165016718.2109,
+          "final_layer_mse": 7.640402372999233e-07,
+          "flops_used": 65914109312,
+          "mlp_index": 8,
+          "mlp_name": "kimberly-caldwell",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 9.995882916347397e-08,
+          "all_layers_mse": 0.0007817625300958753,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67162926830.35346,
+          "final_layer_mse": 4.0481859286956023e-07,
+          "flops_used": 65914109312,
+          "mlp_index": 9,
+          "mlp_name": "annette-hansen",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        }
+      ],
+      "id": "948b3f80-e710-4b4a-a794-f6f48cafec28",
+      "metadata": {},
+      "observation": "pass score=1.48165e-07",
+      "parent_values": [
+        -1.4671028799923532e-07,
+        -1.4795474437687154e-07,
+        -1.4814142339925195e-07,
+        -1.4824544364135236e-07
+      ],
+      "parents": [
+        {
+          "id": "d9b1ebc0-f207-4a33-aaae-0784d847cc5d",
+          "timestep": 3
+        },
+        {
+          "id": "e29bc054-1a7e-4fb4-b991-c324cb03f510",
+          "timestep": 1
+        },
+        {
+          "id": "4d3fd094-b095-4bd7-989f-804c5d1c70fa",
+          "timestep": 0
+        },
+        {
+          "id": "32cb3951-d448-40bd-a4be-7ad947807ab1",
+          "timestep": -1
+        }
+      ],
+      "timestep": 6,
+      "type": "State",
+      "value": -1.48165276568948e-07
+    },
+    {
+      "code": "from __future__ import annotations\n\nimport flopscope.numpy as fnp\nimport flopscope as flops\nfrom whestbench import BaseEstimator\n\n\nclass Estimator(BaseEstimator):\n    def predict(self, mlp, budget):\n        width = int(mlp.width)\n        depth = int(mlp.depth)\n\n        d_mu = fnp.zeros(width, dtype=fnp.float32)\n        d_var = fnp.ones(width, dtype=fnp.float32)\n        diag_rows = []\n        diag_vars = []\n\n        for w in mlp.weights:\n            d_mu_pre = w.T @ d_mu\n            d_var_pre = (w * w).T @ d_var\n            d_var_pre = fnp.maximum(d_var_pre, 1e-12)\n            d_sigma = fnp.sqrt(d_var_pre)\n            d_alpha = d_mu_pre / d_sigma\n            d_phi = flops.stats.norm.pdf(d_alpha)\n            d_cdf = flops.stats.norm.cdf(d_alpha)\n\n            d_mu = d_mu_pre * d_cdf + d_sigma * d_phi\n            d_ez2 = (d_mu_pre * d_mu_pre + d_var_pre) * d_cdf + d_mu_pre * d_sigma * d_phi\n            d_var = fnp.maximum(d_ez2 - d_mu * d_mu, 0.0)\n\n            diag_rows.append(d_mu)\n            diag_vars.append(d_var)\n\n        if depth == 1:\n            return fnp.asarray(fnp.stack(diag_rows, axis=0), dtype=fnp.float32)\n\n        per_sample = max(1, depth * (2 * width * width + 4 * width))\n        n_samples = max(1024, int((0.625 * float(budget)) / float(per_sample)))\n        n_samples = min(n_samples, 13744)\n        n_samples = 2 * max(1, n_samples // 2)\n\n        rng = fnp.random.default_rng(int(mlp.seed) + 2)\n        eye = fnp.eye(width, dtype=fnp.float32)\n\n        half_samples = n_samples // 2\n        x0 = fnp.asarray(rng.standard_normal((half_samples, width), dtype=fnp.float32))\n        x = fnp.concatenate([x0, -x0], axis=0)\n\n        for i, w in enumerate(mlp.weights[:-1]):\n            z = x @ w\n\n            if i == 0:\n                t_cov = w.T @ w\n                z_center = z - fnp.mean(z, axis=0)\n                sample_cov = (z_center.T @ z_center) / float(n_samples)\n\n                s_vals, s_vecs = fnp.linalg.eigh(sample_cov)\n                t_vals, t_vecs = fnp.linalg.eigh(t_cov)\n\n                inv_sqrt = s_vecs @ (\n                    fnp.diag(1.0 / fnp.sqrt(fnp.maximum(s_vals, 1e-12))) @ s_vecs.T\n                )\n                target_sqrt = t_vecs @ (\n                    fnp.diag(fnp.sqrt(fnp.maximum(t_vals, 1e-12))) @ t_vecs.T\n                )\n                z = z_center @ (inv_sqrt @ target_sqrt)\n\n            x = fnp.maximum(z, 0.0)\n\n            if i == 0:\n                x_mean0 = fnp.mean(x, axis=0)\n                x_center = x - x_mean0\n                sample_cov = (x_center.T @ x_center) / float(n_samples)\n                s_vals, s_vecs = fnp.linalg.eigh(sample_cov)\n\n                sigma0 = fnp.sqrt(fnp.maximum(fnp.diagonal(t_cov), 1e-12))\n                scale0 = fnp.maximum(sigma0[:, None] * sigma0[None, :], 1e-12)\n                rho0 = fnp.clip(t_cov / scale0, -0.999999, 0.999999)\n                root0 = fnp.sqrt(fnp.maximum(1.0 - rho0 * rho0, 0.0))\n\n                pi = 3.141592653589793\n                kernel0 = (root0 + (pi - fnp.arccos(rho0)) * rho0) / (2.0 * pi)\n                target_second = (sigma0[:, None] * sigma0[None, :]) * kernel0\n                target_cov = target_second - diag_rows[0][:, None] * diag_rows[0][None, :]\n                target_cov = 0.5 * (target_cov + target_cov.T)\n                target_cov = target_cov * (1.0 - eye) + eye * diag_vars[0][None, :]\n\n                t_vals, t_vecs = fnp.linalg.eigh(target_cov)\n\n                inv_sqrt = s_vecs @ (\n                    fnp.diag(1.0 / fnp.sqrt(fnp.maximum(s_vals, 1e-12))) @ s_vecs.T\n                )\n                target_sqrt = t_vecs @ (\n                    fnp.diag(fnp.sqrt(fnp.maximum(t_vals, 1e-12))) @ t_vecs.T\n                )\n                x_full = x_center @ (inv_sqrt @ target_sqrt) + diag_rows[0]\n\n                x = (\n                    diag_rows[0]\n                    - 0.280 * (x_mean0 - diag_rows[0])\n                    + 1.500 * (x_full - diag_rows[0])\n                    - 0.500 * x_center\n                )\n\n        z = x @ mlp.weights[-1]\n        z64 = fnp.asarray(z, dtype=fnp.float32)\n        z_mean = fnp.mean(z64, axis=0)\n        z_center = z64 - z_mean\n        z_var = fnp.mean(z_center * z_center, axis=0)\n        z_sigma = fnp.sqrt(fnp.maximum(z_var, 1e-12))\n\n        z_alpha = z_mean / z_sigma\n        z_cdf = flops.stats.norm.cdf(z_alpha)\n        z_phi = flops.stats.norm.pdf(z_alpha)\n        final_gauss = z_mean * z_cdf + z_sigma * z_phi\n\n        z_alpha_md = d_mu_pre / z_sigma\n        final_mixed_diag = (\n            d_mu_pre * flops.stats.norm.cdf(z_alpha_md)\n            + z_sigma * flops.stats.norm.pdf(z_alpha_md)\n        )\n\n        final_mc = fnp.sum(fnp.maximum(z64, 0.0), axis=0) / float(n_samples)\n        final = 0.99965 * (\n            1.03850 * final_mc\n            - 0.0425 * final_gauss\n            + 0.00400 * final_mixed_diag\n        )\n\n        return fnp.asarray(fnp.stack(list(diag_rows[:-1]) + [final], axis=0), dtype=fnp.float32)",
+      "construction": [
+        {
+          "adjusted_final_layer_score": 9.874289812160407e-08,
+          "all_layers_mse": 0.0010538664646446705,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67589470334.35317,
+          "final_layer_mse": 3.9737059864819457e-07,
+          "flops_used": 65914109312,
+          "mlp_index": 0,
+          "mlp_name": "daniel-harrison",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 2.1497317909338892e-07,
+          "all_layers_mse": 0.0009419074631296098,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 66876361481.84749,
+          "final_layer_mse": 8.743404009692313e-07,
+          "flops_used": 65914109312,
+          "mlp_index": 1,
+          "mlp_name": "dustin-robinson",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.446596425026096e-07,
+          "all_layers_mse": 0.0008651884854771197,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 66896628923.71627,
+          "final_layer_mse": 5.881824449716078e-07,
+          "flops_used": 65914109312,
+          "mlp_index": 2,
+          "mlp_name": "cole-martin",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.0027099830413895e-07,
+          "all_layers_mse": 0.00038619060069322586,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 66884456165.13702,
+          "final_layer_mse": 4.077735411556205e-07,
+          "flops_used": 65914109312,
+          "mlp_index": 3,
+          "mlp_name": "donna-clarke",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.021518157546907e-07,
+          "all_layers_mse": 0.000541090383194387,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 66896041817.96523,
+          "final_layer_mse": 4.1535034256412473e-07,
+          "flops_used": 65914109312,
+          "mlp_index": 4,
+          "mlp_name": "rebecca-walker",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 2.731266680259247e-07,
+          "all_layers_mse": 0.000638364814221859,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67183574624.36172,
+          "final_layer_mse": 1.1057829851779388e-06,
+          "flops_used": 65914109312,
+          "mlp_index": 5,
+          "mlp_name": "monique-stevens",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.0967075341104712e-07,
+          "all_layers_mse": 0.0009598042233847082,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67126836217.94196,
+          "final_layer_mse": 4.443892578365194e-07,
+          "flops_used": 65914109312,
+          "mlp_index": 6,
+          "mlp_name": "keith-brock",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.4714390818742594e-07,
+          "all_layers_mse": 0.0007104044780135155,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67187296189.36988,
+          "final_layer_mse": 5.956950985819276e-07,
+          "flops_used": 65914109312,
+          "mlp_index": 7,
+          "mlp_name": "robert-huff",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.8867255433074102e-07,
+          "all_layers_mse": 0.0006866337498649955,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67167843095.96034,
+          "final_layer_mse": 7.640402372999233e-07,
+          "flops_used": 65914109312,
+          "mlp_index": 8,
+          "mlp_name": "kimberly-caldwell",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 9.992938027860561e-08,
+          "all_layers_mse": 0.0007817625300958753,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67143139950.93318,
+          "final_layer_mse": 4.0481859286956023e-07,
+          "flops_used": 65914109312,
+          "mlp_index": 9,
+          "mlp_name": "annette-hansen",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        }
+      ],
+      "id": "40ca3ef4-3ad7-4c03-86b2-84c1d1483e12",
+      "metadata": {},
+      "observation": "pass score=1.47934e-07",
+      "parent_values": [
+        -1.4671028799923532e-07,
+        -1.4795474437687154e-07,
+        -1.4814142339925195e-07,
+        -1.4824544364135236e-07
+      ],
+      "parents": [
+        {
+          "id": "d9b1ebc0-f207-4a33-aaae-0784d847cc5d",
+          "timestep": 3
+        },
+        {
+          "id": "e29bc054-1a7e-4fb4-b991-c324cb03f510",
+          "timestep": 1
+        },
+        {
+          "id": "4d3fd094-b095-4bd7-989f-804c5d1c70fa",
+          "timestep": 0
+        },
+        {
+          "id": "32cb3951-d448-40bd-a4be-7ad947807ab1",
+          "timestep": -1
+        }
+      ],
+      "timestep": 6,
+      "type": "State",
+      "value": -1.479341798010177e-07
+    },
+    {
+      "code": "from __future__ import annotations\n\nimport flopscope.numpy as fnp\nimport flopscope as flops\nfrom whestbench import BaseEstimator\n\n\nclass Estimator(BaseEstimator):\n    def predict(self, mlp, budget):\n        width = int(mlp.width)\n        depth = int(mlp.depth)\n\n        d_mu = fnp.zeros(width, dtype=fnp.float32)\n        d_var = fnp.ones(width, dtype=fnp.float32)\n        diag_rows = []\n        diag_vars = []\n\n        for w in mlp.weights:\n            d_mu_pre = w.T @ d_mu\n            d_var_pre = (w * w).T @ d_var\n            d_var_pre = fnp.maximum(d_var_pre, 1e-12)\n            d_sigma = fnp.sqrt(d_var_pre)\n            d_alpha = d_mu_pre / d_sigma\n            d_phi = flops.stats.norm.pdf(d_alpha)\n            d_cdf = flops.stats.norm.cdf(d_alpha)\n\n            d_mu = d_mu_pre * d_cdf + d_sigma * d_phi\n            d_ez2 = (d_mu_pre * d_mu_pre + d_var_pre) * d_cdf + d_mu_pre * d_sigma * d_phi\n            d_var = fnp.maximum(d_ez2 - d_mu * d_mu, 0.0)\n\n            diag_rows.append(d_mu)\n            diag_vars.append(d_var)\n\n        if depth == 1:\n            return fnp.asarray(fnp.stack(diag_rows, axis=0), dtype=fnp.float32)\n\n        per_sample = max(1, depth * (2 * width * width + 4 * width))\n        n_samples = max(1024, int((0.720 * float(budget)) / float(per_sample)))\n        n_samples = min(n_samples, 13744)\n        n_samples = 2 * max(1, n_samples // 2)\n\n        rng = fnp.random.default_rng(int(mlp.seed) + 2)\n        eye = fnp.eye(width, dtype=fnp.float32)\n\n        half_samples = n_samples // 2\n        x0 = fnp.asarray(rng.standard_normal((half_samples, width), dtype=fnp.float32))\n        x = fnp.concatenate([x0, -x0], axis=0)\n\n        for i, w in enumerate(mlp.weights[:-1]):\n            z = x @ w\n\n            if i == 0:\n                t_cov = w.T @ w\n                z_center = z - fnp.mean(z, axis=0)\n                sample_cov = (z_center.T @ z_center) / float(n_samples)\n\n                s_vals, s_vecs = fnp.linalg.eigh(sample_cov)\n                t_vals, t_vecs = fnp.linalg.eigh(t_cov)\n\n                inv_sqrt = s_vecs @ (\n                    fnp.diag(1.0 / fnp.sqrt(fnp.maximum(s_vals, 1e-12))) @ s_vecs.T\n                )\n                target_sqrt = t_vecs @ (\n                    fnp.diag(fnp.sqrt(fnp.maximum(t_vals, 1e-12))) @ t_vecs.T\n                )\n                z = z_center @ (inv_sqrt @ target_sqrt)\n            x = fnp.maximum(z, 0.0)\n\n            if i == 0:\n                x_mean0 = fnp.mean(x, axis=0)\n                x_center = x - x_mean0\n                sample_cov = (x_center.T @ x_center) / float(n_samples)\n                s_vals, s_vecs = fnp.linalg.eigh(sample_cov)\n\n                sigma0 = fnp.sqrt(fnp.maximum(fnp.diagonal(t_cov), 1e-12))\n                scale0 = fnp.maximum(sigma0[:, None] * sigma0[None, :], 1e-12)\n                rho0 = fnp.clip(t_cov / scale0, -0.999999, 0.999999)\n                root0 = fnp.sqrt(fnp.maximum(1.0 - rho0 * rho0, 0.0))\n\n                pi = 3.141592653589793\n                kernel0 = (root0 + (pi - fnp.arccos(rho0)) * rho0) / (2.0 * pi)\n                target_second = (sigma0[:, None] * sigma0[None, :]) * kernel0\n                target_cov = target_second - diag_rows[0][:, None] * diag_rows[0][None, :]\n                target_cov = 0.5 * (target_cov + target_cov.T)\n                target_cov = target_cov * (1.0 - eye) + eye * diag_vars[0][None, :]\n\n                t_vals, t_vecs = fnp.linalg.eigh(target_cov)\n\n                inv_sqrt = s_vecs @ (\n                    fnp.diag(1.0 / fnp.sqrt(fnp.maximum(s_vals, 1e-12))) @ s_vecs.T\n                )\n                target_sqrt = t_vecs @ (\n                    fnp.diag(fnp.sqrt(fnp.maximum(t_vals, 1e-12))) @ t_vecs.T\n                )\n                x_full = x_center @ (inv_sqrt @ target_sqrt) + diag_rows[0]\n\n                x = (\n                    diag_rows[0]\n                    - 0.245 * (x_mean0 - diag_rows[0])\n                    + 1.445 * (x_full - diag_rows[0])\n                    - 0.445 * x_center\n                )\n\n        z = x @ mlp.weights[-1]\n        z64 = fnp.asarray(z, dtype=fnp.float32)\n        z_mean = fnp.mean(z64, axis=0)\n        z_center = z64 - z_mean\n        z_var = fnp.mean(z_center * z_center, axis=0)\n        z_sigma = fnp.sqrt(fnp.maximum(z_var, 1e-12))\n\n        z_alpha = z_mean / z_sigma\n        z_cdf = flops.stats.norm.cdf(z_alpha)\n        z_phi = flops.stats.norm.pdf(z_alpha)\n        final_gauss = z_mean * z_cdf + z_sigma * z_phi\n\n        z_alpha_md = d_mu_pre / z_sigma\n        final_mixed_diag = (\n            d_mu_pre * flops.stats.norm.cdf(z_alpha_md)\n            + z_sigma * flops.stats.norm.pdf(z_alpha_md)\n        )\n        final_mc = fnp.sum(fnp.maximum(z64, 0.0), axis=0) / float(n_samples)\n        final = 0.99964 * (\n            1.03700 * final_mc\n            - 0.0425 * final_gauss\n            + 0.00400 * final_mixed_diag\n            + 0.00150 * diag_rows[-1]\n        )\n\n        return fnp.asarray(fnp.stack(list(diag_rows[:-1]) + [final], axis=0), dtype=fnp.float32)\n",
+      "construction": [
+        {
+          "adjusted_final_layer_score": 9.539981530741363e-08,
+          "all_layers_mse": 0.0010538659989833832,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67720707608.16157,
+          "final_layer_mse": 3.83173045293006e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 0,
+          "mlp_name": "daniel-harrison",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 2.180084900644066e-07,
+          "all_layers_mse": 0.0009419078123755753,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67026417059.598564,
+          "final_layer_mse": 8.847005688039644e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 1,
+          "mlp_name": "dustin-robinson",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.4271661987732614e-07,
+          "all_layers_mse": 0.0008651881944388151,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67083227736.65011,
+          "final_layer_mse": 5.786680503661046e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 2,
+          "mlp_name": "cole-martin",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.0547790315511814e-07,
+          "all_layers_mse": 0.0003861912991851568,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 66832021353.541016,
+          "final_layer_mse": 4.2928508037221036e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 3,
+          "mlp_name": "donna-clarke",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 9.779415576233001e-08,
+          "all_layers_mse": 0.0005410898011177778,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67119279978.57153,
+          "final_layer_mse": 3.963095309700293e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 4,
+          "mlp_name": "rebecca-walker",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 2.6682203451648953e-07,
+          "all_layers_mse": 0.000638364115729928,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67051038248.23916,
+          "final_layer_mse": 1.082393282558769e-06,
+          "flops_used": 65914109824,
+          "mlp_index": 5,
+          "mlp_name": "monique-stevens",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.1532264472728239e-07,
+          "all_layers_mse": 0.0009598049218766391,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67149310288.725494,
+          "final_layer_mse": 4.671344981943548e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 6,
+          "mlp_name": "keith-brock",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.4975501573812006e-07,
+          "all_layers_mse": 0.000710404827259481,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67096102339.92159,
+          "final_layer_mse": 6.070898734833463e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 7,
+          "mlp_name": "robert-huff",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.867777726520528e-07,
+          "all_layers_mse": 0.0006866336334496737,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67028803480.56376,
+          "final_layer_mse": 7.579361636089743e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 8,
+          "mlp_name": "kimberly-caldwell",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.0167103084433831e-07,
+          "all_layers_mse": 0.0007817627629265189,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 66983670098.48177,
+          "final_layer_mse": 4.128546606807504e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 9,
+          "mlp_name": "annette-hansen",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        }
+      ],
+      "id": "b5942e80-49cb-4056-b22c-9d021e6f6ea4",
+      "metadata": {},
+      "observation": "pass score=1.47975e-07",
+      "parent_values": [
+        -1.4671028799923532e-07,
+        -1.4795474437687154e-07,
+        -1.4814142339925195e-07,
+        -1.4824544364135236e-07
+      ],
+      "parents": [
+        {
+          "id": "d9b1ebc0-f207-4a33-aaae-0784d847cc5d",
+          "timestep": 3
+        },
+        {
+          "id": "e29bc054-1a7e-4fb4-b991-c324cb03f510",
+          "timestep": 1
+        },
+        {
+          "id": "4d3fd094-b095-4bd7-989f-804c5d1c70fa",
+          "timestep": 0
+        },
+        {
+          "id": "32cb3951-d448-40bd-a4be-7ad947807ab1",
+          "timestep": -1
+        }
+      ],
+      "timestep": 7,
+      "type": "State",
+      "value": -1.4797454826448776e-07
+    },
+    {
+      "code": "from __future__ import annotations\n\nimport flopscope.numpy as fnp\nimport flopscope as flops\nfrom whestbench import BaseEstimator\n\n\nclass Estimator(BaseEstimator):\n    def predict(self, mlp, budget):\n        width = int(mlp.width)\n        depth = int(mlp.depth)\n\n        d_mu = fnp.zeros(width, dtype=fnp.float32)\n        d_var = fnp.ones(width, dtype=fnp.float32)\n        diag_rows = []\n        diag_vars = []\n\n        for w in mlp.weights:\n            d_mu_pre = w.T @ d_mu\n            d_var_pre = (w * w).T @ d_var\n            d_var_pre = fnp.maximum(d_var_pre, 1e-12)\n            d_sigma = fnp.sqrt(d_var_pre)\n            d_alpha = d_mu_pre / d_sigma\n            d_phi = flops.stats.norm.pdf(d_alpha)\n            d_cdf = flops.stats.norm.cdf(d_alpha)\n\n            d_mu = d_mu_pre * d_cdf + d_sigma * d_phi\n            d_ez2 = (d_mu_pre * d_mu_pre + d_var_pre) * d_cdf + d_mu_pre * d_sigma * d_phi\n            d_var = fnp.maximum(d_ez2 - d_mu * d_mu, 0.0)\n\n            diag_rows.append(d_mu)\n            diag_vars.append(d_var)\n\n        if depth == 1:\n            return fnp.asarray(fnp.stack(diag_rows, axis=0), dtype=fnp.float32)\n\n        per_sample = max(1, depth * (2 * width * width + 4 * width))\n        n_samples = max(1024, int((0.720 * float(budget)) / float(per_sample)))\n        n_samples = min(n_samples, 13744)\n        n_samples = 2 * max(1, n_samples // 2)\n\n        rng = fnp.random.default_rng(int(mlp.seed) + 2)\n        eye = fnp.eye(width, dtype=fnp.float32)\n\n        half_samples = n_samples // 2\n        x0 = fnp.asarray(rng.standard_normal((half_samples, width), dtype=fnp.float32))\n        x = fnp.concatenate([x0, -x0], axis=0)\n\n        for i, w in enumerate(mlp.weights[:-1]):\n            z = x @ w\n\n            if i == 0:\n                t_cov = w.T @ w\n                z_center = z - fnp.mean(z, axis=0)\n                sample_cov = (z_center.T @ z_center) / float(n_samples)\n\n                s_vals, s_vecs = fnp.linalg.eigh(sample_cov)\n                t_vals, t_vecs = fnp.linalg.eigh(t_cov)\n\n                inv_sqrt = s_vecs @ (\n                    fnp.diag(1.0 / fnp.sqrt(fnp.maximum(s_vals, 1e-12))) @ s_vecs.T\n                )\n                target_sqrt = t_vecs @ (\n                    fnp.diag(fnp.sqrt(fnp.maximum(t_vals, 1e-12))) @ t_vecs.T\n                )\n                z = z_center @ (inv_sqrt @ target_sqrt)\n\n            x = fnp.maximum(z, 0.0)\n\n            if i == 0:\n                x_mean0 = fnp.mean(x, axis=0)\n                x_center = x - x_mean0\n                sample_cov = (x_center.T @ x_center) / float(n_samples)\n                s_vals, s_vecs = fnp.linalg.eigh(sample_cov)\n\n                sigma0 = fnp.sqrt(fnp.maximum(fnp.diagonal(t_cov), 1e-12))\n                scale0 = fnp.maximum(sigma0[:, None] * sigma0[None, :], 1e-12)\n                rho0 = fnp.clip(t_cov / scale0, -0.999999, 0.999999)\n                root0 = fnp.sqrt(fnp.maximum(1.0 - rho0 * rho0, 0.0))\n\n                pi = 3.141592653589793\n                kernel0 = (root0 + (pi - fnp.arccos(rho0)) * rho0) / (2.0 * pi)\n                target_second = (sigma0[:, None] * sigma0[None, :]) * kernel0\n                target_cov = target_second - diag_rows[0][:, None] * diag_rows[0][None, :]\n                target_cov = 0.5 * (target_cov + target_cov.T)\n                target_cov = target_cov * (1.0 - eye) + eye * diag_vars[0][None, :]\n\n                t_vals, t_vecs = fnp.linalg.eigh(target_cov)\n\n                inv_sqrt = s_vecs @ (\n                    fnp.diag(1.0 / fnp.sqrt(fnp.maximum(s_vals, 1e-12))) @ s_vecs.T\n                )\n                target_sqrt = t_vecs @ (\n                    fnp.diag(fnp.sqrt(fnp.maximum(t_vals, 1e-12))) @ t_vecs.T\n                )\n                x_full = x_center @ (inv_sqrt @ target_sqrt) + diag_rows[0]\n\n                x = (\n                    diag_rows[0]\n                    - 0.245 * (x_mean0 - diag_rows[0])\n                    + 1.445 * (x_full - diag_rows[0])\n                    - 0.445 * x_center\n                )\n\n        z = x @ mlp.weights[-1]\n        z64 = fnp.asarray(z, dtype=fnp.float32)\n        z_mean = fnp.mean(z64, axis=0)\n        z_center = z64 - z_mean\n        z_var = fnp.mean(z_center * z_center, axis=0)\n        z_sigma = fnp.sqrt(fnp.maximum(z_var, 1e-12))\n\n        z_alpha = z_mean / z_sigma\n        z_cdf = flops.stats.norm.cdf(z_alpha)\n        z_phi = flops.stats.norm.pdf(z_alpha)\n        final_gauss = z_mean * z_cdf + z_sigma * z_phi\n\n        z_alpha_md = d_mu_pre / z_sigma\n        final_mixed_diag = (\n            d_mu_pre * flops.stats.norm.cdf(z_alpha_md)\n            + z_sigma * flops.stats.norm.pdf(z_alpha_md)\n        )\n\n        final_mc = fnp.sum(fnp.maximum(z64, 0.0), axis=0) / float(n_samples)\n        final = 0.99964 * (\n            1.03700 * final_mc\n            - 0.0425 * final_gauss\n            + 0.00400 * final_mixed_diag\n            + 0.00150 * diag_rows[-1]\n        )\n\n        return fnp.asarray(fnp.stack(list(diag_rows[:-1]) + [final], axis=0), dtype=fnp.float32)",
+      "construction": [
+        {
+          "adjusted_final_layer_score": 9.508763775964495e-08,
+          "all_layers_mse": 0.0010538659989833832,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67499104616.93823,
+          "final_layer_mse": 3.83173045293006e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 0,
+          "mlp_name": "daniel-harrison",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 2.1735024432265627e-07,
+          "all_layers_mse": 0.0009419078123755753,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 66824040291.60559,
+          "final_layer_mse": 8.847005688039644e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 1,
+          "mlp_name": "dustin-robinson",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.4204439292987842e-07,
+          "all_layers_mse": 0.0008651881944388151,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 66767250848.70875,
+          "final_layer_mse": 5.786680503661046e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 2,
+          "mlp_name": "cole-martin",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.0538703266262637e-07,
+          "all_layers_mse": 0.0003861912991851568,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 66774444756.80411,
+          "final_layer_mse": 4.2928508037221036e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 3,
+          "mlp_name": "donna-clarke",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 9.731135301386942e-08,
+          "all_layers_mse": 0.0005410898011177778,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 66787916896.639465,
+          "final_layer_mse": 3.963095309700293e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 4,
+          "mlp_name": "rebecca-walker",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 2.6600082360301127e-07,
+          "all_layers_mse": 0.000638364115729928,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 66844672066.86556,
+          "final_layer_mse": 1.082393282558769e-06,
+          "flops_used": 65914109824,
+          "mlp_index": 5,
+          "mlp_name": "monique-stevens",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.14839204983886e-07,
+          "all_layers_mse": 0.0009598049218766391,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 66867816177.90282,
+          "final_layer_mse": 4.671344981943548e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 6,
+          "mlp_name": "keith-brock",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.4921608228490788e-07,
+          "all_layers_mse": 0.000710404827259481,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 66854639081.0591,
+          "final_layer_mse": 6.070898734833463e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 7,
+          "mlp_name": "robert-huff",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.8629295867211164e-07,
+          "all_layers_mse": 0.0006866336334496737,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 66854818640.05148,
+          "final_layer_mse": 7.579361636089743e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 8,
+          "mlp_name": "kimberly-caldwell",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.018406302180252e-07,
+          "all_layers_mse": 0.0007817627629265189,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67095406828.22287,
+          "final_layer_mse": 4.128546606807504e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 9,
+          "mlp_name": "annette-hansen",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        }
+      ],
+      "id": "ebb38af0-d59a-4dbf-aa89-2e1d231836e5",
+      "metadata": {},
+      "observation": "pass score=1.47537e-07",
+      "parent_values": [
+        -1.4671028799923532e-07,
+        -1.4795474437687154e-07,
+        -1.4814142339925195e-07,
+        -1.4824544364135236e-07
+      ],
+      "parents": [
+        {
+          "id": "d9b1ebc0-f207-4a33-aaae-0784d847cc5d",
+          "timestep": 3
+        },
+        {
+          "id": "e29bc054-1a7e-4fb4-b991-c324cb03f510",
+          "timestep": 1
+        },
+        {
+          "id": "4d3fd094-b095-4bd7-989f-804c5d1c70fa",
+          "timestep": 0
+        },
+        {
+          "id": "32cb3951-d448-40bd-a4be-7ad947807ab1",
+          "timestep": -1
+        }
+      ],
+      "timestep": 7,
+      "type": "State",
+      "value": -1.4753703604506173e-07
+    },
+    {
+      "code": "from __future__ import annotations\n\nimport flopscope.numpy as fnp\nimport flopscope as flops\nfrom whestbench import BaseEstimator\n\n\nclass Estimator(BaseEstimator):\n    def predict(self, mlp, budget):\n        width = int(mlp.width)\n        depth = int(mlp.depth)\n\n        d_mu = fnp.zeros(width, dtype=fnp.float32)\n        d_var = fnp.ones(width, dtype=fnp.float32)\n        diag_rows = []\n        diag_vars = []\n\n        for w in mlp.weights:\n            d_mu_pre = w.T @ d_mu\n            d_var_pre = (w * w).T @ d_var\n            d_var_pre = fnp.maximum(d_var_pre, 1e-12)\n            d_sigma = fnp.sqrt(d_var_pre)\n            d_alpha = d_mu_pre / d_sigma\n            d_phi = flops.stats.norm.pdf(d_alpha)\n            d_cdf = flops.stats.norm.cdf(d_alpha)\n\n            d_mu = d_mu_pre * d_cdf + d_sigma * d_phi\n            d_ez2 = (d_mu_pre * d_mu_pre + d_var_pre) * d_cdf + d_mu_pre * d_sigma * d_phi\n            d_var = fnp.maximum(d_ez2 - d_mu * d_mu, 0.0)\n\n            diag_rows.append(d_mu)\n            diag_vars.append(d_var)\n\n        if depth == 1:\n            return fnp.asarray(fnp.stack(diag_rows, axis=0), dtype=fnp.float32)\n\n        per_sample = max(1, depth * (2 * width * width + 4 * width))\n        n_samples = max(1024, int((0.625 * float(budget)) / float(per_sample)))\n        n_samples = min(n_samples, 13744)\n        n_samples = 2 * max(1, n_samples // 2)\n\n        rng = fnp.random.default_rng(int(mlp.seed) + 2)\n        eye = fnp.eye(width, dtype=fnp.float32)\n\n        half_samples = n_samples // 2\n        x0 = fnp.asarray(rng.standard_normal((half_samples, width), dtype=fnp.float32))\n        x = fnp.concatenate([x0, -x0], axis=0)\n\n        for i, w in enumerate(mlp.weights[:-1]):\n            z = x @ w\n\n            if i == 0:\n                t_cov = w.T @ w\n                z_center = z - fnp.mean(z, axis=0)\n                sample_cov = (z_center.T @ z_center) / float(n_samples)\n\n                s_vals, s_vecs = fnp.linalg.eigh(sample_cov)\n                t_vals, t_vecs = fnp.linalg.eigh(t_cov)\n\n                inv_sqrt = s_vecs @ (\n                    fnp.diag(1.0 / fnp.sqrt(fnp.maximum(s_vals, 1e-12))) @ s_vecs.T\n                )\n                target_sqrt = t_vecs @ (\n                    fnp.diag(fnp.sqrt(fnp.maximum(t_vals, 1e-12))) @ t_vecs.T\n                )\n                z = z_center @ (inv_sqrt @ target_sqrt)\n\n            x = fnp.maximum(z, 0.0)\n\n            if i == 0:\n                x_mean0 = fnp.mean(x, axis=0)\n                x_center = x - x_mean0\n                sample_cov = (x_center.T @ x_center) / float(n_samples)\n                s_vals, s_vecs = fnp.linalg.eigh(sample_cov)\n\n                sigma0 = fnp.sqrt(fnp.maximum(fnp.diagonal(t_cov), 1e-12))\n                scale0 = fnp.maximum(sigma0[:, None] * sigma0[None, :], 1e-12)\n                rho0 = fnp.clip(t_cov / scale0, -0.999999, 0.999999)\n                root0 = fnp.sqrt(fnp.maximum(1.0 - rho0 * rho0, 0.0))\n\n                pi = 3.141592653589793\n                kernel0 = (root0 + (pi - fnp.arccos(rho0)) * rho0) / (2.0 * pi)\n                target_second = (sigma0[:, None] * sigma0[None, :]) * kernel0\n                target_cov = target_second - diag_rows[0][:, None] * diag_rows[0][None, :]\n                target_cov = 0.5 * (target_cov + target_cov.T)\n                target_cov = target_cov * (1.0 - eye) + eye * diag_vars[0][None, :]\n\n                t_vals, t_vecs = fnp.linalg.eigh(target_cov)\n\n                inv_sqrt = s_vecs @ (\n                    fnp.diag(1.0 / fnp.sqrt(fnp.maximum(s_vals, 1e-12))) @ s_vecs.T\n                )\n                target_sqrt = t_vecs @ (\n                    fnp.diag(fnp.sqrt(fnp.maximum(t_vals, 1e-12))) @ t_vecs.T\n                )\n                x_full = x_center @ (inv_sqrt @ target_sqrt) + diag_rows[0]\n\n                x = (\n                    diag_rows[0]\n                    - 0.245 * (x_mean0 - diag_rows[0])\n                    + 1.455 * (x_full - diag_rows[0])\n                    - 0.455 * x_center\n                )\n\n        z = x @ mlp.weights[-1]\n        z64 = fnp.asarray(z, dtype=fnp.float32)\n        z_mean = fnp.mean(z64, axis=0)\n        z_center = z64 - z_mean\n        z_var = fnp.mean(z_center * z_center, axis=0)\n        z_sigma = fnp.sqrt(fnp.maximum(z_var, 1e-12))\n\n        z_alpha = z_mean / z_sigma\n        z_cdf = flops.stats.norm.cdf(z_alpha)\n        z_phi = flops.stats.norm.pdf(z_alpha)\n        final_gauss = z_mean * z_cdf + z_sigma * z_phi\n\n        z_alpha_md = d_mu_pre / z_sigma\n        final_mixed_diag = (\n            d_mu_pre * flops.stats.norm.cdf(z_alpha_md)\n            + z_sigma * flops.stats.norm.pdf(z_alpha_md)\n        )\n        final_mc = fnp.sum(fnp.maximum(z64, 0.0), axis=0) / float(n_samples)\n        final = 0.99965 * (\n            1.03700 * final_mc\n            - 0.0425 * final_gauss\n            + 0.00400 * final_mixed_diag\n            + 0.00150 * diag_rows[-1]\n        )\n\n        return fnp.asarray(fnp.stack(list(diag_rows[:-1]) + [final], axis=0), dtype=fnp.float32)\n",
+      "construction": [
+        {
+          "adjusted_final_layer_score": 9.445625344736977e-08,
+          "all_layers_mse": 0.0010538659989833832,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67712341723.73831,
+          "final_layer_mse": 3.794301051129878e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 0,
+          "mlp_name": "daniel-harrison",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 2.184429186220051e-07,
+          "all_layers_mse": 0.0009419079287908971,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 66864992780.38561,
+          "final_layer_mse": 8.886036084732041e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 1,
+          "mlp_name": "dustin-robinson",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.449169695586303e-07,
+          "all_layers_mse": 0.0008651885436847806,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 66878831116.25731,
+          "final_layer_mse": 5.893855359317968e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 2,
+          "mlp_name": "cole-martin",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.0397947975490887e-07,
+          "all_layers_mse": 0.0003861910954583436,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 66878609461.48455,
+          "final_layer_mse": 4.228918442095164e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 3,
+          "mlp_name": "donna-clarke",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 9.801487854545568e-08,
+          "all_layers_mse": 0.0005410899175330997,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 66883247447.906136,
+          "final_layer_mse": 3.9860574929662107e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 4,
+          "mlp_name": "rebecca-walker",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 2.682706735334922e-07,
+          "all_layers_mse": 0.0006383642321452498,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67120916871.12868,
+          "final_layer_mse": 1.0871368658627034e-06,
+          "flops_used": 65914109824,
+          "mlp_index": 5,
+          "mlp_name": "monique-stevens",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.1510185799215693e-07,
+          "all_layers_mse": 0.0009598049218766391,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67139652846.15576,
+          "final_layer_mse": 4.6630722749796405e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 6,
+          "mlp_name": "keith-brock",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.486867432999816e-07,
+          "all_layers_mse": 0.0007104046526364982,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67121544210.01494,
+          "final_layer_mse": 6.025307470736152e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 7,
+          "mlp_name": "robert-huff",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.851087392817731e-07,
+          "all_layers_mse": 0.00068663340061903,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 66851390255.38981,
+          "final_layer_mse": 7.531567689511576e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 8,
+          "mlp_name": "kimberly-caldwell",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        },
+        {
+          "adjusted_final_layer_score": 1.0143677449759877e-07,
+          "all_layers_mse": 0.0007817627629265189,
+          "budget_exhausted": false,
+          "combined_budget_exhausted": false,
+          "effective_compute": 67118601975.73721,
+          "final_layer_mse": 4.1107534798356937e-07,
+          "flops_used": 65914109824,
+          "mlp_index": 9,
+          "mlp_name": "annette-hansen",
+          "residual_wall_time_exhausted": false,
+          "time_exhausted": false
+        }
+      ],
+      "id": "3471b7d9-3085-42a6-8c54-301434650e62",
+      "metadata": {},
+      "observation": "pass score=1.47842e-07",
+      "parent_values": [
+        -1.4671028799923532e-07,
+        -1.4795474437687154e-07,
+        -1.4814142339925195e-07,
+        -1.4824544364135236e-07
+      ],
+      "parents": [
+        {
+          "id": "d9b1ebc0-f207-4a33-aaae-0784d847cc5d",
+          "timestep": 3
+        },
+        {
+          "id": "e29bc054-1a7e-4fb4-b991-c324cb03f510",
+          "timestep": 1
+        },
+        {
+          "id": "4d3fd094-b095-4bd7-989f-804c5d1c70fa",
+          "timestep": 0
+        },
+        {
+          "id": "32cb3951-d448-40bd-a4be-7ad947807ab1",
+          "timestep": -1
+        }
+      ],
+      "timestep": 10,
+      "type": "State",
+      "value": -1.4784152885333724e-07
+    }
+  ],
+  "step": 12
+}

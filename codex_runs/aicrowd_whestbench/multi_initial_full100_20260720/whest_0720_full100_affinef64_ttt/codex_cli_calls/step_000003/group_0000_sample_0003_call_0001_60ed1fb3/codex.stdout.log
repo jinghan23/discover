@@ -1,0 +1,169 @@
+```python
+from __future__ import annotations
+
+import flopscope.numpy as fnp
+from whestbench import BaseEstimator
+
+
+_BUDGET_FRACTION = 0.146
+_MIN_SAMPLES = 32
+_MAX_SAMPLES = 1_000_000
+_ARRAY_BYTES_LIMIT = 100 * 1024 * 1024
+_WORST_CASE_ITEMSIZE = 8
+_SETUP_SEED_OFFSET = 3
+_INV_SQRT_2PI = 0.3989422804014327
+_RELU_VAR_FACTOR = 0.5 - _INV_SQRT_2PI * _INV_SQRT_2PI
+_MOMENT_EPS = 1e-10
+
+
+def _to_int(value, default=0):
+    try:
+        if value is None:
+            return default
+        return int(value)
+    except Exception:
+        return default
+
+
+def _sample_count(budget: int, width: int, depth: int) -> int:
+    per_sample = depth * (2 * width * width + width) + width * width
+    fixed = 9 * width**3 + 2 * (2 * width**3)
+    k = (int(_BUDGET_FRACTION * budget) - fixed) // max(per_sample, 1)
+    max_k_by_bytes = _ARRAY_BYTES_LIMIT // max(width * _WORST_CASE_ITEMSIZE, 1)
+    k = int(max(_MIN_SAMPLES, min(_MAX_SAMPLES, max_k_by_bytes, k)))
+    return k - (k & 1)
+
+
+def _normal_pdf(x):
+    return _INV_SQRT_2PI * fnp.exp(-0.5 * x * x)
+
+
+def _normal_cdf(x):
+    x = fnp.asarray(x, dtype=fnp.float64)
+    ax = fnp.abs(x)
+    t = 1.0 / (1.0 + 0.2316419 * ax)
+    poly = (((((1.330274429 * t - 1.821255978) * t + 1.781477937) * t
+              - 0.356563782) * t + 0.319381530) * t)
+    cdf_pos = 1.0 - _normal_pdf(ax) * poly
+    cdf_pos = fnp.minimum(1.0, fnp.maximum(0.0, cdf_pos))
+    return fnp.where(x >= 0.0, cdf_pos, 1.0 - cdf_pos)
+
+
+def _relu_gaussian_mean_from_pre(preactivation):
+    z = fnp.asarray(preactivation, dtype=fnp.float64)
+    mu = fnp.mean(z, axis=0)
+    second = fnp.mean(z * z, axis=0)
+    var = fnp.maximum(second - mu * mu, _MOMENT_EPS)
+    sigma = fnp.sqrt(var)
+    alpha = mu / sigma
+    mean = sigma * _normal_pdf(alpha) + mu * _normal_cdf(alpha)
+    return fnp.asarray(fnp.maximum(mean, 0.0), dtype=fnp.float32)
+
+
+def _mean32(x):
+    return fnp.asarray(
+        fnp.mean(fnp.asarray(x, dtype=fnp.float64), axis=0),
+        dtype=fnp.float32,
+    )
+
+
+def _final_residual_weight(width, k):
+    if width < 96:
+        return 0.98
+    if k >= 65536:
+        return 0.96
+    if k >= 32768:
+        return 0.94
+    if k >= 8192:
+        return 0.90
+    if k >= 2048:
+        return 0.86
+    if width >= 256:
+        return 0.82
+    return 0.94
+
+
+class Estimator(BaseEstimator):
+    def setup(self, context):
+        self._samples = None
+        self._width = None
+        self._depth = None
+        self._setup_seed = _to_int(getattr(context, "seed", 0)) + _SETUP_SEED_OFFSET
+
+        width = getattr(context, "width", None)
+        depth = getattr(context, "depth", None)
+        flop_budget = _to_int(getattr(context, "flop_budget", 0))
+
+        if width is not None and depth is not None and flop_budget > 0:
+            self._width = int(width)
+            self._depth = int(depth)
+            self._samples = self._make_samples(
+                self._width,
+                _sample_count(flop_budget, self._width, self._depth),
+                self._setup_seed,
+            )
+
+    def _make_samples(self, width, k, seed):
+        rng = fnp.random.default_rng(seed)
+        u = rng.standard_normal((k // 2, width), dtype=fnp.float32)
+
+        covariance = (u.T @ u) / float(k // 2)
+        eigenvalues, eigenvectors = fnp.linalg.eigh(covariance)
+        eigenvalues = fnp.maximum(eigenvalues, 1e-6)
+        inverse_sqrt = (eigenvectors / fnp.sqrt(eigenvalues)) @ eigenvectors.T
+
+        half = fnp.asarray(u @ inverse_sqrt, dtype=fnp.float32)
+        return fnp.concatenate([half, -half], axis=0)
+
+    def predict(self, mlp, budget):
+        width = int(mlp.width)
+        depth = int(mlp.depth)
+
+        if (
+            not hasattr(self, "_samples")
+            or self._samples is None
+            or self._samples.shape[1] != width
+            or getattr(self, "_depth", depth) != depth
+        ):
+            self._samples = self._make_samples(
+                width,
+                _sample_count(_to_int(budget), width, depth),
+                int(mlp.seed) + _SETUP_SEED_OFFSET,
+            )
+            self._width = width
+            self._depth = depth
+
+        first_weight = mlp.weights[0]
+        first_variance = fnp.sum(first_weight * first_weight, axis=0)
+        first_mean = fnp.sqrt(first_variance) * _INV_SQRT_2PI
+
+        if depth == 1:
+            return first_mean[None, :]
+
+        x = fnp.maximum(self._samples @ first_weight, 0.0)
+
+        sample_mean = fnp.mean(x, axis=0)
+        sample_second = fnp.mean(x * x, axis=0)
+        sample_variance = fnp.maximum(sample_second - sample_mean * sample_mean, 1e-6)
+        target_variance = first_variance * _RELU_VAR_FACTOR
+
+        x = (x - sample_mean) * fnp.sqrt(target_variance / sample_variance) + first_mean
+
+        means = [fnp.asarray(first_mean, dtype=fnp.float32)]
+
+        for layer_index in range(1, depth):
+            z = x @ mlp.weights[layer_index]
+
+            if layer_index == depth - 1:
+                raw = fnp.maximum(z, 0.0)
+                raw_mean = _mean32(raw)
+                gaussian_mean = _relu_gaussian_mean_from_pre(z)
+                residual_weight = _final_residual_weight(width, int(self._samples.shape[0]))
+                final_mean = gaussian_mean + residual_weight * (raw_mean - gaussian_mean)
+                means.append(fnp.asarray(final_mean, dtype=fnp.float32))
+            else:
+                x = fnp.maximum(z, 0.0)
+                means.append(_mean32(x))
+
+        return fnp.concatenate([m[None, :] for m in means], axis=0)
+```

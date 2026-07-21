@@ -1,0 +1,100 @@
+```python
+from __future__ import annotations
+
+import math
+
+import flopscope.numpy as fnp
+from whestbench import BaseEstimator
+
+
+_BUDGET_FRACTION = 0.055
+_MIN_SAMPLES = 24
+_MAX_SAMPLES = 262144
+_ARRAY_BYTES_LIMIT = 80 * 1024 * 1024
+_WORST_CASE_ITEMSIZE = 8
+_INV_SQRT_2PI = 0.3989422804014327
+
+
+def _sample_count(budget, width: int, depth: int) -> int:
+    max_k_by_bytes = _ARRAY_BYTES_LIMIT // max(width * _WORST_CASE_ITEMSIZE, 1)
+
+    if budget is None:
+        k = min(4096, max_k_by_bytes)
+    else:
+        per_sample = depth * (2 * width * width + width) + 2 * width * width + 5 * width
+        fixed = 10 * width * width + 6 * width
+        k = (int(_BUDGET_FRACTION * budget) - fixed) // max(per_sample, 1)
+        k = int(max(_MIN_SAMPLES, min(_MAX_SAMPLES, max_k_by_bytes, k)))
+
+    k = k - (k & 1)
+    return max(2, k)
+
+
+def _mean_chi_radius(width: int) -> float:
+    return math.sqrt(2.0) * math.exp(
+        math.lgamma(0.5 * (width + 1.0)) - math.lgamma(0.5 * width)
+    )
+
+
+class Estimator(BaseEstimator):
+    def predict(self, mlp, budget):
+        width = mlp.width
+        depth = mlp.depth
+        weights = mlp.weights
+
+        first_var = fnp.sum(weights[0] * weights[0], axis=0)
+        first_mean = fnp.sqrt(fnp.maximum(first_var, 1e-12)) * _INV_SQRT_2PI
+
+        if depth == 1:
+            return first_mean[None, :]
+
+        k = _sample_count(budget, width, depth)
+        n = k // 2
+
+        rng = fnp.random.default_rng(mlp.seed)
+        u = rng.standard_normal((n, width), dtype=fnp.float32)
+
+        norm = fnp.sqrt(fnp.maximum(fnp.sum(u * u, axis=1), 1e-20))
+        u = u / norm[:, None]
+
+        x = fnp.concatenate([u, -u], axis=0) * _mean_chi_radius(width)
+        x = fnp.maximum(x @ weights[0], 0.0)
+
+        first_pair = (x[:n] + x[n:]) * 0.5
+        rows = [first_mean[None, :]]
+
+        for layer_index, weight in enumerate(weights[1:], start=1):
+            x = fnp.maximum(x @ weight, 0.0)
+            if layer_index < depth - 1:
+                rows.append(fnp.mean(x, axis=0)[None, :])
+
+        final_pair = (x[:n] + x[n:]) * 0.5
+        final_mean = fnp.mean(final_pair, axis=0)
+
+        if n > width + 4:
+            control_mean = fnp.mean(first_pair, axis=0)
+            h = first_pair - control_mean[None, :]
+            f = final_pair - final_mean[None, :]
+
+            gram = h.T @ h
+            cross = h.T @ f
+            ridge = fnp.maximum(
+                (fnp.sum(h * h) / float(max(width, 1))) * 3e-5,
+                1e-7,
+            )
+
+            try:
+                beta = fnp.linalg.solve(
+                    gram + ridge * fnp.eye(width, dtype=gram.dtype),
+                    cross,
+                )
+            except Exception:
+                values, vectors = fnp.linalg.eigh(gram)
+                beta = vectors @ ((vectors.T @ cross) / (fnp.maximum(values, 0.0)[:, None] + ridge))
+
+            final_mean = final_mean - ((control_mean - first_mean) @ beta)
+            final_mean = fnp.maximum(final_mean, 0.0)
+
+        rows.append(final_mean[None, :])
+        return fnp.concatenate(rows, axis=0)
+```

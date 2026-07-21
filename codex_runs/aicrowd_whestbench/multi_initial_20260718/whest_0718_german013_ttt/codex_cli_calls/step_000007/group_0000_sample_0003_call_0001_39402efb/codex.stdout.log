@@ -1,0 +1,89 @@
+```python
+from __future__ import annotations
+
+import math
+
+import flopscope.numpy as fnp
+from whestbench import BaseEstimator
+
+
+_BUDGET_FRACTION = 0.06
+_MIN_SAMPLES = 24
+_MAX_SAMPLES = 1_000_000
+_ARRAY_BYTES_LIMIT = 96 * 1024 * 1024
+_WORST_CASE_ITEMSIZE = 8
+_INV_SQRT_2PI = 0.3989422804014327
+
+
+def _sample_count(budget, width: int, depth: int) -> int:
+    max_k_by_bytes = _ARRAY_BYTES_LIMIT // max(width * _WORST_CASE_ITEMSIZE, 1)
+
+    if budget is None:
+        k = min(4096, max_k_by_bytes)
+    else:
+        per_sample = depth * (2 * width * width + width) + 2 * width * width + 6 * width
+        fixed = 6 * width * width + width
+        k = (int(_BUDGET_FRACTION * budget) - fixed) // max(per_sample, 1)
+        k = int(max(_MIN_SAMPLES, min(_MAX_SAMPLES, max_k_by_bytes, k)))
+
+    k = k - (k & 1)
+    return max(2, k)
+
+
+def _mean_chi_radius(width: int) -> float:
+    return math.sqrt(2.0) * math.exp(
+        math.lgamma(0.5 * (width + 1.0)) - math.lgamma(0.5 * width)
+    )
+
+
+class Estimator(BaseEstimator):
+    def predict(self, mlp, budget):
+        width = mlp.width
+        depth = mlp.depth
+
+        first_var = fnp.sum(mlp.weights[0] * mlp.weights[0], axis=0)
+        first_mean = fnp.sqrt(fnp.maximum(first_var, 1e-12)) * _INV_SQRT_2PI
+
+        if depth == 1:
+            return first_mean[None, :]
+
+        k = _sample_count(budget, width, depth)
+        n = k // 2
+
+        rng = fnp.random.default_rng(mlp.seed)
+        u = rng.standard_normal((n, width), dtype=fnp.float32)
+        u = u / fnp.sqrt(fnp.maximum(fnp.sum(u * u, axis=1), 1e-20))[:, None]
+
+        covariance = (u.T @ u) / float(n)
+        values, vectors = fnp.linalg.eigh(covariance)
+        values = fnp.maximum(values * float(width), 1e-6)
+        inverse_sqrt = (vectors / fnp.sqrt(values)) @ vectors.T
+
+        x = fnp.concatenate([u, -u], axis=0) * _mean_chi_radius(width)
+        x = fnp.maximum(x @ (inverse_sqrt @ mlp.weights[0]), 0.0)
+        first_pair = (x[:n] + x[n:]) * 0.5
+
+        layer_means = [first_mean]
+        for layer_index, weight in enumerate(mlp.weights[1:], start=1):
+            x = fnp.maximum(x @ weight, 0.0)
+            pair_mean = (x[:n] + x[n:]) * 0.5
+            mean = fnp.mean(pair_mean, axis=0)
+
+            if layer_index == depth - 1 and n > width + 8:
+                control_mean = fnp.mean(first_pair, axis=0)
+                h = first_pair - control_mean[None, :]
+                f = pair_mean - mean[None, :]
+
+                gram = h.T @ h
+                cross = h.T @ f
+                eigvals, eigvecs = fnp.linalg.eigh(gram)
+                eigvals = fnp.maximum(eigvals, 0.0)
+                ridge = fnp.maximum(fnp.mean(eigvals) * 1e-5, 1e-6)
+                beta = eigvecs @ ((eigvecs.T @ cross) / (eigvals[:, None] + ridge))
+
+                mean = fnp.maximum(mean - ((control_mean - first_mean) @ beta), 0.0)
+
+            layer_means.append(mean)
+
+        return fnp.stack(layer_means, axis=0)
+```

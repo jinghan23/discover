@@ -1,0 +1,332 @@
+You are solving the ARC White-Box Estimation Challenge 2026
+(WhestBench) under the official evaluator contract.
+
+Task:
+- You receive the weights of a randomly initialized square ReLU MLP.
+- Inputs follow a standard normal distribution.
+- Predict the per-neuron post-ReLU activation mean for every layer.
+- Return a `flopscope.numpy.ndarray` with shape `(mlp.depth, mlp.width)`.
+
+Required submission interface:
+- Import `flopscope.numpy as fnp` for numerical operations.
+- Define `class Estimator(BaseEstimator)` with
+  `predict(self, mlp, budget)`.
+- Optional `setup(self, context)` and `teardown(self)` hooks follow the official
+  WhestBench API.
+- Seed predict-time randomness from `mlp.seed` and setup-time randomness from
+  `context.seed`.
+
+Official scoring:
+- For each MLP, compute final-layer MSE against the official Monte Carlo target.
+- Effective compute is `C = FLOPs + lambda * residual_wall_time`.
+- A valid MLP score is `final_layer_mse * max(0.1, C / flop_budget)`.
+- The suite score is the arithmetic mean of those per-MLP scores; lower is better.
+- Exceptions, invalid shapes/non-finite values, FLOP/time exhaustion, or combined
+  budget exhaustion use an all-zero prediction and multiplier 1.0 for that MLP.
+- All-layer MSE is diagnostic only.
+
+Do not use plain NumPy or uninstrumented numerical libraries to evade FLOP
+accounting. Residual Python or uninstrumented work is charged at the official
+lambda rate and can exhaust the combined budget.
+
+Fairness and data isolation:
+- Derive predictions only from the `mlp` weights and allowed setup context.
+- Do not inspect, search for, or read evaluation datasets, Hugging Face caches,
+  saved evaluation reports, target moments, or ground-truth files.
+- Do not hardcode values tied to public mini MLPs. Such candidates are invalid
+  even if they receive a low local score.
+
+Algorithm directions worth exploring:
+- Mean and diagonal-variance propagation through ReLU moments.
+- Full, structured, or low-rank covariance propagation.
+- Hybrid analytic propagation with compute-budgeted Monte Carlo probes.
+- Layer-wise corrections for correlation error in deep networks.
+- Allocating FLOPs to layers where final-layer MSE is most sensitive.
+
+
+Official evaluation suite for this run:
+- dataset: None@None
+- split / MLPs: None / first None
+- width / depth: None / None
+- FLOP budget per MLP: None
+- residual penalty lambda: None FLOPs/second
+- runner: None
+
+You are iteratively optimizing budget-adjusted final-layer score.
+Here is the last code we ran:
+```python
+from __future__ import annotations
+
+import math
+
+import flopscope as flops
+import flopscope.numpy as fnp
+from whestbench import BaseEstimator
+
+
+_INV_SQRT_2PI = 0.39894228040143267794
+_INV_2PI = 0.15915494309189533577
+_PI = 3.14159265358979323846
+_TAIL_CLIP = 1e-12
+_ARRAY_BYTES_LIMIT = 112 * 1024 * 1024
+_FLOAT64_ITEMSIZE = 8
+_TARGET_FLOP_FRACTION = 0.118
+
+
+def _first_primes(count: int) -> tuple[int, ...]:
+    primes = []
+    candidate = 2
+    while len(primes) < count:
+        ok = True
+        for p in primes:
+            if p * p > candidate:
+                break
+            if candidate % p == 0:
+                ok = False
+                break
+        if ok:
+            primes.append(candidate)
+        candidate += 1
+    return tuple(primes)
+
+
+def _mean_chi(dim: int) -> float:
+    return math.sqrt(2.0) * math.exp(
+        math.lgamma(0.5 * (dim + 1.0)) - math.lgamma(0.5 * dim)
+    )
+
+
+def _lattice_generator(width: int) -> fnp.ndarray:
+    roots = fnp.sqrt(fnp.array(_first_primes(width), dtype=fnp.float64))
+    return roots - fnp.floor(roots)
+
+
+def _sphere_lattice_inputs(n_samples: int, width: int, seed: int) -> fnp.ndarray:
+    half = max(1, n_samples // 2)
+    rng = fnp.random.default_rng(seed)
+    generator = _lattice_generator(width)
+    shift = rng.random(width)
+
+    indices = fnp.arange(half, dtype=fnp.float64)[:, None]
+    uniforms = indices * generator[None, :] + shift[None, :]
+    uniforms = uniforms - fnp.floor(uniforms)
+    uniforms = fnp.clip(uniforms, _TAIL_CLIP, 1.0 - _TAIL_CLIP)
+
+    base = flops.stats.norm.ppf(uniforms)
+    norm = fnp.sqrt(fnp.sum(base * base, axis=1, keepdims=True))
+    base = (_mean_chi(width) * base) / fnp.maximum(norm, 1e-30)
+
+    return fnp.concatenate((base, -base), axis=0)
+
+
+def _pair_average(values: fnp.ndarray) -> fnp.ndarray:
+    half = values.shape[0] // 2
+    return 0.5 * (values[:half] + values[half : 2 * half])
+
+
+def _exact_first_layer_mean(weight: fnp.ndarray) -> fnp.ndarray:
+    sigma = fnp.sqrt(fnp.sum(weight * weight, axis=0))
+    return sigma * _INV_SQRT_2PI
+
+
+def _relu_product_kernel(gram: fnp.ndarray) -> fnp.ndarray:
+    diag = fnp.maximum(fnp.diag(gram), 0.0)
+    sigma = fnp.sqrt(diag)
+    denom = fnp.maximum(sigma[:, None] * sigma[None, :], 1e-30)
+    rho = fnp.clip(gram / denom, -1.0, 1.0)
+
+    root = fnp.sqrt(fnp.maximum(1.0 - rho * rho, 0.0))
+    theta = fnp.arccos(rho)
+    return (sigma[:, None] * sigma[None, :]) * (
+        root + (_PI - theta) * rho
+    ) * _INV_2PI
+
+
+def _first_layer_sphere_second(weight: fnp.ndarray, width: int) -> fnp.ndarray:
+    radius = _mean_chi(width)
+    return (radius * radius / width) * _relu_product_kernel(weight.T @ weight)
+
+
+def _exact_second_preact_square_mean(
+    first_weight: fnp.ndarray,
+    second_weight: fnp.ndarray,
+    width: int,
+) -> fnp.ndarray:
+    first_second = _first_layer_sphere_second(first_weight, width)
+    projected = first_second @ second_weight
+    return fnp.sum(second_weight * projected, axis=0)
+
+
+def _use_quadratic_cv(budget: int, width: int, depth: int) -> bool:
+    if depth < 2:
+        return False
+    target = int(_TARGET_FLOP_FRACTION * budget)
+    return target > 12 * width * width * width + 32 * width * width
+
+
+def _sample_count(budget: int, width: int, depth: int, quadratic_cv: bool) -> int:
+    forward_per_sample = depth * (2 * width * width + width)
+    sphere_per_sample = 4 * width
+    ppf_per_sample = 45 * width
+    mean_per_sample = max(depth - 1, 0) * width
+
+    cv_per_sample = 3 * width * width
+    cv_fixed = 3 * width * width * width + 10 * width * width + 8 * width
+
+    if quadratic_cv:
+        cv_per_sample += 6 * width * width
+        cv_fixed += 8 * width * width * width + 14 * width * width
+
+    per_sample = (
+        forward_per_sample
+        + sphere_per_sample
+        + ppf_per_sample
+        + mean_per_sample
+        + cv_per_sample
+    )
+
+    count = (int(_TARGET_FLOP_FRACTION * budget) - cv_fixed) // max(per_sample, 1)
+    max_by_bytes = _ARRAY_BYTES_LIMIT // max(width * _FLOAT64_ITEMSIZE, 1)
+    count = int(max(8, min(count, max_by_bytes)))
+    count -= count % 2
+    return max(2, count)
+
+
+def _ridge_for(cov: fnp.ndarray, width: int, n_samples: int, base: float, scale: float):
+    diag_scale = fnp.mean(fnp.diag(cov))
+    return fnp.maximum(diag_scale, 1e-30) * (
+        base + scale * width / fnp.maximum(float(n_samples), 1.0)
+    )
+
+
+def _final_control_variate(
+    first_activations: fnp.ndarray,
+    exact_first_mean: fnp.ndarray,
+    final_activations: fnp.ndarray,
+    second_preactivations: fnp.ndarray | None,
+    exact_second_square_mean: fnp.ndarray | None,
+) -> fnp.ndarray:
+    y = _pair_average(final_activations)
+    c1 = _pair_average(first_activations)
+
+    y_mean = fnp.mean(y, axis=0)
+    c1_mean = fnp.mean(c1, axis=0)
+    yc = y - y_mean
+    c1c = c1 - c1_mean
+    n_pairs = c1.shape[0]
+    width = c1.shape[1]
+
+    r11 = (c1c.T @ c1c) / n_pairs
+    b1 = (c1c.T @ yc) / n_pairs
+    ridge1 = _ridge_for(r11, width, n_pairs, 0.012, 0.8)
+    solve1 = r11 + ridge1 * fnp.eye(width, dtype=fnp.float64)
+
+    beta1 = fnp.linalg.solve(solve1, b1)
+    d1 = c1_mean - exact_first_mean
+    prediction = y_mean - d1 @ beta1
+
+    if second_preactivations is not None and exact_second_square_mean is not None:
+        c2 = _pair_average(second_preactivations * second_preactivations)
+        c2_mean = fnp.mean(c2, axis=0)
+        c2c = c2 - c2_mean
+
+        cross12 = (c1c.T @ c2c) / n_pairs
+        gamma12 = fnp.linalg.solve(solve1, cross12)
+        c2r = c2c - c1c @ gamma12
+        yr = yc - c1c @ beta1
+
+        r22 = (c2r.T @ c2r) / n_pairs
+        b2 = (c2r.T @ yr) / n_pairs
+        ridge2 = _ridge_for(r22, width, n_pairs, 0.045, 1.6)
+        beta2 = fnp.linalg.solve(
+            r22 + ridge2 * fnp.eye(width, dtype=fnp.float64),
+            b2,
+        )
+
+        d2 = (c2_mean - exact_second_square_mean) - d1 @ gamma12
+        prediction = prediction - d2 @ beta2
+
+    return fnp.maximum(prediction, 0.0)
+
+
+class Estimator(BaseEstimator):
+    def setup(self, context):
+        self._setup_seed = context.seed
+
+    def predict(self, mlp, budget):
+        width = mlp.width
+        depth = mlp.depth
+        budget = int(budget)
+
+        quadratic_cv = _use_quadratic_cv(budget, width, depth)
+        n_samples = _sample_count(budget, width, depth, quadratic_cv)
+
+        activations = _sphere_lattice_inputs(n_samples, width, mlp.seed)
+        rows = []
+
+        first_activations = None
+        second_preactivations = None
+        exact_first_mean = None
+        exact_second_square_mean = None
+
+        for layer_index, weight in enumerate(mlp.weights):
+            preactivations = activations @ weight
+
+            if layer_index == 1 and quadratic_cv:
+                second_preactivations = preactivations
+
+            activations = fnp.maximum(preactivations, 0.0)
+
+            if layer_index == 0:
+                exact_first_mean = _exact_first_layer_mean(weight)
+                first_activations = activations
+                rows.append(exact_first_mean)
+
+                if quadratic_cv:
+                    try:
+                        exact_second_square_mean = _exact_second_preact_square_mean(
+                            weight,
+                            mlp.weights[1],
+                            width,
+                        )
+                    except Exception:
+                        exact_second_square_mean = None
+                        second_preactivations = None
+            else:
+                rows.append(fnp.mean(activations, axis=0))
+
+        if depth > 1 and first_activations is not None and exact_first_mean is not None:
+            try:
+                rows[-1] = _final_control_variate(
+                    first_activations,
+                    exact_first_mean,
+                    activations,
+                    second_preactivations,
+                    exact_second_square_mean,
+                )
+            except Exception:
+                rows[-1] = fnp.mean(activations, axis=0)
+
+        return fnp.stack(rows, axis=0)
+```
+Here is the budget-adjusted final-layer score before and after running the code above (lower is better): 0.000000 -> 0.000000
+Target: 1e-07. Current gap: 0.000000. Further improvements will also be generously rewarded.
+
+--- Previous Program Output ---
+
+
+		 ...(TRUNCATED)...
+43871e-05 | 3.1816197e+10 | ok
+benjamin-dean | 1.7826424e-07 | 1.5229587e-06 | 3.1837945e+10 | ok
+michele-galvan | 2.5618143e-07 | 2.186174e-06 | 3.1873652e+10 | ok
+cathy-butler | 1.3371597e-06 | 1.1417717e-05 | 3.1854654e+10 | ok
+lindsey-chase | 2.605523e-07 | 2.22482e-06 | 3.1854364e+10 | ok
+kenneth-hernandez | 4.4036949e-07 | 3.7594345e-06 | 3.1861308e+10 | ok
+lauren-flowers | 5.320094e-07 | 4.5463539e-06 | 3.1829145e+10 | ok
+kristi-johnson | 3.6839296e-07 | 3.1464317e-06 | 3.1846515e+10 | ok
+--- End Output ---
+
+Return one final Python code block containing an official `Estimator` class.
+
+
+Return only the final answer content. Do not edit files or run tools.
