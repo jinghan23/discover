@@ -1,0 +1,278 @@
+from __future__ import annotations
+
+import flopscope.numpy as fnp
+from whestbench import BaseEstimator
+
+
+_MIN_SAMPLES = 32
+_MAX_SAMPLES = 1_000_000
+_ARRAY_BYTES_LIMIT = 100 * 1024 * 1024
+_WORST_CASE_ITEMSIZE = 8
+_SETUP_SEED_OFFSET = 3
+_FULL_COV_WIDTH_LIMIT = 1024
+
+_PI = 3.141592653589793
+_INV_2PI = 0.15915494309189535
+_INV_SQRT_2PI = 0.3989422804014327
+_RELU_ZERO_VARIANCE = 0.5 - _INV_SQRT_2PI * _INV_SQRT_2PI
+_RELU_UNIT_THIRD_CENTRAL = _INV_SQRT_2PI * (0.5 + 1.0 / _PI)
+
+_FINAL_ANALYTIC_BLEND = 0.06
+_BLEND_MIN_FACTOR = 0.25
+_BLEND_MAX_FACTOR = 1.6
+
+
+def _to_int(value, default=0):
+    try:
+        if value is None:
+            return default
+        if isinstance(value, dict):
+            for name in ("flop_budget", "flops", "budget"):
+                if name in value and value[name] is not None:
+                    return int(value[name])
+        for name in ("flop_budget", "flops", "budget"):
+            attr = getattr(value, name, None)
+            if attr is not None:
+                return int(attr)
+        return int(value)
+    except Exception:
+        return default
+
+
+def _sample_count(budget: int, width: int, depth: int) -> int:
+    per_sample = depth * (2 * width * width + width) + width * width
+    fixed = 3 * width**3
+    k = (int(0.18 * budget) - fixed) // max(per_sample, 1)
+    max_k_by_bytes = _ARRAY_BYTES_LIMIT // max(width * _WORST_CASE_ITEMSIZE, 1)
+    k = int(max(_MIN_SAMPLES, min(_MAX_SAMPLES, max_k_by_bytes, k)))
+    return k - (k & 1)
+
+
+def _normal_cdf(x):
+    ax = fnp.abs(x)
+    t = 1.0 / (1.0 + 0.2316419 * ax)
+    poly = (
+        ((((1.330274429 * t - 1.821255978) * t + 1.781477937) * t - 0.356563782)
+        * t + 0.319381530)
+        * t
+    )
+    cdf_pos = 1.0 - _INV_SQRT_2PI * fnp.exp(-0.5 * ax * ax) * poly
+    return fnp.where(x >= 0.0, cdf_pos, 1.0 - cdf_pos)
+
+
+def _gaussian_relu_mean(mean, variance):
+    variance = fnp.maximum(variance, 1e-12)
+    std = fnp.sqrt(variance)
+    t = mean / std
+    return std * _INV_SQRT_2PI * fnp.exp(-0.5 * t * t) + mean * _normal_cdf(t)
+
+
+def _edgeworth_relu_mean(mean, variance, third_cumulant, fourth_cumulant=None):
+    variance = fnp.maximum(variance, 1e-12)
+    std = fnp.sqrt(variance)
+    t = mean / std
+    phi = _INV_SQRT_2PI * fnp.exp(-0.5 * t * t)
+
+    third_limit = 4.0 * variance * std
+    third_cumulant = fnp.minimum(third_limit, fnp.maximum(-third_limit, third_cumulant))
+    correction = -third_cumulant * t * phi / (6.0 * variance)
+
+    if fourth_cumulant is not None:
+        fourth_limit = 8.0 * variance * variance
+        fourth_cumulant = fnp.minimum(fourth_limit, fnp.maximum(-fourth_limit, fourth_cumulant))
+        correction = correction + fourth_cumulant * (t * t - 1.0) * phi / (24.0 * variance * std)
+
+    return fnp.maximum(_gaussian_relu_mean(mean, variance) + correction, 0.0)
+
+
+def _sample_cumulants(values, mean, variance):
+    centered = values - mean
+    squared = centered * centered
+    third = fnp.mean(squared * centered, axis=0)
+    fourth = fnp.mean(squared * squared, axis=0) - 3.0 * variance * variance
+
+    std = fnp.sqrt(fnp.maximum(variance, 1e-12))
+    third_limit = 4.0 * variance * std
+    fourth_limit = 8.0 * variance * variance
+
+    third = fnp.minimum(third_limit, fnp.maximum(-third_limit, third))
+    fourth = fnp.minimum(fourth_limit, fnp.maximum(-fourth_limit, fourth))
+    return third, fourth
+
+
+def _blend_final(sample_mean, analytic_mean, relu_values):
+    n = float(max(int(relu_values.shape[0]), 1))
+    relu_second = fnp.asarray(
+        fnp.mean(fnp.asarray(relu_values * relu_values, dtype=fnp.float64), axis=0),
+        dtype=fnp.float32,
+    )
+    mean_variance = fnp.maximum(relu_second - sample_mean * sample_mean, 0.0) / n
+    diff = analytic_mean - sample_mean
+    factor = (2.0 * mean_variance) / (mean_variance + diff * diff + 1e-12)
+    factor = fnp.minimum(_BLEND_MAX_FACTOR, fnp.maximum(_BLEND_MIN_FACTOR, factor))
+    blend = _FINAL_ANALYTIC_BLEND * factor
+    return fnp.asarray(sample_mean + blend * diff, dtype=fnp.float32)
+
+
+def _correct_columns(values, target_mean, target_variance):
+    sample_mean = fnp.mean(values, axis=0)
+    sample_second = fnp.mean(values * values, axis=0)
+    sample_variance = fnp.maximum(sample_second - sample_mean * sample_mean, 1e-6)
+    scale = fnp.sqrt(fnp.maximum(target_variance, 1e-12) / sample_variance)
+    return fnp.asarray((values - sample_mean) * scale + target_mean, dtype=fnp.float32)
+
+
+def _first_relu_covariance(weight, variance, mean):
+    std = fnp.sqrt(fnp.maximum(variance, 1e-12))
+    gram = weight.T @ weight
+    denom = fnp.maximum(std[:, None] * std[None, :], 1e-12)
+    rho = fnp.minimum(1.0, fnp.maximum(-1.0, gram / denom))
+    root = fnp.sqrt(fnp.maximum(1.0 - rho * rho, 0.0))
+    second = denom * (root + (_PI - fnp.arccos(rho)) * rho) * _INV_2PI
+    return fnp.asarray(second - mean[:, None] * mean[None, :], dtype=fnp.float32)
+
+
+def _second_layer_moments(first_weight, second_weight, first_variance, first_mean, exact):
+    z_mean = first_mean @ second_weight
+    first_diag_cov = first_variance * _RELU_ZERO_VARIANCE
+
+    if exact:
+        cov = _first_relu_covariance(first_weight, first_variance, first_mean)
+        z_variance = fnp.sum(second_weight * (cov @ second_weight), axis=0)
+    else:
+        product = first_weight @ second_weight
+        linearized = 0.25 * fnp.sum(product * product, axis=0)
+        diag_fix = (first_diag_cov - 0.25 * first_variance) @ (second_weight * second_weight)
+        z_variance = linearized + diag_fix
+
+    third = (
+        (fnp.maximum(first_variance, 1e-12) ** 1.5 * _RELU_UNIT_THIRD_CENTRAL)
+        @ (second_weight * second_weight * second_weight)
+    )
+    return z_mean, fnp.maximum(z_variance, 1e-8), third
+
+
+class Estimator(BaseEstimator):
+    def setup(self, context):
+        self._samples = None
+        self._width = None
+        self._depth = None
+        self._setup_seed = _to_int(getattr(context, "seed", 0)) + _SETUP_SEED_OFFSET
+
+        width = getattr(context, "width", None)
+        depth = getattr(context, "depth", None)
+        flop_budget = _to_int(getattr(context, "flop_budget", 0))
+
+        if width is not None and depth is not None and flop_budget > 0:
+            self._width = int(width)
+            self._depth = int(depth)
+            self._samples = self._make_samples(
+                self._width,
+                _sample_count(flop_budget, self._width, self._depth),
+                self._setup_seed,
+            )
+
+    def teardown(self):
+        self._samples = None
+
+    def _make_samples(self, width, k, seed):
+        rng = fnp.random.default_rng(seed)
+        half_k = max(1, k // 2)
+        u = rng.standard_normal((half_k, width), dtype=fnp.float32)
+
+        if half_k < width:
+            gram = (u @ u.T) / float(width)
+            eigenvalues, eigenvectors = fnp.linalg.eigh(gram)
+            inverse_sqrt = (eigenvectors / fnp.sqrt(fnp.maximum(eigenvalues, 1e-6))) @ eigenvectors.T
+            half = fnp.asarray(inverse_sqrt @ u, dtype=fnp.float32)
+        else:
+            covariance = (u.T @ u) / float(half_k)
+            eigenvalues, eigenvectors = fnp.linalg.eigh(covariance)
+            inverse_sqrt = (eigenvectors / fnp.sqrt(fnp.maximum(eigenvalues, 1e-6))) @ eigenvectors.T
+            half = fnp.asarray(u @ inverse_sqrt, dtype=fnp.float32)
+
+        return fnp.concatenate([half, -half], axis=0)
+
+    def predict(self, mlp, budget):
+        width = int(mlp.width)
+        depth = int(mlp.depth)
+
+        if (
+            not hasattr(self, "_samples")
+            or self._samples is None
+            or self._samples.shape[1] != width
+            or getattr(self, "_depth", depth) != depth
+        ):
+            self._samples = self._make_samples(
+                width,
+                _sample_count(_to_int(budget), width, depth),
+                int(mlp.seed) + _SETUP_SEED_OFFSET,
+            )
+            self._width = width
+            self._depth = depth
+
+        first_weight = mlp.weights[0]
+        first_variance = fnp.sum(first_weight * first_weight, axis=0)
+        first_mean = fnp.sqrt(fnp.maximum(first_variance, 1e-12)) * _INV_SQRT_2PI
+
+        if depth == 1:
+            return fnp.asarray(first_mean[None, :], dtype=fnp.float32)
+
+        x = fnp.maximum(self._samples @ first_weight, 0.0)
+        x = _correct_columns(x, first_mean, first_variance * _RELU_ZERO_VARIANCE)
+
+        second_weight = mlp.weights[1]
+        z_mean, z_variance, z_third = _second_layer_moments(
+            first_weight,
+            second_weight,
+            first_variance,
+            first_mean,
+            width <= _FULL_COV_WIDTH_LIMIT,
+        )
+
+        z = _correct_columns(x @ second_weight, z_mean, z_variance)
+
+        if depth == 2:
+            relu_z = fnp.maximum(z, 0.0)
+            sample_mean = fnp.asarray(
+                fnp.mean(fnp.asarray(relu_z, dtype=fnp.float64), axis=0),
+                dtype=fnp.float32,
+            )
+            sample_third, sample_fourth = _sample_cumulants(z, z_mean, z_variance)
+            analytic_third = 0.5 * z_third + 0.5 * sample_third
+            analytic_mean = fnp.asarray(
+                _edgeworth_relu_mean(z_mean, z_variance, analytic_third, sample_fourth),
+                dtype=fnp.float32,
+            )
+            final_mean = _blend_final(sample_mean, analytic_mean, relu_z)
+            return fnp.concatenate([first_mean[None, :], final_mean[None, :]], axis=0)
+
+        layer_means = [fnp.asarray(first_mean, dtype=fnp.float32)]
+        x = fnp.maximum(z, 0.0)
+        layer_means.append(fnp.asarray(fnp.mean(x, axis=0), dtype=fnp.float32))
+
+        for weight in mlp.weights[2:-1]:
+            x = fnp.maximum(x @ weight, 0.0)
+            layer_means.append(fnp.asarray(fnp.mean(x, axis=0), dtype=fnp.float32))
+
+        final_weight = mlp.weights[-1]
+        z = x @ final_weight
+        relu_z = fnp.maximum(z, 0.0)
+        sample_mean = fnp.asarray(
+            fnp.mean(fnp.asarray(relu_z, dtype=fnp.float64), axis=0),
+            dtype=fnp.float32,
+        )
+
+        z_mean = fnp.mean(z, axis=0)
+        z_second = fnp.mean(z * z, axis=0)
+        z_variance = fnp.maximum(z_second - z_mean * z_mean, 1e-6)
+        z_third, z_fourth = _sample_cumulants(z, z_mean, z_variance)
+
+        analytic_mean = fnp.asarray(
+            _edgeworth_relu_mean(z_mean, z_variance, z_third, z_fourth),
+            dtype=fnp.float32,
+        )
+        final_mean = _blend_final(sample_mean, analytic_mean, relu_z)
+        layer_means.append(final_mean)
+
+        return fnp.asarray(fnp.stack(layer_means, axis=0), dtype=fnp.float32)

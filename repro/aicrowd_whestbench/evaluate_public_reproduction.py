@@ -34,6 +34,12 @@ def main() -> None:
     parser.add_argument("--split", default=SPLIT)
     parser.add_argument("--flop-budget", type=int, default=FLOP_BUDGET)
     parser.add_argument(
+        "--setup-seed",
+        type=int,
+        default=0,
+        help="Seed passed to the official setup context.",
+    )
+    parser.add_argument(
         "--lambda-flops-per-second",
         type=float,
         default=LAMBDA_FLOPS_PER_SECOND,
@@ -48,6 +54,7 @@ def main() -> None:
         n_mlps=args.n_mlps,
         flop_budget=args.flop_budget,
         lambda_flops_per_second=args.lambda_flops_per_second,
+        seed=args.setup_seed,
         runner="subprocess",
         streaming=False,
     )
@@ -89,6 +96,7 @@ def main() -> None:
             "flop_budget": args.flop_budget,
             "lambda_flops_per_second": args.lambda_flops_per_second,
             "runner": "subprocess",
+            "setup_seed": args.setup_seed,
         },
         "results": results,
         "source": str(args.estimator),
