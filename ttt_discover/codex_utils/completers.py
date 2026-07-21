@@ -180,6 +180,7 @@ class CodexCliCompleter(TextCompleter):
     ) -> "CodexCliCompleter":
         return cls(
             model_name=cfg.model_name,
+            reasoning_effort=getattr(cfg, "cli_reasoning_effort", "xhigh"),
             codex_command=cfg.cli_command,
             sandbox=cfg.cli_sandbox,
             cwd=cwd,

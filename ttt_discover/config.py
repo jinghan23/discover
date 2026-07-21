@@ -81,6 +81,7 @@ class DiscoverConfig:
     cli_command: str = "codex"
     cli_sandbox: CliSandboxName = "read-only"
     cli_timeout: float | None = None
+    cli_reasoning_effort: str | None = "xhigh"
 
     # Evaluation runner
     eval_runner: EvalRunnerName = "auto"
