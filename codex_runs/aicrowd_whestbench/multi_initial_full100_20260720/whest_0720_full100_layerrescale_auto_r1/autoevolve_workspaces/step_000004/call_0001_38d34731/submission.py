@@ -1,0 +1,105 @@
+from __future__ import annotations
+
+import flopscope as flops
+import flopscope.numpy as fnp
+from whestbench import BaseEstimator
+
+_FRAC = 0.09
+_BETA0 = 0.70
+_BETA1 = 0.052
+_RADIAL = True
+_SEED_OFFSET = 0
+_FINAL_GAUSS_BLEND = 0.03
+
+
+class Estimator(BaseEstimator):
+    def predict(self, mlp, budget):
+        width = int(mlp.width)
+        depth = int(mlp.depth)
+        rng = fnp.random.default_rng(int(mlp.seed) + _SEED_OFFSET)
+
+        per_sample = max(1, depth * (2 * width * width + 4 * width))
+        n_samples = max(1024, int((_FRAC * float(budget)) / float(per_sample)))
+        n_samples = min(n_samples, 8192)
+        n_samples = max(2, 2 * (n_samples // 2))
+
+        mu = fnp.zeros(width)
+        var = fnp.ones(width)
+        diag_rows = []
+        diag_vars = []
+        for w in mlp.weights:
+            mu_pre = w.T @ mu
+            var_pre = fnp.maximum((w * w).T @ var, 1e-12)
+            sigma = fnp.sqrt(var_pre)
+            alpha = mu_pre / sigma
+            phi = flops.stats.norm.pdf(alpha)
+            cdf = flops.stats.norm.cdf(alpha)
+            mu = mu_pre * cdf + sigma * phi
+            ez2 = (mu_pre * mu_pre + var_pre) * cdf + mu_pre * sigma * phi
+            var = fnp.maximum(ez2 - mu * mu, 0.0)
+            diag_rows.append(mu)
+            diag_vars.append(var)
+
+        half = n_samples // 2
+        base = fnp.asarray(rng.standard_normal((half, width), dtype=fnp.float32))
+        x = fnp.concatenate((base, -base), axis=0)
+        x = x - fnp.mean(x, axis=0)
+
+        q, _ = fnp.linalg.qr(x, mode="reduced")
+        if _RADIAL:
+            raw_norm = fnp.sqrt(fnp.maximum(fnp.sum(x * x, axis=1), 1e-12))[:, None]
+            q_norm = fnp.sqrt(fnp.maximum(fnp.sum(q * q, axis=1), 1e-12))[:, None]
+            x = q * (raw_norm / q_norm)
+            x = x - fnp.mean(x, axis=0)
+            x_var = fnp.maximum(fnp.mean(x * x, axis=0), 1e-12)
+            x = x * fnp.sqrt(1.0 / x_var)
+        else:
+            x = q * fnp.sqrt(float(n_samples))
+
+        for i, w in enumerate(mlp.weights[:-1]):
+            x = fnp.maximum(x @ w, 0.0)
+            if i == 0:
+                x_center = x - fnp.mean(x, axis=0)
+                x_var = fnp.maximum(fnp.mean(x_center * x_center, axis=0), 1e-12)
+                x_match = (
+                    x_center
+                    * fnp.sqrt(fnp.maximum(diag_vars[i], 1e-12) / x_var)
+                    + diag_rows[i]
+                )
+                x = (1.0 - _BETA0) * x + _BETA0 * x_match
+            elif i == 1:
+                x_center = x - fnp.mean(x, axis=0)
+                x_var = fnp.maximum(fnp.mean(x_center * x_center, axis=0), 1e-12)
+                x_match = (
+                    x_center
+                    * fnp.sqrt(fnp.maximum(diag_vars[i], 1e-12) / x_var)
+                    + diag_rows[i]
+                )
+                x = (1.0 - _BETA1) * x + _BETA1 * x_match
+
+        final_pre = x @ mlp.weights[-1]
+        final_act = fnp.maximum(final_pre, 0.0)
+        final_pred = fnp.asarray(
+            fnp.mean(fnp.asarray(final_act, dtype=fnp.float64), axis=0),
+            dtype=fnp.float32,
+        )
+        if _FINAL_GAUSS_BLEND != 0.0:
+            final_pre64 = fnp.asarray(final_pre, dtype=fnp.float64)
+            final_mu = fnp.mean(final_pre64, axis=0)
+            final_center = final_pre64 - final_mu
+            final_var = fnp.maximum(fnp.mean(final_center * final_center, axis=0), 1e-12)
+            final_sigma = fnp.sqrt(final_var)
+            final_alpha = final_mu / final_sigma
+            final_gauss = (
+                final_mu * flops.stats.norm.cdf(final_alpha)
+                + final_sigma * flops.stats.norm.pdf(final_alpha)
+            )
+            final_pred = (
+                (1.0 - _FINAL_GAUSS_BLEND) * final_pred
+                + _FINAL_GAUSS_BLEND * final_gauss
+            )
+        diag = fnp.asarray(fnp.stack(diag_rows, axis=0), dtype=fnp.float32)
+        return fnp.asarray(
+            fnp.concatenate((diag[:-1], final_pred[None, :]), axis=0),
+            dtype=fnp.float32,
+        )

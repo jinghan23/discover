@@ -1,0 +1,343 @@
+from __future__ import annotations
+
+import math
+import warnings
+
+import flopscope as flops
+import flopscope.numpy as fnp
+from whestbench import BaseEstimator
+
+warnings.filterwarnings("ignore", message=".*Symmetry lost.*")
+
+
+_TARGET_FLOP_FRACTION = 0.14
+_SHIFT_COUNT = 2
+_ANTIPODAL_DIRECTIONS = False
+_CROSS_FIT_VECTOR_CONTROL = True
+_SEED_OFFSET = 0
+_TAIL_CLIP = 1e-11
+_ARRAY_BYTES_LIMIT = 100 * 1024 * 1024
+_FLOAT64_ITEMSIZE = 8
+_VECTOR_CONTROL_MIN_SAMPLE_FACTOR = 1
+_VECTOR_CONTROL_RIDGE = 1e-8
+_VECTOR_CONTROL_SCALE = 1.15
+_SCALAR_CONTROL_RIDGE = 1e-8
+
+
+def _first_primes(count: int) -> tuple[int, ...]:
+    primes: list[int] = []
+    candidate = 2
+    while len(primes) < count:
+        is_prime = True
+        for prime in primes:
+            if prime * prime > candidate:
+                break
+            if candidate % prime == 0:
+                is_prime = False
+                break
+        if is_prime:
+            primes.append(candidate)
+        candidate += 1
+    return tuple(primes)
+
+
+def _lattice_generator(width: int) -> fnp.ndarray:
+    roots = fnp.sqrt(fnp.array(_first_primes(width), dtype=fnp.float64))
+    return roots - fnp.floor(roots)
+
+
+def _lattice_uniforms(
+    n_samples: int, generator: fnp.ndarray, shift: fnp.ndarray
+) -> fnp.ndarray:
+    indices = fnp.arange(n_samples, dtype=fnp.float64)[:, None]
+    unwrapped = indices * generator[None, :] + shift[None, :]
+    return unwrapped - fnp.floor(unwrapped)
+
+
+def _exact_first_layer_mean(first_weight: fnp.ndarray) -> fnp.ndarray:
+    standard_deviation = fnp.sqrt(fnp.sum(first_weight * first_weight, axis=0))
+    return standard_deviation / fnp.sqrt(2.0 * fnp.pi)
+
+
+def _first_layer_direction_mean_and_covariance(
+    first_weight: fnp.ndarray, mean_radius: float, identity: fnp.ndarray
+) -> tuple[fnp.ndarray, fnp.ndarray]:
+    width = first_weight.shape[0]
+    gram = first_weight.T @ first_weight
+    norm_squared = fnp.maximum(fnp.sum(first_weight * first_weight, axis=0), 0.0)
+    standard_deviation = fnp.sqrt(norm_squared)
+    standard_deviation_outer = standard_deviation[:, None] * standard_deviation[None, :]
+    correlation = fnp.clip(
+        gram / fnp.maximum(standard_deviation_outer, 1e-300), -1.0, 1.0
+    )
+    relu_kernel = (
+        fnp.sqrt(fnp.maximum(1.0 - correlation * correlation, 0.0))
+        + (fnp.pi - fnp.arccos(correlation)) * correlation
+    ) / (2.0 * fnp.pi)
+    second_moment = standard_deviation_outer * relu_kernel / width
+    mean = standard_deviation / (fnp.sqrt(2.0 * fnp.pi) * mean_radius)
+    covariance = second_moment - mean[:, None] * mean[None, :]
+    covariance = covariance + _VECTOR_CONTROL_RIDGE * identity
+    return mean, covariance
+
+
+def _mean_standard_normal_radius(width: int) -> float:
+    return math.sqrt(2.0) * math.exp(
+        math.lgamma(0.5 * (width + 1)) - math.lgamma(0.5 * width)
+    )
+
+
+def _sphere_relu_third_moment_scale(width: int) -> float:
+    mean_radius_cubed = (2.0 ** 1.5) * math.exp(
+        math.lgamma(0.5 * (width + 3)) - math.lgamma(0.5 * width)
+    )
+    return math.sqrt(2.0 / math.pi) / mean_radius_cubed
+
+
+def _sample_count(budget: int, width: int, depth: int) -> int:
+    lattice_per_sample = 89 * width
+    sphere_per_sample = 4 * width
+    forward_per_sample = depth * (2 * width * width + width)
+    control_variate_per_sample = 14 * width
+    later_means_per_sample = width if depth > 1 else 0
+    per_sample = (
+        lattice_per_sample
+        + sphere_per_sample
+        + forward_per_sample
+        + control_variate_per_sample
+        + later_means_per_sample
+    )
+
+    fixed = 2 * width * width + 8 * width
+    n_samples = (int(_TARGET_FLOP_FRACTION * budget) - fixed) // per_sample
+    max_samples_by_bytes = _ARRAY_BYTES_LIMIT // max(width * _FLOAT64_ITEMSIZE, 1)
+    return int(max(1, min(n_samples, max_samples_by_bytes)))
+
+
+class Estimator(BaseEstimator):
+    def setup(self, context):
+        self._width_constants = {}
+
+    def _constants_for_width(self, width: int):
+        cache = getattr(self, "_width_constants", None)
+        if cache is None:
+            cache = {}
+            self._width_constants = cache
+        constants = cache.get(width)
+        if constants is None:
+            constants = (
+                _lattice_generator(width),
+                _mean_standard_normal_radius(width),
+                fnp.eye(width, dtype=fnp.float64),
+                fnp.zeros(width, dtype=fnp.float64),
+            )
+            cache[width] = constants
+        return constants
+
+    def predict(self, mlp, budget):
+        n_samples = _sample_count(budget, mlp.width, mlp.depth)
+        if _ANTIPODAL_DIRECTIONS:
+            n_direction_samples = max(1, n_samples // 2)
+            actual_samples = 2 * n_direction_samples
+        else:
+            n_per_shift = max(1, n_samples // _SHIFT_COUNT)
+            actual_samples = n_per_shift * _SHIFT_COUNT
+
+        use_vector_control = actual_samples >= max(
+            2, _VECTOR_CONTROL_MIN_SAMPLE_FACTOR * mlp.width
+        )
+
+        rng = fnp.random.default_rng(mlp.seed + _SEED_OFFSET)
+        generator, mean_radius, identity, zero_row = self._constants_for_width(
+            mlp.width
+        )
+
+        base_shift = rng.random(mlp.width)
+        if _ANTIPODAL_DIRECTIONS:
+            uniforms = _lattice_uniforms(n_direction_samples, generator, base_shift)
+        else:
+            shift_arrays = []
+            paired_shift = base_shift
+            for shift_index in range(_SHIFT_COUNT):
+                if shift_index == 0:
+                    shift = base_shift
+                elif shift_index == 1:
+                    shift = 1.0 - base_shift
+                elif shift_index % 2 == 0:
+                    paired_shift = rng.random(mlp.width)
+                    shift = paired_shift
+                else:
+                    shift = 1.0 - paired_shift
+                shift_arrays.append(_lattice_uniforms(n_per_shift, generator, shift))
+            uniforms = fnp.concatenate(tuple(shift_arrays), axis=0)
+
+        uniforms = 1.0 - fnp.abs(2.0 * uniforms - 1.0)
+        uniforms = fnp.clip(uniforms, _TAIL_CLIP, 1.0 - _TAIL_CLIP)
+        activations = flops.stats.norm.ppf(uniforms)
+        radii = fnp.sqrt(fnp.sum(activations * activations, axis=1))[:, None]
+        activations = fnp.asarray(
+            activations / fnp.maximum(radii, 1e-30), dtype=fnp.float32
+        )
+
+        if _ANTIPODAL_DIRECTIONS:
+            activations = fnp.concatenate((activations, -activations), axis=0)
+
+        rows = []
+        final_layer_index = mlp.depth - 1
+        first_row = None
+        first_activations = None
+        first_preactivation_square_sum = None
+
+        for layer_index, weight in enumerate(mlp.weights):
+            preactivations = activations @ weight
+            activations = fnp.maximum(preactivations, 0.0)
+
+            if layer_index == 0:
+                first_row = _exact_first_layer_mean(weight)
+                first_activations = activations
+                if not use_vector_control:
+                    first_preactivation_square_sum = fnp.sum(
+                        preactivations * preactivations, axis=1
+                    )
+                rows.append(first_row)
+
+            elif layer_index == final_layer_index:
+                final_mean = fnp.mean(activations, axis=0)
+                centered_final = activations - final_mean[None, :]
+
+                if use_vector_control:
+                    (
+                        exact_first_direction_mean,
+                        first_direction_covariance,
+                    ) = _first_layer_direction_mean_and_covariance(
+                        mlp.weights[0], mean_radius, identity
+                    )
+                    centered_first_direction = (
+                        first_activations - exact_first_direction_mean[None, :]
+                    )
+
+                    if _CROSS_FIT_VECTOR_CONTROL:
+                        half_sample_count = first_activations.shape[0] // 2
+                        first_half = slice(0, half_sample_count)
+                        second_half = slice(
+                            half_sample_count, first_activations.shape[0]
+                        )
+
+                        first_cross_covariance = (
+                            centered_first_direction[first_half].T
+                            @ centered_final[first_half]
+                        ) / half_sample_count
+                        second_cross_covariance = (
+                            centered_first_direction[second_half].T
+                            @ centered_final[second_half]
+                        ) / (first_activations.shape[0] - half_sample_count)
+
+                        first_coefficients = fnp.linalg.solve(
+                            first_direction_covariance, first_cross_covariance
+                        )
+                        second_coefficients = fnp.linalg.solve(
+                            first_direction_covariance, second_cross_covariance
+                        )
+
+                        first_half_mean = fnp.mean(first_activations[first_half], axis=0)
+                        second_half_mean = fnp.mean(
+                            first_activations[second_half], axis=0
+                        )
+                        correction = 0.5 * (
+                            (first_half_mean - exact_first_direction_mean)
+                            @ second_coefficients
+                            + (second_half_mean - exact_first_direction_mean)
+                            @ first_coefficients
+                        )
+                    else:
+                        first_direction_mean = fnp.mean(first_activations, axis=0)
+                        cross_covariance = (
+                            centered_first_direction.T @ centered_final
+                        ) / first_activations.shape[0]
+                        coefficients = fnp.linalg.solve(
+                            first_direction_covariance, cross_covariance
+                        )
+                        correction = (
+                            first_direction_mean - exact_first_direction_mean
+                        ) @ coefficients
+
+                    rows.append(
+                        mean_radius * (final_mean - _VECTOR_CONTROL_SCALE * correction)
+                    )
+
+                else:
+                    activation_sum = fnp.sum(first_activations, axis=1)
+                    activation_square_sum = fnp.sum(
+                        first_activations * first_activations, axis=1
+                    )
+                    activation_cubic_sum = fnp.sum(
+                        first_activations
+                        * first_activations
+                        * first_activations,
+                        axis=1,
+                    )
+                    activation_fourth_sum = fnp.sum(
+                        first_activations
+                        * first_activations
+                        * first_activations
+                        * first_activations,
+                        axis=1,
+                    )
+                    controls = fnp.stack(
+                        (
+                            activation_sum,
+                            activation_square_sum,
+                            activation_cubic_sum,
+                            activation_fourth_sum,
+                            first_preactivation_square_sum,
+                        ),
+                        axis=1,
+                    )
+
+                    control_mean = fnp.mean(controls, axis=0)
+                    centered_control = controls - control_mean[None, :]
+                    control_covariance = centered_control.T @ centered_control
+                    control_covariance = control_covariance + (
+                        _SCALAR_CONTROL_RIDGE
+                        * first_activations.shape[0]
+                        * fnp.eye(control_covariance.shape[0], dtype=fnp.float64)
+                    )
+                    cross_covariance = centered_control.T @ centered_final
+                    coefficients = fnp.linalg.solve(
+                        control_covariance, cross_covariance
+                    )
+
+                    exact_control_mean = fnp.sum(first_row) / mean_radius
+                    exact_square_mean = (
+                        0.5 * fnp.sum(mlp.weights[0] * mlp.weights[0]) / mlp.width
+                    )
+                    first_norm_squared = fnp.sum(
+                        mlp.weights[0] * mlp.weights[0], axis=0
+                    )
+                    exact_cubic_mean = _sphere_relu_third_moment_scale(
+                        mlp.width
+                    ) * fnp.sum(first_norm_squared * fnp.sqrt(first_norm_squared))
+                    exact_fourth_mean = (
+                        1.5
+                        * fnp.sum(first_norm_squared * first_norm_squared)
+                        / (mlp.width * (mlp.width + 2))
+                    )
+                    exact_preactivation_square_mean = (
+                        fnp.sum(first_norm_squared) / mlp.width
+                    )
+                    exact_controls = fnp.stack(
+                        (
+                            exact_control_mean,
+                            exact_square_mean,
+                            exact_cubic_mean,
+                            exact_fourth_mean,
+                            exact_preactivation_square_mean,
+                        )
+                    )
+                    correction = (control_mean - exact_controls) @ coefficients
+                    rows.append(mean_radius * (final_mean - correction))
+
+            else:
+                rows.append(zero_row)
+
+        return fnp.stack(rows, axis=0)

@@ -1,0 +1,180 @@
+"""RQMC sphere-direction submission candidate at the 10% score floor.
+
+Public method description:
+https://discourse.aicrowd.com/t/unbiased-randomized-qmc-rao-blackwell-for-post-relu-activation-means-method-unbiasedness-proof-and-where-the-frontier-is/18053
+"""
+
+from __future__ import annotations
+
+import math
+
+import flopscope as flops
+import flopscope.numpy as fnp
+from whestbench import BaseEstimator
+
+
+_TARGET_FLOP_FRACTION = 0.10
+_SHIFT_COUNT = 2
+_SEED_OFFSET = 0
+_TAIL_CLIP = 1e-11
+_ARRAY_BYTES_LIMIT = 100 * 1024 * 1024
+_FLOAT64_ITEMSIZE = 8
+
+
+def _first_primes(count: int) -> tuple[int, ...]:
+    primes: list[int] = []
+    candidate = 2
+    while len(primes) < count:
+        is_prime = True
+        for prime in primes:
+            if prime * prime > candidate:
+                break
+            if candidate % prime == 0:
+                is_prime = False
+                break
+        if is_prime:
+            primes.append(candidate)
+        candidate += 1
+    return tuple(primes)
+
+
+def _lattice_generator(width: int) -> fnp.ndarray:
+    roots = fnp.sqrt(fnp.array(_first_primes(width), dtype=fnp.float64))
+    return roots - fnp.floor(roots)
+
+
+def _lattice_uniforms(
+    n_samples: int, generator: fnp.ndarray, shift: fnp.ndarray
+) -> fnp.ndarray:
+    indices = fnp.arange(n_samples, dtype=fnp.float64)[:, None]
+    unwrapped = indices * generator[None, :] + shift[None, :]
+    return unwrapped - fnp.floor(unwrapped)
+
+
+def _exact_first_layer_mean(first_weight: fnp.ndarray) -> fnp.ndarray:
+    standard_deviation = fnp.sqrt(fnp.sum(first_weight * first_weight, axis=0))
+    return standard_deviation / fnp.sqrt(2.0 * fnp.pi)
+
+
+def _mean_standard_normal_radius(width: int) -> float:
+    return math.sqrt(2.0) * math.exp(
+        math.lgamma(0.5 * (width + 1)) - math.lgamma(0.5 * width)
+    )
+
+
+def _sample_count(budget: int, width: int, depth: int) -> int:
+    # Each row pays for the lattice construction and inverse-normal map, every
+    # layer's matmul/ReLU, and sampled means for rows 1..depth-1. The first row
+    # uses the exact Gaussian ReLU mean instead.
+    lattice_per_sample = 89 * width
+    sphere_per_sample = 4 * width
+    forward_per_sample = depth * (2 * width * width + width)
+    control_variate_per_sample = 14 * width
+    later_means_per_sample = width if depth > 1 else 0
+    per_sample = (
+        lattice_per_sample
+        + sphere_per_sample
+        + forward_per_sample
+        + control_variate_per_sample
+        + later_means_per_sample
+    )
+
+    # Fixed work is tiny relative to the forward pass; reserve it explicitly
+    # so the phase-1 count remains under the requested tracked-FLOP fraction.
+    fixed = 2 * width * width + 8 * width
+    n_samples = (int(_TARGET_FLOP_FRACTION * budget) - fixed) // per_sample
+    max_samples_by_bytes = _ARRAY_BYTES_LIMIT // max(width * _FLOAT64_ITEMSIZE, 1)
+    return int(max(1, min(n_samples, max_samples_by_bytes)))
+
+
+class Estimator(BaseEstimator):
+    """Single-shift rank-1 lattice estimator with an exact first output row."""
+
+    def predict(self, mlp, budget):
+        n_samples = _sample_count(budget, mlp.width, mlp.depth)
+        n_per_shift = max(1, n_samples // _SHIFT_COUNT)
+        rng = fnp.random.default_rng(mlp.seed + _SEED_OFFSET)
+        generator = _lattice_generator(mlp.width)
+        uniforms = fnp.concatenate(
+            tuple(
+                _lattice_uniforms(n_per_shift, generator, rng.random(mlp.width))
+                for _ in range(_SHIFT_COUNT)
+            ),
+            axis=0,
+        )
+        uniforms = fnp.clip(uniforms, _TAIL_CLIP, 1.0 - _TAIL_CLIP)
+        activations = flops.stats.norm.ppf(uniforms)
+        radii = fnp.sqrt(fnp.sum(activations * activations, axis=1))[:, None]
+        activations = activations / fnp.maximum(radii, 1e-30)
+        mean_radius = _mean_standard_normal_radius(mlp.width)
+
+        rows = []
+        final_layer_index = mlp.depth - 1
+        zero_row = fnp.zeros(mlp.width, dtype=fnp.float64)
+        first_row = None
+        first_activations = None
+        first_preactivation_square_sum = None
+        for layer_index, weight in enumerate(mlp.weights):
+            preactivations = activations @ weight
+            activations = fnp.maximum(preactivations, 0.0)
+            if layer_index == 0:
+                first_row = _exact_first_layer_mean(weight)
+                first_activations = activations
+                first_preactivation_square_sum = fnp.sum(
+                    preactivations * preactivations, axis=1
+                )
+                rows.append(first_row)
+            elif layer_index == final_layer_index:
+                activation_sum = fnp.sum(first_activations, axis=1)
+                activation_square_sum = fnp.sum(
+                    first_activations * first_activations, axis=1
+                )
+                activation_fourth_sum = fnp.sum(
+                    first_activations
+                    * first_activations
+                    * first_activations
+                    * first_activations,
+                    axis=1,
+                )
+                controls = fnp.stack(
+                    (
+                        activation_sum,
+                        activation_square_sum,
+                        activation_fourth_sum,
+                        first_preactivation_square_sum,
+                    ),
+                    axis=1,
+                )
+                control_mean = fnp.mean(controls, axis=0)
+                final_mean = fnp.mean(activations, axis=0)
+                centered_control = controls - control_mean[None, :]
+                centered_final = activations - final_mean[None, :]
+                control_covariance = centered_control.T @ centered_control
+                cross_covariance = centered_control.T @ centered_final
+                coefficients = fnp.linalg.solve(control_covariance, cross_covariance)
+                exact_control_mean = fnp.sum(first_row) / mean_radius
+                exact_square_mean = (
+                    0.5 * fnp.sum(mlp.weights[0] * mlp.weights[0]) / mlp.width
+                )
+                first_norm_squared = fnp.sum(mlp.weights[0] * mlp.weights[0], axis=0)
+                exact_fourth_mean = (
+                    1.5
+                    * fnp.sum(first_norm_squared * first_norm_squared)
+                    / (mlp.width * (mlp.width + 2))
+                )
+                exact_preactivation_square_mean = (
+                    fnp.sum(first_norm_squared) / mlp.width
+                )
+                exact_controls = fnp.stack(
+                    (
+                        exact_control_mean,
+                        exact_square_mean,
+                        exact_fourth_mean,
+                        exact_preactivation_square_mean,
+                    )
+                )
+                correction = (control_mean - exact_controls) @ coefficients
+                rows.append(mean_radius * (final_mean - correction))
+            else:
+                rows.append(zero_row)
+        return fnp.stack(rows, axis=0)

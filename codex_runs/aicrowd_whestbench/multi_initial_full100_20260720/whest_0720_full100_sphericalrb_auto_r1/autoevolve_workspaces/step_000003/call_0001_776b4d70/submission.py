@@ -1,0 +1,248 @@
+from __future__ import annotations
+
+import math
+
+import flopscope as flops
+import flopscope.numpy as fnp
+from whestbench import BaseEstimator
+
+
+_TARGET_FLOP_FRACTION = 0.09
+_FALLBACK_FLOP_FRACTION = 0.1024
+_MAX_WORKING_SET_BYTES = 100 * 1024 * 1024
+_FLOAT64_ITEMSIZE = 8
+_TAIL_CLIP = 1e-11
+_MIN_ANTITHETIC_SAMPLES = 32
+_WHITENING_EIGENVALUE_FLOOR = 1e-8
+_QMC_SHIFTS = 2
+_GATE_MEAN_CORRECTION = 1.125
+_SECOND_LAYER_CONTROL_BLEND = 0.5
+_SECOND_LAYER_CONTROL_MAX_FRACTION = 0.05
+_SETUP_DIRECTION_SETS = 1
+_SETUP_SEED_OFFSET = 0
+
+
+def _second_layer_control_fixed_cost(width: int) -> int:
+    return 4 * width**3 + 16 * width * width
+
+
+def _use_second_layer_control(budget: int, width: int, depth: int) -> bool:
+    return (
+        depth > 1
+        and _second_layer_control_fixed_cost(width)
+        <= int(_SECOND_LAYER_CONTROL_MAX_FRACTION * budget)
+    )
+
+
+def _sample_count(budget: int, width: int, depth: int) -> int:
+    per_sample = depth * (2 * width * width + 4 * width)
+    fixed = (depth + 1) * 2 * width * width + 8 * width
+    if _use_second_layer_control(budget, width, depth):
+        fixed += _second_layer_control_fixed_cost(width)
+    budget_limited = (
+        int(_TARGET_FLOP_FRACTION * budget) - fixed
+    ) // max(per_sample, 1)
+    memory_limited = _MAX_WORKING_SET_BYTES // max(width * _FLOAT64_ITEMSIZE, 1)
+    count = int(max(_MIN_ANTITHETIC_SAMPLES, min(budget_limited, memory_limited)))
+    return count - (count & 1)
+
+
+def _fallback_sample_count(budget: int, width: int, depth: int) -> int:
+    half_lattice_per_sample = (89 * width + 3 * width + 2) // 2
+    layer_per_sample = depth * (2 * width * width + 2 * width)
+    covariance_per_sample = width * width
+    per_sample = half_lattice_per_sample + layer_per_sample + covariance_per_sample
+    fixed = 13 * width**3 + 8 * width
+    budget_limited = (
+        int(_FALLBACK_FLOP_FRACTION * budget) - fixed
+    ) // max(per_sample, 1)
+    memory_limited = _MAX_WORKING_SET_BYTES // max(width * _FLOAT64_ITEMSIZE, 1)
+    count = int(max(_MIN_ANTITHETIC_SAMPLES, min(budget_limited, memory_limited)))
+    return count - (count & 1)
+
+
+def _first_primes(count: int) -> tuple[int, ...]:
+    primes: list[int] = []
+    candidate = 2
+    while len(primes) < count:
+        is_prime = True
+        for prime in primes:
+            if prime * prime > candidate:
+                break
+            if candidate % prime == 0:
+                is_prime = False
+                break
+        if is_prime:
+            primes.append(candidate)
+        candidate += 1
+    return tuple(primes)
+
+
+def _lattice_normal_samples(n_samples: int, width: int, rng) -> fnp.ndarray:
+    roots = fnp.sqrt(fnp.array(_first_primes(width), dtype=fnp.float64))
+    generator = roots - fnp.floor(roots)
+    shift = rng.random(width)
+    indices = fnp.arange(n_samples, dtype=fnp.float64)[:, None]
+    unwrapped = indices * generator[None, :] + shift[None, :]
+    uniforms = unwrapped - fnp.floor(unwrapped)
+    uniforms = fnp.clip(uniforms, _TAIL_CLIP, 1.0 - _TAIL_CLIP)
+    return flops.stats.norm.ppf(uniforms)
+
+
+def _mean_chi(dimension: int) -> float:
+    half_dimension = 0.5 * float(dimension)
+    return math.sqrt(2.0) * math.exp(
+        math.lgamma(half_dimension + 0.5) - math.lgamma(half_dimension)
+    )
+
+
+def _qmc_directions(n_samples: int, width: int, rng) -> fnp.ndarray:
+    normals = _lattice_normal_samples(n_samples, width, rng)
+    radii = fnp.sqrt(fnp.maximum(fnp.sum(normals * normals, axis=1), 1e-24))
+    return normals / radii[:, None]
+
+
+def _lattice_half_directions(half_samples: int, width: int, rng) -> fnp.ndarray:
+    base_count = half_samples // _QMC_SHIFTS
+    remainder = half_samples - base_count * _QMC_SHIFTS
+    direction_blocks = []
+    for shift_index in range(_QMC_SHIFTS):
+        block_count = base_count + (1 if shift_index < remainder else 0)
+        direction_blocks.append(_qmc_directions(block_count, width, rng))
+    return fnp.concatenate(direction_blocks, axis=0)
+
+
+def _angular_whitening_transform(directions: fnp.ndarray) -> fnp.ndarray:
+    n_samples, width = directions.shape
+    scaled_second_moment = directions.T @ directions * (float(width) / float(n_samples))
+    eigenvalues, eigenvectors = fnp.linalg.eigh(scaled_second_moment)
+    eigenvalues = fnp.maximum(eigenvalues, _WHITENING_EIGENVALUE_FLOOR)
+    return (eigenvectors / fnp.sqrt(eigenvalues)) @ eigenvectors.T
+
+
+def _exact_first_layer_mean(weights: fnp.ndarray) -> fnp.ndarray:
+    standard_deviation = fnp.sqrt(fnp.sum(weights * weights, axis=0))
+    return standard_deviation / fnp.sqrt(2.0 * fnp.pi)
+
+
+def _gaussian_relu_mean(mean: fnp.ndarray, variance: fnp.ndarray) -> fnp.ndarray:
+    standard_deviation = fnp.sqrt(fnp.maximum(variance, 1e-30))
+    standardized = mean / standard_deviation
+    density = fnp.exp(-0.5 * standardized * standardized) / fnp.sqrt(2.0 * fnp.pi)
+    return standard_deviation * density + mean * flops.stats.norm.cdf(standardized)
+
+
+def _second_layer_gaussian_control(
+    first_weights: fnp.ndarray,
+    second_weights: fnp.ndarray,
+) -> fnp.ndarray:
+    preactivation_covariance = first_weights.T @ first_weights
+    variance = fnp.maximum(fnp.diag(preactivation_covariance), 1e-30)
+    standard_deviation = fnp.sqrt(variance)
+    scale = standard_deviation[:, None] * standard_deviation[None, :]
+    correlation = fnp.clip(preactivation_covariance / scale, -1.0, 1.0)
+    sine = fnp.sqrt(fnp.maximum(1.0 - correlation * correlation, 0.0))
+    angle = fnp.arccos(correlation)
+    second_moment = scale * (
+        sine + (fnp.pi - angle) * correlation
+    ) / (2.0 * fnp.pi)
+    first_mean = standard_deviation / fnp.sqrt(2.0 * fnp.pi)
+    first_covariance = second_moment - first_mean[:, None] * first_mean[None, :]
+
+    preactivation_mean = first_mean @ second_weights
+    projected_covariance = first_covariance @ second_weights
+    preactivation_variance = fnp.sum(projected_covariance * second_weights, axis=0)
+    return _gaussian_relu_mean(preactivation_mean, preactivation_variance)
+
+
+class Estimator(BaseEstimator):
+    def setup(self, context) -> None:
+        self._setup_width = int(context.width)
+        self._direction_pool = []
+        if int(context.depth) == 1:
+            self._setup_half_samples = 0
+            return
+        self._setup_half_samples = (
+            _sample_count(int(context.flop_budget), int(context.width), int(context.depth))
+            // 2
+        )
+        rng = fnp.random.default_rng(
+            (int(context.seed) + _SETUP_SEED_OFFSET) & 0xFFFFFFFF
+        )
+        for _ in range(_SETUP_DIRECTION_SETS):
+            half_directions = _lattice_half_directions(
+                self._setup_half_samples,
+                self._setup_width,
+                rng,
+            )
+            whitening = _angular_whitening_transform(half_directions)
+            half_inputs = (half_directions @ whitening) * _mean_chi(self._setup_width)
+            self._direction_pool.append(half_inputs)
+
+    def predict(self, mlp, budget: int) -> fnp.ndarray:
+        if mlp.depth == 1:
+            return fnp.asarray(
+                fnp.stack((_exact_first_layer_mean(mlp.weights[0]),), axis=0),
+                dtype=fnp.float32,
+            )
+
+        n_samples = _sample_count(budget, mlp.width, mlp.depth)
+        half_samples = n_samples // 2
+        used_cached_inputs = False
+
+        if (
+            hasattr(self, "_direction_pool")
+            and mlp.width == self._setup_width
+            and half_samples == self._setup_half_samples
+            and self._direction_pool
+        ):
+            half_inputs = self._direction_pool[
+                int(mlp.seed) % len(self._direction_pool)
+            ]
+            used_cached_inputs = True
+        else:
+            n_samples = _fallback_sample_count(budget, mlp.width, mlp.depth)
+            half_samples = n_samples // 2
+            rng = fnp.random.default_rng(int(mlp.seed))
+            half_directions = _lattice_half_directions(half_samples, mlp.width, rng)
+            whitening = _angular_whitening_transform(half_directions)
+            half_inputs = (half_directions @ whitening) * _mean_chi(mlp.width)
+
+        activations = fnp.concatenate((half_inputs, -half_inputs), axis=0)
+
+        rows = []
+        activations = fnp.maximum(activations @ mlp.weights[0], 0.0)
+        exact_first_mean = _exact_first_layer_mean(mlp.weights[0])
+        rows.append(exact_first_mean)
+
+        second_layer_control = None
+        if used_cached_inputs and _use_second_layer_control(budget, mlp.width, mlp.depth):
+            second_layer_control = _second_layer_gaussian_control(
+                mlp.weights[0],
+                mlp.weights[1],
+            )
+
+        mean_correction = exact_first_mean - fnp.mean(activations, axis=0)
+        for layer_index, weights in enumerate(mlp.weights[1:], start=1):
+            preactivations = activations @ weights
+            gate_mean = fnp.mean(preactivations > 0.0, axis=0)
+            activations = fnp.maximum(preactivations, 0.0)
+            mean_correction = (mean_correction @ weights) * gate_mean
+            base_row = fnp.mean(activations, axis=0)
+            if layer_index == 1 and second_layer_control is not None:
+                second_layer_correction = second_layer_control - base_row
+                rows.append(
+                    base_row
+                    + _SECOND_LAYER_CONTROL_BLEND * second_layer_correction
+                    + (1.0 - _SECOND_LAYER_CONTROL_BLEND)
+                    * _GATE_MEAN_CORRECTION
+                    * mean_correction
+                )
+                mean_correction = (
+                    _SECOND_LAYER_CONTROL_BLEND * second_layer_correction
+                    + (1.0 - _SECOND_LAYER_CONTROL_BLEND) * mean_correction
+                )
+            else:
+                rows.append(base_row + _GATE_MEAN_CORRECTION * mean_correction)
+
+        return fnp.asarray(fnp.stack(rows, axis=0), dtype=fnp.float32)

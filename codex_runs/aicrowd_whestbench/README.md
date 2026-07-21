@@ -12,15 +12,13 @@ The committed snapshot includes:
 - all 18 completed runs under `multi_initial_20260718/`;
 - the six completed `*_ttt` runs under
   `multi_initial_full100_20260720/`;
+- the twelve completed `*_auto_r*` runs under
+  `multi_initial_full100_20260720/`;
 - run-level `metrics.jsonl`, `agent_outputs.jsonl`, score/state streams, and the
   final cumulative pool snapshot;
 - model-call prompts, stdout/stderr transcripts, final responses, commands,
   sanitized environment descriptions, and final `submission.py` files;
 - initial estimators, completed-run console logs, and submission review logs.
-
-The twelve `*_auto_r*` full-100 runs were still active when this snapshot was
-created and are intentionally not included.  They should be archived only
-after their metrics, model-call logs, and final pools stop changing.
 
 The snapshot intentionally excludes `*_codex_home/`, `eval_tmp/`, Python
 caches, dependency/plugin copies, hourly review cycle workspaces, and all but

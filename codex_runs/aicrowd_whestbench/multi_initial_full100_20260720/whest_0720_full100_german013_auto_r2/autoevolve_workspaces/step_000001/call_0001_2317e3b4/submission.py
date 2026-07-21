@@ -1,0 +1,160 @@
+"""Whitened shifted-lattice estimator with early-layer moment corrections."""
+
+from __future__ import annotations
+
+import flopscope.numpy as fnp
+from whestbench import BaseEstimator
+
+
+_BUDGET_FRACTION = 0.107
+_MIN_SAMPLES = 32
+_MAX_SAMPLES = 1_000_000
+_ARRAY_BYTES_LIMIT = 100 * 1024 * 1024
+_WORST_CASE_ITEMSIZE = 8
+_TWO_PI = 6.283185307179586
+_PI = 3.141592653589793
+_INV_SQRT_2PI = 0.3989422804014327
+_SQRT_2_OVER_PI = 0.7978845608028654
+_FIRST_CORRECTION = 0.8
+_SECOND_CORRECTION = 0.3
+
+
+def _normal_cdf(x):
+    x = fnp.clip(x, -8.0, 8.0)
+    y = _SQRT_2_OVER_PI * (x + 0.044715 * x * x * x)
+    return 0.5 * (1.0 + fnp.tanh(y))
+
+
+def _gaussian_relu_moments(mu, var):
+    sigma = fnp.sqrt(fnp.maximum(var, 1e-20))
+    alpha = fnp.clip(mu / sigma, -8.0, 8.0)
+    phi = _INV_SQRT_2PI * fnp.exp(-0.5 * alpha * alpha)
+    cdf = _normal_cdf(alpha)
+    mean = sigma * phi + mu * cdf
+    second = (var + mu * mu) * cdf + mu * sigma * phi
+    return mean, fnp.maximum(second, mean * mean)
+
+
+def _sample_count(budget: int, width: int, depth: int) -> int:
+    per_sample = depth * (2 * width * width + width) + width * width + 16 * width
+    fixed = 9 * width**3 + 2 * (2 * width**3)
+    k = (int(_BUDGET_FRACTION * budget) - fixed) // max(per_sample, 1)
+    max_k_by_bytes = _ARRAY_BYTES_LIMIT // max(width * _WORST_CASE_ITEMSIZE, 1)
+    k = int(max(_MIN_SAMPLES, min(_MAX_SAMPLES, max_k_by_bytes, k)))
+    k = k - (k & 1)
+    return max(_MIN_SAMPLES, min(k, 24576))
+
+
+def _lattice_block(count: int, width: int, shift1, shift2):
+    pairs = width // 2
+    i = (fnp.arange(count, dtype=fnp.float32) + 0.5)[:, None]
+    j = (fnp.arange(pairs, dtype=fnp.float32) + 1.0)[None, :]
+
+    u1 = fnp.mod(i * fnp.sqrt(2.0 * j + 1.0) * 0.754877666 + shift1, 1.0)
+    u2 = fnp.mod(i * fnp.sqrt(2.0 * j + 2.0) * 0.569840291 + shift2, 1.0)
+    u1 = fnp.clip(u1, 1e-7, 1.0 - 1e-7)
+
+    radius = fnp.sqrt(-2.0 * fnp.log(u1))
+    angle = _TWO_PI * u2
+    z0 = radius * fnp.cos(angle)
+    z1 = radius * fnp.sin(angle)
+    return fnp.concatenate([z0, z1], axis=1)
+
+
+def _lattice_normal(half: int, width: int, seed: int):
+    pairs = width // 2
+    rng = fnp.random.default_rng(seed)
+    shift1 = rng.random((1, pairs), dtype=fnp.float32)
+    shift2 = rng.random((1, pairs), dtype=fnp.float32)
+    z = _lattice_block(half, width, shift1, shift2)
+    if width & 1:
+        extra = rng.standard_normal((half, 1), dtype=fnp.float32)
+        z = fnp.concatenate([z, extra], axis=1)
+    return z
+
+
+class Estimator(BaseEstimator):
+    """Budgeted quasi-Monte Carlo estimator for final-layer activation means."""
+
+    def predict(self, mlp, budget):
+        width = mlp.width
+        depth = mlp.depth
+        k = _sample_count(budget, width, depth)
+
+        u = _lattice_normal(k // 2, width, mlp.seed)
+        x = fnp.concatenate([u, -u], axis=0)
+
+        covariance = (u.T @ u) / float(k // 2)
+        eigenvalues, eigenvectors = fnp.linalg.eigh(covariance)
+        eigenvalues = fnp.maximum(eigenvalues, 1e-6)
+        inverse_sqrt = (eigenvectors / fnp.sqrt(eigenvalues)) @ eigenvectors.T
+        x = fnp.maximum(x @ (inverse_sqrt @ mlp.weights[0]), 0.0)
+
+        if depth == 1:
+            first_var = fnp.sum(mlp.weights[0] * mlp.weights[0], axis=0)
+            return (fnp.sqrt(first_var) * _INV_SQRT_2PI)[None, :]
+
+        first_var = fnp.sum(mlp.weights[0] * mlp.weights[0], axis=0)
+        true_second = 0.5 * first_var
+        true_mean = fnp.sqrt(first_var) * _INV_SQRT_2PI
+
+        sample_mean = fnp.mean(x, axis=0)
+        sample_second = fnp.mean(x * x, axis=0)
+        positive_mean = 2.0 * sample_mean
+        positive_second = 2.0 * sample_second
+        true_positive_mean = 2.0 * true_mean
+        true_positive_second = 2.0 * true_second
+        sample_positive_var = fnp.maximum(
+            positive_second - positive_mean * positive_mean,
+            1e-12,
+        )
+        true_positive_var = fnp.maximum(
+            true_positive_second - true_positive_mean * true_positive_mean,
+            1e-12,
+        )
+        scale = fnp.sqrt(true_positive_var / sample_positive_var)
+        shift = true_positive_mean - scale * positive_mean
+        corrected = x + _FIRST_CORRECTION * ((scale - 1.0) * x + shift)
+        x = fnp.where(x > 0.0, fnp.maximum(corrected, 0.0), 0.0)
+
+        gram = mlp.weights[0].T @ mlp.weights[0]
+        std = fnp.sqrt(fnp.maximum(fnp.diag(gram), 1e-20))
+        rho = gram / (std[:, None] * std[None, :])
+        rho = fnp.clip(rho, -1.0, 1.0)
+        root = fnp.sqrt(fnp.maximum(1.0 - rho * rho, 0.0))
+        first_second = (
+            (std[:, None] * std[None, :])
+            * (root + (_PI - fnp.arccos(rho)) * rho)
+            / _TWO_PI
+        )
+        pre_mean = true_mean @ mlp.weights[1]
+        projected = first_second @ mlp.weights[1]
+        pre_second = fnp.sum(mlp.weights[1] * projected, axis=0)
+        second_layer_mean, second_layer_second = _gaussian_relu_moments(
+            pre_mean,
+            fnp.maximum(pre_second - pre_mean * pre_mean, 1e-20),
+        )
+
+        for layer_index, weight in enumerate(mlp.weights[1:], start=1):
+            x = fnp.maximum(x @ weight, 0.0)
+            if layer_index == 1:
+                sample_mean = fnp.mean(x, axis=0)
+                sample_second = fnp.mean(x * x, axis=0)
+                sample_var = fnp.maximum(
+                    sample_second - sample_mean * sample_mean,
+                    1e-12,
+                )
+                target_var = fnp.maximum(
+                    second_layer_second - second_layer_mean * second_layer_mean,
+                    1e-12,
+                )
+                scale = fnp.sqrt(target_var / sample_var)
+                corrected = x + _SECOND_CORRECTION * (
+                    (scale - 1.0) * x
+                    + (second_layer_mean - scale * sample_mean)
+                )
+                x = fnp.maximum(corrected, 0.0)
+
+        final_mean = fnp.mean(x, axis=0)
+        zero_rows = fnp.zeros((depth - 1, width), dtype=fnp.float32)
+        return fnp.concatenate([zero_rows, final_mean[None, :]], axis=0)

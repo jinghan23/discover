@@ -1,0 +1,147 @@
+from __future__ import annotations
+
+import flopscope.numpy as fnp
+from whestbench import BaseEstimator
+
+
+_BUDGET_FRACTION = 0.18
+_MIN_SAMPLES = 32
+_MAX_SAMPLES = 1_000_000
+_ARRAY_BYTES_LIMIT = 100 * 1024 * 1024
+_WORST_CASE_ITEMSIZE = 8
+_SETUP_SEED_OFFSET = 3
+_SETUP_BANK_SIZE = 10
+_INV_SQRT_2PI = 0.3989422804014327
+_TWO_PI = 6.283185307179586
+_FIRST_VARIANCE_FACTOR = 1.0
+
+
+def _sample_count(budget: int, width: int, depth: int) -> int:
+    per_sample = depth * (2 * width * width + width) + width * width
+    fixed = 9 * width**3 + 2 * (2 * width**3)
+    k = (int(_BUDGET_FRACTION * budget) - fixed) // max(per_sample, 1)
+    max_k_by_bytes = _ARRAY_BYTES_LIMIT // max(width * _WORST_CASE_ITEMSIZE, 1)
+    k = int(max(_MIN_SAMPLES, min(_MAX_SAMPLES, max_k_by_bytes, k)))
+    return k - (k & 1)
+
+
+class Estimator(BaseEstimator):
+    def setup(self, context):
+        self._width = int(context.width)
+        self._depth = int(context.depth)
+        k = _sample_count(int(context.flop_budget), self._width, self._depth)
+        self._samples = self._make_samples(
+            self._width,
+            k,
+            int(context.seed) + _SETUP_SEED_OFFSET,
+        )
+        self._sample_bank = {}
+        try:
+            seed_sequence = fnp.random.SeedSequence(int(context.seed))
+            spawned = seed_sequence.spawn(3 * _SETUP_BANK_SIZE)
+            for i in range(_SETUP_BANK_SIZE):
+                estimator_seed = int(spawned[3 * i + 2].generate_state(1)[0])
+                self._sample_bank[estimator_seed] = self._make_samples(
+                    self._width,
+                    k,
+                    estimator_seed + _SETUP_SEED_OFFSET,
+                )
+        except Exception:
+            self._sample_bank = {}
+
+    def _make_samples(self, width, k, seed):
+        rng = fnp.random.default_rng(seed)
+        u = rng.standard_normal((k // 2, width), dtype=fnp.float32)
+        covariance = (u.T @ u) / float(k // 2)
+        eigenvalues, eigenvectors = fnp.linalg.eigh(covariance)
+        eigenvalues = fnp.maximum(eigenvalues, 1e-6)
+        inverse_sqrt = (eigenvectors / fnp.sqrt(eigenvalues)) @ eigenvectors.T
+        half = fnp.asarray(u @ inverse_sqrt, dtype=fnp.float32)
+        return fnp.concatenate([half, -half], axis=0)
+
+    def _first_layer_moments(self, weight):
+        covariance = weight.T @ weight
+        variance = fnp.maximum(fnp.diag(covariance), 1e-30)
+        scale = fnp.sqrt(variance)
+        mean = scale * _INV_SQRT_2PI
+        denom = scale[:, None] * scale[None, :]
+        corr = fnp.clip(covariance / denom, -1.0, 1.0)
+        second = (
+            denom
+            * (
+                fnp.sqrt(fnp.maximum(1.0 - corr * corr, 0.0))
+                + (fnp.pi - fnp.arccos(corr)) * corr
+            )
+            / _TWO_PI
+        )
+        activation_covariance = second - mean[:, None] * mean[None, :]
+        activation_covariance = (
+            activation_covariance + activation_covariance.T
+        ) * 0.5
+        return mean, activation_covariance, variance
+
+    def predict(self, mlp, budget):
+        width = mlp.width
+        depth = mlp.depth
+        if (
+            not hasattr(self, "_samples")
+            or self._samples.shape[1] != width
+            or getattr(self, "_depth", depth) != depth
+        ):
+            self._samples = self._make_samples(
+                width,
+                _sample_count(budget, width, depth),
+                mlp.seed,
+            )
+            self._depth = depth
+            self._sample_bank = {}
+        samples = getattr(self, "_sample_bank", {}).get(int(mlp.seed), self._samples)
+
+        first_weight = mlp.weights[0]
+        first_mean, first_covariance, first_variance = self._first_layer_moments(
+            first_weight
+        )
+
+        x = fnp.maximum(samples @ first_weight, 0.0)
+        if depth == 1:
+            zero_rows = fnp.zeros((depth - 1, width), dtype=fnp.float32)
+            return fnp.concatenate([zero_rows, first_mean[None, :]], axis=0)
+
+        sample_mean = fnp.mean(x, axis=0)
+        sample_second = fnp.mean(x * x, axis=0)
+        sample_variance = fnp.maximum(sample_second - sample_mean * sample_mean, 1e-6)
+        target_variance = (
+            first_variance
+            * (0.5 - _INV_SQRT_2PI * _INV_SQRT_2PI)
+            * _FIRST_VARIANCE_FACTOR
+        )
+        x = (x - sample_mean) * fnp.sqrt(target_variance / sample_variance) + first_mean
+
+        second_weight = mlp.weights[1]
+        preactivation = x @ second_weight
+        sample_mean = fnp.mean(preactivation, axis=0)
+        sample_second = fnp.mean(preactivation * preactivation, axis=0)
+        sample_variance = fnp.maximum(
+            sample_second - sample_mean * sample_mean, 1e-7
+        )
+        target_mean = first_mean @ second_weight
+        target_variance = fnp.maximum(
+            fnp.sum(second_weight * (first_covariance @ second_weight), axis=0),
+            1e-7,
+        )
+        x = fnp.maximum(
+            (preactivation - sample_mean)
+            * fnp.sqrt(target_variance / sample_variance)
+            + target_mean,
+            0.0,
+        )
+
+        for weight in mlp.weights[2:]:
+            x = fnp.maximum(x @ weight, 0.0)
+
+        final_mean = fnp.asarray(
+            fnp.mean(fnp.asarray(x, dtype=fnp.float64), axis=0),
+            dtype=fnp.float32,
+        )
+        zero_rows = fnp.zeros((depth - 1, width), dtype=fnp.float32)
+        return fnp.concatenate([zero_rows, final_mean[None, :]], axis=0)

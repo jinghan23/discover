@@ -1,0 +1,2111 @@
+OpenAI Codex v0.144.3
+--------
+workdir: /opt/tiger/discover/workspace
+model: gpt-5.5
+provider: openai
+approval: never
+sandbox: danger-full-access
+reasoning effort: xhigh
+reasoning summaries: none
+session id: 019f7fb2-d86a-7413-9e7e-0b1bacb9a0b1
+--------
+user
+You are solving the ARC White-Box Estimation Challenge 2026
+(WhestBench) under the official evaluator contract.
+
+Task:
+- You receive the weights of a randomly initialized square ReLU MLP.
+- Inputs follow a standard normal distribution.
+- Predict the per-neuron post-ReLU activation mean for every layer.
+- Return a `flopscope.numpy.ndarray` with shape `(mlp.depth, mlp.width)`.
+
+Required submission interface:
+- Import `flopscope.numpy as fnp` for numerical operations.
+- Define `class Estimator(BaseEstimator)` with
+  `predict(self, mlp, budget)`.
+- Optional `setup(self, context)` and `teardown(self)` hooks follow the official
+  WhestBench API.
+- Seed predict-time randomness from `mlp.seed` and setup-time randomness from
+  `context.seed`.
+
+Official scoring:
+- For each MLP, compute final-layer MSE against the official Monte Carlo target.
+- Effective compute is `C = FLOPs + lambda * residual_wall_time`.
+- A valid MLP score is `final_layer_mse * max(0.1, C / flop_budget)`.
+- The suite score is the arithmetic mean of those per-MLP scores; lower is better.
+- Exceptions, invalid shapes/non-finite values, FLOP/time exhaustion, or combined
+  budget exhaustion use an all-zero prediction and multiplier 1.0 for that MLP.
+- All-layer MSE is diagnostic only.
+
+Do not use plain NumPy or uninstrumented numerical libraries to evade FLOP
+accounting. Residual Python or uninstrumented work is charged at the official
+lambda rate and can exhaust the combined budget.
+
+Fairness and data isolation:
+- Derive predictions only from the `mlp` weights and allowed setup context.
+- Do not inspect, search for, or read evaluation datasets, Hugging Face caches,
+  saved evaluation reports, target moments, or ground-truth files.
+- Do not hardcode values tied to public mini MLPs. Such candidates are invalid
+  even if they receive a low local score.
+
+Algorithm directions worth exploring:
+- Mean and diagonal-variance propagation through ReLU moments.
+- Full, structured, or low-rank covariance propagation.
+- Hybrid analytic propagation with compute-budgeted Monte Carlo probes.
+- Layer-wise corrections for correlation error in deep networks.
+- Allocating FLOPs to layers where final-layer MSE is most sensitive.
+
+
+Official evaluation suite for this run:
+- dataset: None@None
+- split / MLPs: None / first None
+- width / depth: None / None
+- FLOP budget per MLP: None
+- residual penalty lambda: None FLOPs/second
+- runner: None
+
+You are iteratively optimizing budget-adjusted final-layer score.
+Here is the last code we ran:
+```python
+from __future__ import annotations
+
+import flopscope.numpy as fnp
+import flopscope as flops
+from whestbench import BaseEstimator
+
+
+class Estimator(BaseEstimator):
+    def predict(self, mlp, budget):
+        width = int(mlp.width)
+        depth = int(mlp.depth)
+        d_mu = fnp.zeros(width)
+        d_var = fnp.ones(width)
+        diag_rows = []
+        diag_vars = []
+
+        for w in mlp.weights:
+            d_mu_pre = w.T @ d_mu
+            d_var_pre = (w * w).T @ d_var
+            d_var_pre = fnp.maximum(d_var_pre, 1e-12)
+            d_sigma = fnp.sqrt(d_var_pre)
+            d_alpha = d_mu_pre / d_sigma
+            d_phi = flops.stats.norm.pdf(d_alpha)
+            d_cdf = flops.stats.norm.cdf(d_alpha)
+            d_mu = d_mu_pre * d_cdf + d_sigma * d_phi
+            d_ez2 = (d_mu_pre * d_mu_pre + d_var_pre) * d_cdf + d_mu_pre * d_sigma * d_phi
+            d_var = fnp.maximum(d_ez2 - d_mu * d_mu, 0.0)
+            diag_rows.append(d_mu)
+            diag_vars.append(d_var)
+
+        if depth == 1:
+            return fnp.asarray(fnp.stack(diag_rows, axis=0), dtype=fnp.float32)
+
+        per_sample = max(1, depth * (2 * width * width + 4 * width))
+        n_samples = max(1024, int((0.625 * float(budget)) / float(per_sample)))
+        n_samples = min(n_samples, 7520)
+        n_samples = 2 * max(1, n_samples // 2)
+
+        rng = fnp.random.default_rng(int(mlp.seed) + 3)
+        eye = fnp.eye(width, dtype=fnp.float64)
+        half_samples = n_samples // 2
+        x0 = fnp.asarray(rng.standard_normal((half_samples, width), dtype=fnp.float32))
+        x = fnp.concatenate([x0, -x0], axis=0)
+
+        for i, w in enumerate(mlp.weights[:-1]):
+            z = x @ w
+            if i == 0:
+                t_cov = w.T @ w
+                z_center = z - fnp.mean(z, axis=0)
+                sample_cov = (z_center.T @ z_center) / float(n_samples)
+                s_vals, s_vecs = fnp.linalg.eigh(sample_cov)
+                t_vals, t_vecs = fnp.linalg.eigh(t_cov)
+                inv_sqrt = s_vecs @ (
+                    fnp.diag(1.0 / fnp.sqrt(fnp.maximum(s_vals, 1e-12))) @ s_vecs.T
+                )
+                target_sqrt = t_vecs @ (
+                    fnp.diag(fnp.sqrt(fnp.maximum(t_vals, 1e-12))) @ t_vecs.T
+                )
+                z = z_center @ (inv_sqrt @ target_sqrt)
+
+            x = fnp.maximum(z, 0.0)
+            if i == 0:
+                x_mean0 = fnp.mean(x, axis=0)
+                x_center = x - x_mean0
+                sample_cov = (x_center.T @ x_center) / float(n_samples)
+                s_vals, s_vecs = fnp.linalg.eigh(sample_cov)
+
+                sigma0 = fnp.sqrt(fnp.maximum(fnp.diagonal(t_cov), 1e-12))
+                scale0 = fnp.maximum(sigma0[:, None] * sigma0[None, :], 1e-12)
+                rho0 = fnp.clip(t_cov / scale0, -0.999999, 0.999999)
+                root0 = fnp.sqrt(fnp.maximum(1.0 - rho0 * rho0, 0.0))
+                pi = 3.141592653589793
+                kernel0 = (root0 + (pi - fnp.arccos(rho0)) * rho0) / (2.0 * pi)
+                target_second = (sigma0[:, None] * sigma0[None, :]) * kernel0
+                target_cov = target_second - diag_rows[0][:, None] * diag_rows[0][None, :]
+                target_cov = 0.5 * (target_cov + target_cov.T)
+                target_cov = target_cov * (1.0 - eye) + eye * diag_vars[0][None, :]
+
+                t_vals, t_vecs = fnp.linalg.eigh(target_cov)
+                inv_sqrt = s_vecs @ (
+                    fnp.diag(1.0 / fnp.sqrt(fnp.maximum(s_vals, 1e-12))) @ s_vecs.T
+                )
+                target_sqrt = t_vecs @ (
+                    fnp.diag(fnp.sqrt(fnp.maximum(t_vals, 1e-12))) @ t_vecs.T
+                )
+                x_full = x_center @ (inv_sqrt @ target_sqrt) + diag_rows[0]
+                x = (
+                    diag_rows[0]
+                    - 0.100 * (x_mean0 - diag_rows[0])
+                    + 1.43645 * (x_full - diag_rows[0])
+                    - 0.43645 * x_center
+                )
+
+        z = x @ mlp.weights[-1]
+        z64 = fnp.asarray(z, dtype=fnp.float64)
+        z_mean = fnp.mean(z64, axis=0)
+        z_center = z64 - z_mean
+        z_var = fnp.mean(z_center * z_center, axis=0)
+        z_sigma = fnp.sqrt(fnp.maximum(z_var, 1e-12))
+        z_alpha = z_mean / z_sigma
+        z_cdf = flops.stats.norm.cdf(z_alpha)
+        z_phi = flops.stats.norm.pdf(z_alpha)
+        final_gauss = z_mean * z_cdf + z_sigma * z_phi
+        z_alpha_md = d_mu_pre / z_sigma
+        final_mixed_diag = (
+            d_mu_pre * flops.stats.norm.cdf(z_alpha_md)
+            + z_sigma * flops.stats.norm.pdf(z_alpha_md)
+        )
+        final_mc = fnp.sum(fnp.maximum(z64, 0.0), axis=0) / float(n_samples)
+        final = 0.99938145 * (
+            1.03699807 * final_mc
+            - 0.04249644 * final_gauss
+            + 0.00549808 * final_mixed_diag
+        )
+
+        return fnp.asarray(fnp.stack(list(diag_rows[:-1]) + [final], axis=0), dtype=fnp.float32)
+```
+Here is the budget-adjusted final-layer score before and after running the code above (lower is better): 0.000000 -> 0.000000
+Target: 1e-07. Current gap: 0.000000. Further improvements will also be generously rewarded.
+
+--- Previous Program Output ---
+pass score=3.04468e-07
+--- End Output ---
+
+Return one final Python code block containing an official `Estimator` class.
+
+
+--- Autonomous WhestBench Blackbox Search Mode ---
+Work only inside this workspace:
+/opt/tiger/discover/workspace
+
+Editable candidate:
+/opt/tiger/discover/workspace/submission.py
+
+The trusted official evaluator is exposed only through a local blackbox service.
+Run it after each meaningful revision:
+cd /opt/tiger/discover/workspace && python eval_client.py
+
+Do not edit `eval_client.py`. Only `submission.py` is a candidate artifact. It
+must be plain Python source defining the official `Estimator(BaseEstimator)`
+class, without Markdown fences. Lower `raw_score` is better; `reward` is the
+official baseline score divided by the candidate score.
+Do not inspect evaluation datasets, caches, reports, or target values; derive
+the estimator only from the supplied task description and blackbox scores.
+
+When done, leave the best implementation in:
+/opt/tiger/discover/workspace/submission.py
+
+codex
+I’ll inspect the current candidate and the local workspace shape first, then run the evaluator unchanged to get a clean baseline for this session.
+exec
+/bin/bash -lc "pwd && rg --files -g '"'!*cache*'"' -g '"'!*.pkl'"' -g '"'!*.npy'"' -g '"'!*.npz'"' -g '"'!*.json'"'" in /opt/tiger/discover/workspace
+ succeeded in 0ms:
+/opt/tiger/discover/workspace
+eval_client.py
+codex.stderr.log
+codex.stdout.log
+prompt.txt
+submission.py
+
+exec
+/bin/bash -lc "sed -n '1,260p' submission.py" in /opt/tiger/discover/workspace
+ succeeded in 0ms:
+from __future__ import annotations
+
+import flopscope.numpy as fnp
+import flopscope as flops
+from whestbench import BaseEstimator
+
+
+class Estimator(BaseEstimator):
+    def predict(self, mlp, budget):
+        width = int(mlp.width)
+        depth = int(mlp.depth)
+        d_mu = fnp.zeros(width)
+        d_var = fnp.ones(width)
+        diag_rows = []
+        diag_vars = []
+
+        for w in mlp.weights:
+            d_mu_pre = w.T @ d_mu
+            d_var_pre = (w * w).T @ d_var
+            d_var_pre = fnp.maximum(d_var_pre, 1e-12)
+            d_sigma = fnp.sqrt(d_var_pre)
+            d_alpha = d_mu_pre / d_sigma
+            d_phi = flops.stats.norm.pdf(d_alpha)
+            d_cdf = flops.stats.norm.cdf(d_alpha)
+            d_mu = d_mu_pre * d_cdf + d_sigma * d_phi
+            d_ez2 = (d_mu_pre * d_mu_pre + d_var_pre) * d_cdf + d_mu_pre * d_sigma * d_phi
+            d_var = fnp.maximum(d_ez2 - d_mu * d_mu, 0.0)
+            diag_rows.append(d_mu)
+            diag_vars.append(d_var)
+
+        if depth == 1:
+            return fnp.asarray(fnp.stack(diag_rows, axis=0), dtype=fnp.float32)
+
+        per_sample = max(1, depth * (2 * width * width + 4 * width))
+        n_samples = max(1024, int((0.625 * float(budget)) / float(per_sample)))
+        n_samples = min(n_samples, 7520)
+        n_samples = 2 * max(1, n_samples // 2)
+
+        rng = fnp.random.default_rng(int(mlp.seed) + 3)
+        eye = fnp.eye(width, dtype=fnp.float64)
+        half_samples = n_samples // 2
+        x0 = fnp.asarray(rng.standard_normal((half_samples, width), dtype=fnp.float32))
+        x = fnp.concatenate([x0, -x0], axis=0)
+
+        for i, w in enumerate(mlp.weights[:-1]):
+            z = x @ w
+            if i == 0:
+                t_cov = w.T @ w
+                z_center = z - fnp.mean(z, axis=0)
+                sample_cov = (z_center.T @ z_center) / float(n_samples)
+                s_vals, s_vecs = fnp.linalg.eigh(sample_cov)
+                t_vals, t_vecs = fnp.linalg.eigh(t_cov)
+                inv_sqrt = s_vecs @ (
+                    fnp.diag(1.0 / fnp.sqrt(fnp.maximum(s_vals, 1e-12))) @ s_vecs.T
+                )
+                target_sqrt = t_vecs @ (
+                    fnp.diag(fnp.sqrt(fnp.maximum(t_vals, 1e-12))) @ t_vecs.T
+                )
+                z = z_center @ (inv_sqrt @ target_sqrt)
+
+            x = fnp.maximum(z, 0.0)
+            if i == 0:
+                x_mean0 = fnp.mean(x, axis=0)
+                x_center = x - x_mean0
+                sample_cov = (x_center.T @ x_center) / float(n_samples)
+                s_vals, s_vecs = fnp.linalg.eigh(sample_cov)
+
+                sigma0 = fnp.sqrt(fnp.maximum(fnp.diagonal(t_cov), 1e-12))
+                scale0 = fnp.maximum(sigma0[:, None] * sigma0[None, :], 1e-12)
+                rho0 = fnp.clip(t_cov / scale0, -0.999999, 0.999999)
+                root0 = fnp.sqrt(fnp.maximum(1.0 - rho0 * rho0, 0.0))
+                pi = 3.141592653589793
+                kernel0 = (root0 + (pi - fnp.arccos(rho0)) * rho0) / (2.0 * pi)
+                target_second = (sigma0[:, None] * sigma0[None, :]) * kernel0
+                target_cov = target_second - diag_rows[0][:, None] * diag_rows[0][None, :]
+                target_cov = 0.5 * (target_cov + target_cov.T)
+                target_cov = target_cov * (1.0 - eye) + eye * diag_vars[0][None, :]
+
+                t_vals, t_vecs = fnp.linalg.eigh(target_cov)
+                inv_sqrt = s_vecs @ (
+                    fnp.diag(1.0 / fnp.sqrt(fnp.maximum(s_vals, 1e-12))) @ s_vecs.T
+                )
+                target_sqrt = t_vecs @ (
+                    fnp.diag(fnp.sqrt(fnp.maximum(t_vals, 1e-12))) @ t_vecs.T
+                )
+                x_full = x_center @ (inv_sqrt @ target_sqrt) + diag_rows[0]
+                x = (
+                    diag_rows[0]
+                    - 0.100 * (x_mean0 - diag_rows[0])
+                    + 1.43645 * (x_full - diag_rows[0])
+                    - 0.43645 * x_center
+                )
+
+        z = x @ mlp.weights[-1]
+        z64 = fnp.asarray(z, dtype=fnp.float64)
+        z_mean = fnp.mean(z64, axis=0)
+        z_center = z64 - z_mean
+        z_var = fnp.mean(z_center * z_center, axis=0)
+        z_sigma = fnp.sqrt(fnp.maximum(z_var, 1e-12))
+        z_alpha = z_mean / z_sigma
+        z_cdf = flops.stats.norm.cdf(z_alpha)
+        z_phi = flops.stats.norm.pdf(z_alpha)
+        final_gauss = z_mean * z_cdf + z_sigma * z_phi
+        z_alpha_md = d_mu_pre / z_sigma
+        final_mixed_diag = (
+            d_mu_pre * flops.stats.norm.cdf(z_alpha_md)
+            + z_sigma * flops.stats.norm.pdf(z_alpha_md)
+        )
+        final_mc = fnp.sum(fnp.maximum(z64, 0.0), axis=0) / float(n_samples)
+        final = 0.99938145 * (
+            1.03699807 * final_mc
+            - 0.04249644 * final_gauss
+            + 0.00549808 * final_mixed_diag
+        )
+
+        return fnp.asarray(fnp.stack(list(diag_rows[:-1]) + [final], axis=0), dtype=fnp.float32)
+
+codex
+The candidate already matches the code in the prompt. I’m going to establish the local score now, then I’ll make small, isolated changes so score movement is attributable.
+exec
+/bin/bash -lc 'python eval_client.py' in /opt/tiger/discover/workspace
+codex
+The evaluator is still running. I’ll wait for the result before editing so the baseline reflects the current file exactly.
+codex
+Still waiting on the blackbox run. No edits are being made while it is in flight.
+codex
+The evaluator is taking longer than a minute, which is normal for these candidates because the estimator spends most of its budget in sampled propagation. I’ll keep polling until it returns.
+codex
+No result yet. I’m leaving the process alone rather than starting competing evaluator runs.
+codex
+The blackbox run is still active. Once it returns, I’ll use that as the reference score for any edits.
+codex
+Still no output from the evaluator. I’ll keep waiting; interrupting it would make the comparison less useful.
+codex
+The evaluator has now been running for several minutes without emitting progress. I’m going to give it one more polling interval before deciding whether this is a service stall.
+codex
+It still hasn’t returned, so the run is likely stalled at the evaluator service boundary rather than inside a quick syntax check. I’ll interrupt this run and avoid making score claims from it.
+ exited 130 in 268480ms:
+Traceback (most recent call last):
+  File "/opt/tiger/discover/workspace/eval_client.py", line 94, in <module>
+    raise SystemExit(main())
+                     ^^^^^^
+  File "/opt/tiger/discover/workspace/eval_client.py", line 72, in main
+    response_data = _recv_line(sock)
+                    ^^^^^^^^^^^^^^^^
+  File "/opt/tiger/discover/workspace/eval_client.py", line 49, in _recv_line
+    chunk = sock.recv(65536)
+            ^^^^^^^^^^^^^^^^
+KeyboardInterrupt
+
+codex
+Since the evaluator service did not answer, I’m going to use only synthetic MLPs I generate locally to reason about estimator changes. That keeps the candidate derived from weights, not hidden targets.
+exec
+/bin/bash -lc "python - <<'PY'
+import inspect, whestbench
+print(whestbench)
+print(getattr(whestbench, 'BaseEstimator', None))
+print(inspect.getsource(whestbench.BaseEstimator))
+PY" in /opt/tiger/discover/workspace
+exec
+/bin/bash -lc "python - <<'PY'
+import flopscope.numpy as fnp, flopscope as flops
+print('fnp', fnp)
+print('has random', hasattr(fnp, 'random'))
+print('has linalg', hasattr(fnp, 'linalg'))
+print('flops', flops)
+PY" in /opt/tiger/discover/workspace
+ succeeded in 111ms:
+ succeeded in 948ms:
+<module 'whestbench' from '/tmp/whest-official-deps/whestbench/__init__.py'>
+<class 'whestbench.sdk.BaseEstimator'>
+class BaseEstimator(ABC):
+    """Estimator contract for participant implementations.
+
+    Participants subclass this and implement ``predict`` to return
+    predicted means for all layers as a single ``(depth, width)`` flopscope array.
+    """
+
+    @abstractmethod
+    def predict(self, mlp: MLP, budget: int) -> fnp.ndarray:
+        """Return predicted means for all layers, shape ``(depth, width)``."""
+        raise NotImplementedError
+
+    def setup(self, context: SetupContext) -> None:
+        """Optional one-time setup hook before prediction calls."""
+        return None
+
+    def teardown(self) -> None:
+        """Optional cleanup hook after scoring completes."""
+        return None
+
+
+codex
+The public SDK only exposes the estimator contract here. I’ll inspect the MLP dataclass type next, not evaluator data, to confirm assumptions about fields and weight scaling.
+exec
+/bin/bash -lc "python - <<'PY'
+import inspect
+from whestbench import sdk
+for name in dir(sdk):
+    if name in ('MLP','SetupContext'):
+        obj=getattr(sdk,name)
+        print('---', name, obj)
+        print(inspect.getsource(obj))
+PY" in /opt/tiger/discover/workspace
+ succeeded in 966ms:
+--- MLP <class 'whestbench.domain.MLP'>
+@dataclass(frozen=True)
+class MLP:
+    """Validated MLP container with fixed width and layer depth.
+
+    Attributes:
+        width: Number of neurons per layer.
+        depth: Number of weight matrices (layers).
+        weights: Ordered list of weight matrices, each shape ``(width, width)``.
+        seed: Per-MLP grader-supplied seed. Estimators using randomness should
+            seed off this so their submission reproduces under regrade. Derived
+            deterministically from ``ContestSpec.seed`` and the MLP index by
+            the evaluator; 0 when no spec seed is provided.
+        name: Human-readable per-MLP slug like ``"danielle-johnson"``. Stable
+            across runs and backends at the WhestBench release's pinned
+            ``faker`` version (see ``whestbench.naming``). Empty string when
+            the MLP is constructed outside an evaluator bake path (e.g. in
+            unit tests). Estimators may read it for log lines; the leakage
+            surface is nil because it is a pure function of ``seed``.
+    """
+
+    width: int
+    depth: int
+    weights: Weights
+    seed: int = 0
+    name: str = ""
+
+    def validate(self) -> None:
+        """Validate MLP metadata and weight matrix shapes.
+
+        Raises:
+            ValueError: if width/depth are invalid, if ``depth`` does not
+                match ``len(weights)``, or if any weight matrix has wrong shape.
+        """
+        if self.width <= 0:
+            raise ValueError("MLP width must be positive.")
+        if self.depth <= 0:
+            raise ValueError("MLP depth must be positive.")
+        if len(self.weights) != self.depth:
+            raise ValueError(
+                f"MLP depth mismatch: declared depth={self.depth}, "
+                f"got {len(self.weights)} weight matrices."
+            )
+        for i, w in enumerate(self.weights):
+            shape = tuple(w.shape) if hasattr(w, "shape") else ()
+            if shape != (self.width, self.width):
+                raise ValueError(
+                    f"Weight matrix {i} has shape {shape}, expected ({self.width}, {self.width})."
+                )
+
+    @classmethod
+    def from_row(
+        cls,
+        row: "Any",
+        *,
+        seed_protocol_version: str = "2.0",
+    ) -> "MLP":
+        """Build an MLP from a datasets.Dataset row.
+
+        Under seed_protocol 2.0 (legacy), ``parquet["mlp_seed"]`` IS the estimator
+        seed — ``mlp.seed`` returns it directly.
+
+        Under seed_protocol 3.0 (new), ``parquet["mlp_seed"]`` is the per-MLP
+        INPUT seed; ``mlp.seed`` (the estimator seed) is derived locally via
+        ``int(SeedSequence(input).spawn(3)[2].generate_state(1)[0])``. This keeps
+        the in-memory ``mlp.seed`` semantics identical across protocols, so
+        participant estimator code is unaffected.
+
+        Args:
+            row: Dataset row dict.
+            seed_protocol_version: ``"2.0"`` (legacy) or ``"3.0"`` (explicit).
+                Defaults to ``"2.0"`` for callers that don't pass it (preserves
+                historical behavior).
+
+        Raises:
+            ValueError: on malformed weights via MLP.validate().
+        """
+        weight_layers = [fnp.array(w) for w in row["weights"]]
+        if not weight_layers:
+            raise ValueError("MLP row has empty weights.")
+        depth = len(weight_layers)
+        width = weight_layers[0].shape[0] if weight_layers[0].ndim else 0
+
+        raw_seed = int(row.get("mlp_seed", 0))
+        # Validate the version here, in the one place that interprets it, so every
+        # caller (make_contest_from_dataset, iter_mlps, load_mlp, direct) is guarded.
+        # An unrecognised value (a typo like "3", or the whole seed_protocol dict)
+        # must raise — silently treating it as legacy raw seed would reintroduce the
+        # wrong-score class the explicit-protocol path exists to prevent.
+        from .dataset_io import SEED_PROTOCOL_VERSION, SEED_PROTOCOL_VERSION_V3
+
+        if seed_protocol_version == SEED_PROTOCOL_VERSION_V3:
+            from .seeds import derive_estimator_seed
+
+            estimator_seed = derive_estimator_seed(raw_seed)
+        elif seed_protocol_version == SEED_PROTOCOL_VERSION:
+            estimator_seed = raw_seed  # legacy: parquet mlp_seed IS the estimator seed
+        else:
+            raise ValueError(
+                f"unsupported seed_protocol_version {seed_protocol_version!r}; expected "
+                f"{SEED_PROTOCOL_VERSION!r} (legacy raw seed) or "
+                f"{SEED_PROTOCOL_VERSION_V3!r} (derived per-MLP seed)"
+            )
+
+        mlp = cls(
+            width=width,
+            depth=depth,
+            weights=weight_layers,
+            seed=estimator_seed,
+            name=str(row.get("mlp_name", "")),
+        )
+        mlp.validate()
+        return mlp
+
+--- SetupContext <class 'whestbench.sdk.SetupContext'>
+@dataclass(frozen=True)
+class SetupContext:
+    """Runtime context passed to ``BaseEstimator.setup``."""
+
+    width: int
+    depth: int
+    flop_budget: int
+    api_version: str
+    scratch_dir: Optional[str] = None
+    submission_dir: Optional[str] = None
+    """Read-only path to the extracted submission directory (estimator.py plus
+    any files shipped alongside it, e.g. weights). Load shipped files with
+    ``fnp.load(Path(ctx.submission_dir) / "weights.npz")`` (0 FLOPs) or
+    ``MyModule.from_file(...)``. ``None`` outside the runner/grader."""
+    seed: int = 0
+    """Run-level seed for setup-time randomness.
+
+    Same value across all MLPs in a single run. ``0`` when ``--seed`` was not
+    passed. Participants seed their setup-time RNG via
+    ``np.random.default_rng(ctx.seed)``. See
+    docs/reference/estimator-contract.md for the reproducibility contract.
+    """
+
+
+codex
+The SDK confirms the fields are just `width`, `depth`, weights, and seed. I’m checking public generation helpers only to match the initializer family for synthetic tests.
+exec
+/bin/bash -lc "python - <<'PY'
+import whestbench, pathlib
+root=pathlib.Path(whestbench.__file__).parent
+for p in root.rglob('*.py'):
+    txt=p.read_text(errors='ignore')
+    if 'standard_normal' in txt or 'normal' in txt or 'init' in txt:
+        print(p)
+PY" in /opt/tiger/discover/workspace
+ succeeded in 969ms:
+/tmp/whest-official-deps/whestbench/generation.py
+/tmp/whest-official-deps/whestbench/simulation.py
+/tmp/whest-official-deps/whestbench/estimators.py
+/tmp/whest-official-deps/whestbench/dataset.py
+/tmp/whest-official-deps/whestbench/runner.py
+/tmp/whest-official-deps/whestbench/profiler.py
+/tmp/whest-official-deps/whestbench/dataset_torch.py
+/tmp/whest-official-deps/whestbench/dataset_io.py
+/tmp/whest-official-deps/whestbench/_provenance.py
+/tmp/whest-official-deps/whestbench/ui.py
+/tmp/whest-official-deps/whestbench/subprocess_worker.py
+/tmp/whest-official-deps/whestbench/cli.py
+/tmp/whest-official-deps/whestbench/aicrowd_client.py
+/tmp/whest-official-deps/whestbench/scoring.py
+/tmp/whest-official-deps/whestbench/packaging.py
+/tmp/whest-official-deps/whestbench/hf_progress.py
+/tmp/whest-official-deps/whestbench/reporting.py
+/tmp/whest-official-deps/whestbench/presentation/adapters.py
+
+exec
+/bin/bash -lc "sed -n '1,260p' /tmp/whest-official-deps/whestbench/generation.py" in /opt/tiger/discover/workspace
+ succeeded in 0ms:
+"""Random MLP sampling utilities used by the evaluator."""
+
+from __future__ import annotations
+
+from typing import Optional
+
+import flopscope.numpy as fnp
+
+from .domain import MLP
+
+
+def sample_mlp(
+    width: int,
+    depth: int,
+    rng: Optional[fnp.random.Generator] = None,
+    *,
+    seed: int = 0,
+) -> MLP:
+    """Sample a random MLP with He-initialized weight matrices.
+
+    Each weight matrix has shape ``(width, width)`` with entries drawn from
+    ``N(0, 2/width)`` (He initialization for ReLU networks).
+
+    Args:
+        width: Neuron count per layer.
+        depth: Number of weight matrices.
+        rng: Optional flopscope RNG for weight sampling. If None, a fresh
+            unseeded generator is used.
+        seed: Per-MLP grader-supplied seed to attach to the returned MLP for
+            estimator consumption. This does NOT control weight sampling
+            (which uses ``rng``); it's a separate stream the estimator may
+            consume for its own randomness.
+    """
+    if width <= 0:
+        raise ValueError("width must be positive.")
+    if depth <= 0:
+        raise ValueError("depth must be positive.")
+    if rng is None:
+        rng = fnp.random.default_rng()
+    assert rng is not None  # narrows for pyright; flopscope's default_rng is untyped
+    scale = float(fnp.sqrt(2.0 / width))
+    weights = [
+        fnp.array((rng.standard_normal((width, width)) * scale).astype(fnp.float32))
+        for _ in range(depth)
+    ]
+    mlp = MLP(width=width, depth=depth, weights=weights, seed=int(seed))
+    mlp.validate()
+    return mlp
+
+exec
+/bin/bash -lc "sed -n '1,260p' /tmp/whest-official-deps/whestbench/simulation.py" in /opt/tiger/discover/workspace
+ succeeded in 0ms:
+"""MLP execution helpers for batched forward passes and empirical moments.
+
+These utilities run an MLP layer-by-layer over random inputs and expose
+per-layer outputs/means used by score computation.
+"""
+
+from __future__ import annotations
+
+import warnings
+from typing import Any, Callable, Dict, List, Optional, Tuple
+
+import flopscope.numpy as fnp
+
+from .domain import MLP
+
+
+def relu(x: fnp.ndarray) -> fnp.ndarray:
+    """Element-wise ReLU activation."""
+    return fnp.maximum(x, fnp.float32(0.0))
+
+
+def run_mlp(mlp: MLP, inputs: fnp.ndarray) -> fnp.ndarray:
+    """Forward pass returning final-layer activations.
+
+    Args:
+        mlp: MLP to execute.
+        inputs: Input matrix of shape ``(samples, mlp.width)``.
+
+    Returns:
+        Activations of shape ``(samples, mlp.width)`` after the last layer.
+    """
+    x = inputs
+    for w in mlp.weights:
+        x = relu(x @ w)
+    return x
+
+
+def run_mlp_all_layers(mlp: MLP, inputs: fnp.ndarray) -> List[fnp.ndarray]:
+    """Forward pass returning activations after each layer.
+
+    Args:
+        mlp: MLP to execute.
+        inputs: Input matrix of shape ``(samples, mlp.width)``.
+
+    Returns:
+        List of ``depth`` arrays, each shape ``(samples, mlp.width)``.
+    """
+    x = inputs
+    layers: List[fnp.ndarray] = []
+    for w in mlp.weights:
+        x = relu(x @ w)
+        layers.append(x)
+    return layers
+
+
+def _pick_chunk_size(width: int) -> int:
+    """Choose chunk size to keep peak memory bounded (~4 MB per chunk)."""
+    return max(1024, min(16384, 2**20 // width))
+
+
+def sample_layer_statistics_chunk_count(width: int, n_samples: int) -> int:
+    """Return how many chunks ``sample_layer_statistics`` will process."""
+    chunk_size = _pick_chunk_size(width)
+    return (n_samples + chunk_size - 1) // chunk_size
+
+
+def sample_layer_statistics(
+    mlp: MLP,
+    n_samples: int,
+    rng: Optional[fnp.random.Generator] = None,
+    *,
+    progress: Optional[Callable[[Dict[str, Any]], None]] = None,
+) -> Tuple[fnp.ndarray, fnp.ndarray, float]:
+    """Estimate per-layer activation statistics via chunked Monte Carlo sampling.
+
+    Feeds ``n_samples`` random Gaussian inputs through the MLP in memory-bounded
+    chunks and computes empirical statistics of the activations at each layer.
+
+    The returned values are used in two places:
+
+    * **Scoring** (``scoring.py``): ``final_mean`` and ``avg_variance``
+      normalise the ``sampling_mse`` metric so that networks with
+      naturally high variance are not unfairly penalised.
+    * **Dataset generation** (``dataset.py``): ``all_layer_means`` captures
+      the ground-truth activation profile that estimators try to predict.
+
+    Args:
+        mlp: The MLP network to evaluate.
+        n_samples: How many i.i.d. N(0, 1) input vectors to draw.  Larger
+            values give more precise estimates at the cost of compute time.
+        rng: Optional NumPy-compatible random generator used for sampling inputs.
+            If ``None`` a new generator is created once for the call.
+        progress: Optional callback invoked once per processed chunk.
+
+    Returns:
+        all_layer_means: ``(depth, width)`` float32 array — the mean
+            activation of every neuron at every layer, averaged over all
+            samples.
+        final_mean: ``(width,)`` float32 array — the mean activation at
+            the last layer (equivalent to ``all_layer_means[-1]``).
+        avg_variance: Scalar — the mean per-neuron variance at the final
+            layer, used as a normalisation baseline for ``sampling_mse``.
+    """
+    width = mlp.width
+    depth = mlp.depth
+    chunk_size = _pick_chunk_size(width)
+    total_chunks = sample_layer_statistics_chunk_count(width, n_samples)
+    if rng is None:
+        rng = fnp.random.default_rng()
+    assert rng is not None  # narrows for pyright; flopscope's default_rng is untyped
+
+    # flopscope arrays are immutable (no in-place ``+=`` / item assignment), so
+    # accumulate per-layer sums in a Python list and stack once at the end, and
+    # rebind ``final_sum_sq`` with a whole-array add instead of ``+=``.
+    layer_sums = [fnp.zeros(width, dtype=fnp.float64) for _ in range(depth)]
+    final_sum_sq = fnp.zeros(width, dtype=fnp.float64)
+    n_processed = 0
+
+    # Suppress expected overflow/invalid warnings from deep-network matmuls.
+    # He-initialized weights can produce large pre-activation values at depth;
+    # ReLU clips them, so the warnings are benign.
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=RuntimeWarning, message=".*matmul.*")
+        for chunk_index, start in enumerate(range(0, n_samples, chunk_size), start=1):
+            n = min(chunk_size, n_samples - start)
+            x = fnp.array(rng.standard_normal((n, width), dtype=fnp.float32))
+            for layer_idx, w in enumerate(mlp.weights):
+                x = fnp.maximum(fnp.matmul(x, w), 0.0)
+                x_f64 = fnp.asarray(x, dtype=fnp.float64)
+                layer_sums[layer_idx] = layer_sums[layer_idx] + fnp.sum(x_f64, axis=0)
+            x_f64 = fnp.asarray(x, dtype=fnp.float64)
+            final_sum_sq = final_sum_sq + fnp.sum(x_f64**2, axis=0)
+            n_processed += n
+            if progress is not None:
+                progress({"completed": chunk_index, "total": total_chunks, "unit": "chunks"})
+
+    layer_means = fnp.asarray(fnp.stack(layer_sums) / n_processed, dtype=fnp.float32)
+    final_mean = layer_means[-1].copy()
+    avg_variance = float(
+        fnp.mean(final_sum_sq / n_processed - fnp.asarray(final_mean, dtype=fnp.float64) ** 2)
+    )
+    return layer_means, final_mean, avg_variance
+
+exec
+/bin/bash -lc "sed -n '1,260p' /tmp/whest-official-deps/whestbench/estimators.py" in /opt/tiger/discover/workspace
+ succeeded in 0ms:
+"""Reference estimators for MLP mean prediction using flopscope.
+
+This module provides tutorial estimator classes that predict per-layer
+output means using analytical first-moment propagation through ReLU networks.
+
+For a ReLU unit z = max(0, w^T x), if x ~ N(mu, Sigma):
+    E[z] = mu_pre * Phi(mu_pre/sigma_pre) + sigma_pre * phi(mu_pre/sigma_pre)
+
+where mu_pre = w^T mu, sigma_pre^2 = w^T Sigma w, Phi is the normal CDF,
+and phi is the normal PDF.
+"""
+
+# Reference baselines in this module are deterministic given the MLP weights
+# and budget — they do not consume randomness in predict(). Estimators that
+# DO use Monte Carlo sampling or other randomness should seed from `mlp.seed`
+# to ensure their submission reproduces under the grader's regrade.
+
+from __future__ import annotations
+
+from typing import Optional
+
+import flopscope as flops
+import flopscope.numpy as fnp
+
+from .domain import MLP
+from .sdk import BaseEstimator
+
+
+class MeanPropagationEstimator(BaseEstimator):
+    """Mean propagation estimator for ReLU MLPs.
+
+    Propagates means through each layer using the ReLU expectation formula
+    with a diagonal variance approximation (assumes independent neurons).
+    """
+
+    def predict(self, mlp: MLP, budget: int) -> fnp.ndarray:
+        """Predict per-layer output means via first-moment propagation through ReLU layers."""
+        _ = budget
+        width = mlp.width
+        mu = fnp.zeros(width)
+        var = fnp.ones(width)
+
+        rows = []
+        for w in mlp.weights:
+            mu_pre = w.T @ mu
+            var_pre = (w * w).T @ var
+            var_pre = fnp.maximum(var_pre, 1e-12)
+            sigma_pre = fnp.sqrt(var_pre)
+
+            alpha = mu_pre / sigma_pre
+            phi_alpha = flops.stats.norm.pdf(alpha)
+            Phi_alpha = flops.stats.norm.cdf(alpha)
+
+            # E[ReLU(z)]
+            mu = mu_pre * Phi_alpha + sigma_pre * phi_alpha
+
+            # Var[ReLU(z)]
+            ez2 = (mu_pre * mu_pre + var_pre) * Phi_alpha + mu_pre * sigma_pre * phi_alpha
+            var = fnp.maximum(ez2 - mu * mu, 0.0)
+
+            rows.append(mu)
+
+        return fnp.stack(rows, axis=0)
+
+
+class CovariancePropagationEstimator(BaseEstimator):
+    """Full covariance propagation estimator for ReLU MLPs."""
+
+    _COV_RESCALE_THRESHOLD = 1e100
+
+    def predict(self, mlp: MLP, budget: int) -> fnp.ndarray:
+        """Predict per-layer means via full covariance propagation through ReLU layers."""
+        _ = budget
+        width = mlp.width
+        mu = fnp.zeros(width)
+        cov = fnp.eye(width)
+        log_scale = 0.0
+
+        rows = []
+        for w in mlp.weights:
+            # Rescale before matmul to prevent overflow
+            cov_diag = fnp.diag(cov)
+            max_var_np = float(fnp.max(fnp.asarray(cov_diag)))
+            if max_var_np > self._COV_RESCALE_THRESHOLD:
+                s = float(fnp.sqrt(max_var_np))
+                mu = mu / s
+                cov = cov / (s * s)
+                log_scale += float(fnp.log(s))
+
+            mu_pre = w.T @ mu
+            cov_pre = w.T @ cov @ w
+            var_pre = fnp.maximum(fnp.diag(cov_pre), 1e-12)
+            sigma_pre = fnp.sqrt(var_pre)
+
+            alpha = mu_pre / sigma_pre
+            phi_alpha = flops.stats.norm.pdf(alpha)
+            Phi_alpha = flops.stats.norm.cdf(alpha)
+
+            # Post-ReLU means
+            mu = mu_pre * Phi_alpha + sigma_pre * phi_alpha
+
+            # Post-ReLU diagonal variance
+            ez2 = (mu_pre * mu_pre + var_pre) * Phi_alpha + mu_pre * sigma_pre * phi_alpha
+            var_post = fnp.maximum(ez2 - mu * mu, 0.0)
+
+            # Approximate post-ReLU covariance
+            sigma_np = fnp.asarray(sigma_pre, dtype=fnp.float64)
+            Phi_np = fnp.asarray(Phi_alpha, dtype=fnp.float64)
+            gain_np = fnp.where(sigma_np > 1e-12, Phi_np, 0.0)
+            gain = fnp.array(gain_np.astype(fnp.float32))
+            cov = fnp.multiply(fnp.outer(gain, gain), cov_pre)
+            # Set diagonal to var_post (in-place, like numpy)
+            fnp.fill_diagonal(cov, var_post)
+
+            # Record mean in original (unscaled) coordinates
+            scale_factor = float(fnp.exp(log_scale))
+            rows.append(mu * scale_factor)
+
+        return fnp.stack(rows, axis=0)
+
+
+class CombinedEstimator(BaseEstimator):
+    """Budget-aware hybrid estimator.
+
+    Routes to covariance propagation when the FLOP budget is large
+    enough relative to width^2, otherwise falls back to mean propagation.
+    """
+
+    _COVARIANCE_FLOP_MULTIPLIER = 30
+
+    def __init__(
+        self,
+        *,
+        mean_estimator: Optional[BaseEstimator] = None,
+        covariance_estimator: Optional[BaseEstimator] = None,
+    ) -> None:
+        self._mean_estimator = mean_estimator or MeanPropagationEstimator()
+        self._covariance_estimator = covariance_estimator or CovariancePropagationEstimator()
+
+    def predict(self, mlp: MLP, budget: int) -> fnp.ndarray:
+        """Route to covariance or mean propagation based on available FLOP budget."""
+        if budget >= self._COVARIANCE_FLOP_MULTIPLIER * mlp.width * mlp.width:
+            return self._covariance_estimator.predict(mlp, budget)
+        return self._mean_estimator.predict(mlp, budget)
+
+codex
+I’m going to benchmark changes against fresh synthetic He-initialized networks using high-sample Monte Carlo targets. These are generated on the fly and are not evaluation data.
+exec
+/bin/bash -lc "python - <<'PY'
+try:
+ import scipy
+ print('scipy ok', scipy.__version__)
+except Exception as e:
+ print('no scipy', e)
+PY" in /opt/tiger/discover/workspace
+ succeeded in 0ms:
+scipy ok 1.15.2
+
+codex
+The current estimator’s sampled path is capped at 7,520 samples, so I’ll start synthetic tests around that regime and compare against much larger Monte Carlo references.
+exec
+/bin/bash -lc "python - <<'PY'
+import numpy as np
+from scipy.stats import norm
+
+# Current estimator ported to numpy, parameterized for n cap and blend constants.
+def diag_prop(weights):
+    width=weights[0].shape[0]
+    d_mu=np.zeros(width)
+    d_var=np.ones(width)
+    rows=[]; vars=[]; pres=[]; prevars=[]
+    for w in weights:
+        d_mu_pre=w.T@d_mu
+        d_var_pre=(w*w).T@d_var
+        d_var_pre=np.maximum(d_var_pre,1e-12)
+        sig=np.sqrt(d_var_pre); a=d_mu_pre/sig
+        Phi=norm.cdf(a); phi=norm.pdf(a)
+        d_mu=d_mu_pre*Phi + sig*phi
+        ez2=(d_mu_pre*d_mu_pre+d_var_pre)*Phi+d_mu_pre*sig*phi
+        d_var=np.maximum(ez2-d_mu*d_mu,0.0)
+        rows.append(d_mu.copy()); vars.append(d_var.copy()); pres.append(d_mu_pre.copy()); prevars.append(d_var_pre.copy())
+    return rows, vars, pres, prevars
+
+def predict(weights, seed=0, budget=1e12, ncap=7520, blend=(0.99938145,1.03699807,-0.04249644,0.00549808), first=( -0.100, 1.43645, -0.43645), dtype=np.float32, final_mean_shift=0.0, final_var_mix=0.0):
+    depth=len(weights); width=weights[0].shape[0]
+    rows, vars, pres, prevars = diag_prop(weights)
+    if depth==1: return np.stack(rows).astype(np.float32)
+    per=max(1, depth*(2*width*width+4*width))
+    n=max(1024, int((0.625*float(budget))/float(per)))
+    n=min(n,ncap); n=2*max(1,n//2)
+    rng=np.random.default_rng(int(seed)+3)
+    x0=rng.standard_normal((n//2,width)).astype(dtype)
+    x=np.concatenate([x0,-x0],0)
+    eye=np.eye(width)
+    for i,w in enumerate(weights[:-1]):
+        z=x@w
+        if i==0:
+            t_cov=w.T@w
+            z_center=z-z.mean(0)
+            sample_cov=(z_center.T@z_center)/n
+            s_vals,s_vecs=np.linalg.eigh(sample_cov)
+            t_vals,t_vecs=np.linalg.eigh(t_cov)
+            inv_sqrt=s_vecs@(np.diag(1/np.sqrt(np.maximum(s_vals,1e-12)))@s_vecs.T)
+            target_sqrt=t_vecs@(np.diag(np.sqrt(np.maximum(t_vals,1e-12)))@t_vecs.T)
+            z=z_center@(inv_sqrt@target_sqrt)
+        x=np.maximum(z,0)
+        if i==0:
+            x_mean0=x.mean(0)
+            x_center=x-x_mean0
+            sample_cov=(x_center.T@x_center)/n
+            s_vals,s_vecs=np.linalg.eigh(sample_cov)
+            sigma0=np.sqrt(np.maximum(np.diag(t_cov),1e-12))
+            scale=np.maximum(sigma0[:,None]*sigma0[None,:],1e-12)
+            rho=np.clip(t_cov/scale,-0.999999,0.999999)
+            root=np.sqrt(np.maximum(1-rho*rho,0))
+            pi=np.pi
+            kernel=(root+(pi-np.arccos(rho))*rho)/(2*pi)
+            target_second=(sigma0[:,None]*sigma0[None,:])*kernel
+            target_cov=target_second-rows[0][:,None]*rows[0][None,:]
+            target_cov=0.5*(target_cov+target_cov.T)
+            target_cov=target_cov*(1-eye)+eye*vars[0][None,:]
+            t_vals,t_vecs=np.linalg.eigh(target_cov)
+            inv_sqrt=s_vecs@(np.diag(1/np.sqrt(np.maximum(s_vals,1e-12)))@s_vecs.T)
+            target_sqrt=t_vecs@(np.diag(np.sqrt(np.maximum(t_vals,1e-12)))@t_vecs.T)
+            x_full=x_center@(inv_sqrt@target_sqrt)+rows[0]
+            a,b,c=first
+            x=rows[0]+a*(x_mean0-rows[0])+b*(x_full-rows[0])+c*x_center
+    z=x@weights[-1]
+    z64=z.astype(np.float64)
+    z_mean=z64.mean(0)
+    z_center=z64-z_mean
+    z_var=np.mean(z_center*z_center,0)
+    if final_var_mix"'!=0:
+        z_var=(1-final_var_mix)*z_var + final_var_mix*prevars[-1]
+    z_sigma=np.sqrt(np.maximum(z_var,1e-12))
+    zm2=(1-final_mean_shift)*z_mean + final_mean_shift*pres[-1]
+    a=z_mean/z_sigma
+    final_gauss=z_mean*norm.cdf(a)+z_sigma*norm.pdf(a)
+    amd=pres[-1]/z_sigma
+    final_mixed=pres[-1]*norm.cdf(amd)+z_sigma*norm.pdf(amd)
+    if final_mean_shift!=0:
+        am=zm2/z_sigma
+        final_gauss_shift=zm2*norm.cdf(am)+z_sigma*norm.pdf(am)
+    else:
+        final_gauss_shift=final_gauss
+    final_mc=np.maximum(z64,0).sum(0)/n
+    s,c1,c2,c3=blend
+    final=s*(c1*final_mc+c2*final_gauss_shift+c3*final_mixed)
+    return np.stack(rows[:-1]+[final]).astype(np.float32)
+
+def target(weights, n=300000, seed=1234, chunk=50000):
+    width=weights[0].shape[0]
+    sums=[np.zeros(width) for _ in weights]
+    rng=np.random.default_rng(seed)
+    done=0
+    while done<n:
+        m=min(chunk,n-done)
+        x=rng.standard_normal((m,width)).astype(np.float32)
+        for i,w in enumerate(weights):
+            x=np.maximum(x@w,0)
+            sums[i]+=x.astype(np.float64).sum(0)
+        done+=m
+    return np.stack([s/n for s in sums]).astype(np.float32)
+
+def gen(width, depth, seed):
+    rng=np.random.default_rng(seed)
+    scale=np.sqrt(2/width).astype(np.float64) if hasattr(np.sqrt(2/width),'"'astype') else np.sqrt(2/width)
+    return [(rng.standard_normal((width,width))*scale).astype(np.float32) for _ in range(depth)]
+
+for dims in [(32,4),(64,4),(64,8),(128,4)]:
+    width,depth=dims
+    ms=[]; ds=[]
+    for k in range(5):
+        weights=gen(width,depth,1000+17*k+width+depth)
+        y=target(weights,n=200000 if width<=64 else 120000,seed=9000+k,chunk=40000)
+        p=predict(weights,seed=2000+k,budget=1e12)
+        rows,_,_,_=diag_prop(weights)
+        d=np.stack(rows).astype(np.float32)
+        ms.append(((p[-1]-y[-1])**2).mean())
+        ds.append(((d[-1]-y[-1])**2).mean())
+    print('dims',dims,'current',np.mean(ms), 'diag',np.mean(ds), 'ratio', np.mean(ms)/np.mean(ds))
+PY" in /opt/tiger/discover/workspace
+ succeeded in 8532ms:
+dims (32, 4) current 8.559191e-06 diag 0.0059875622 ratio 0.0014294952
+dims (64, 4) current 8.878198e-06 diag 0.0014988113 ratio 0.005923493
+dims (64, 8) current 7.3372794e-06 diag 0.004026348 ratio 0.0018223163
+dims (128, 4) current 9.038375e-06 diag 0.0008576245 ratio 0.010538848
+
+codex
+The synthetic baseline shows the sampled/control-variate estimator is already much better than diagonal propagation, but still leaves a few e-6 MSE against high-sample references. I’ll fit only final-layer blend weights first, because that is a low-risk change if it improves held-out synthetic networks.
+exec
+/bin/bash -lc "python - <<'PY'
+import numpy as np
+from scipy.stats import norm
+
+np.set_printoptions(precision=8,suppress=False)
+
+def diag_prop(weights):
+    width=weights[0].shape[0]
+    d_mu=np.zeros(width); d_var=np.ones(width)
+    rows=[]; vars=[]; pres=[]; prevars=[]
+    for w in weights:
+        d_mu_pre=w.T@d_mu
+        d_var_pre=(w*w).T@d_var
+        d_var_pre=np.maximum(d_var_pre,1e-12)
+        sig=np.sqrt(d_var_pre); a=d_mu_pre/sig
+        Phi=norm.cdf(a); phi=norm.pdf(a)
+        d_mu=d_mu_pre*Phi+sig*phi
+        ez2=(d_mu_pre*d_mu_pre+d_var_pre)*Phi+d_mu_pre*sig*phi
+        d_var=np.maximum(ez2-d_mu*d_mu,0)
+        rows.append(d_mu.copy()); vars.append(d_var.copy()); pres.append(d_mu_pre.copy()); prevars.append(d_var_pre.copy())
+    return rows,vars,pres,prevars
+
+def features(weights, seed=0, n=7520, first=(-0.1,1.43645,-0.43645), dtype=np.float32):
+    depth=len(weights); width=weights[0].shape[0]
+    rows,vars,pres,prevars=diag_prop(weights)
+    if depth==1:
+        return np.stack([rows[-1], rows[-1], rows[-1], rows[-1], rows[-1], rows[-1]],axis=1), rows
+    rng=np.random.default_rng(seed+3)
+    x0=rng.standard_normal((n//2,width)).astype(dtype)
+    x=np.concatenate([x0,-x0],0)
+    eye=np.eye(width)
+    for i,w in enumerate(weights[:-1]):
+        z=x@w
+        if i==0:
+            t_cov=w.T@w
+            zc=z-z.mean(0)
+            sc=(zc.T@zc)/n
+            sv,svec=np.linalg.eigh(sc); tv,tvec=np.linalg.eigh(t_cov)
+            inv=svec@(np.diag(1/np.sqrt(np.maximum(sv,1e-12)))@svec.T)
+            ts=tvec@(np.diag(np.sqrt(np.maximum(tv,1e-12)))@tvec.T)
+            z=zc@(inv@ts)
+        x=np.maximum(z,0)
+        if i==0:
+            xm=x.mean(0); xc=x-xm; sc=(xc.T@xc)/n
+            sv,svec=np.linalg.eigh(sc)
+            sigma=np.sqrt(np.maximum(np.diag(t_cov),1e-12))
+            rho=np.clip(t_cov/np.maximum(sigma[:,None]*sigma[None,:],1e-12),-0.999999,0.999999)
+            root=np.sqrt(np.maximum(1-rho*rho,0))
+            kern=(root+(np.pi-np.arccos(rho))*rho)/(2*np.pi)
+            target_second=(sigma[:,None]*sigma[None,:])*kern
+            tc=target_second-rows[0][:,None]*rows[0][None,:]
+            tc=0.5*(tc+tc.T); tc=tc*(1-eye)+eye*vars[0][None,:]
+            tv,tvec=np.linalg.eigh(tc)
+            inv=svec@(np.diag(1/np.sqrt(np.maximum(sv,1e-12)))@svec.T)
+            ts=tvec@(np.diag(np.sqrt(np.maximum(tv,1e-12)))@tvec.T)
+            xfull=xc@(inv@ts)+rows[0]
+            a,b,c=first
+            x=rows[0]+a*(xm-rows[0])+b*(xfull-rows[0])+c*xc
+    z=x@weights[-1]
+    z64=z.astype(np.float64)
+    zm=z64.mean(0); zc=z64-zm; zv=np.mean(zc*zc,0); zs=np.sqrt(np.maximum(zv,1e-12))
+    final_mc=np.maximum(z64,0).mean(0)
+    a=zm/zs; final_gauss=zm*norm.cdf(a)+zs*norm.pdf(a)
+    amd=pres[-1]/zs; final_mixed=pres[-1]*norm.cdf(amd)+zs*norm.pdf(amd)
+    # Adjust sample preactivation to diagonal-prop mean/variance, then relu-average.
+    d_sig=np.sqrt(np.maximum(prevars[-1],1e-12))
+    z_adj=(z64-zm)*(d_sig/np.maximum(zs,1e-12))+pres[-1]
+    final_adj=np.maximum(z_adj,0).mean(0)
+    # Adjust mean only and variance only Gaussian moments.
+    am=pres[-1]/zs; gauss_meanfix=pres[-1]*norm.cdf(am)+zs*norm.pdf(am)
+    adv=zm/d_sig; gauss_varfix=zm*norm.cdf(adv)+d_sig*norm.pdf(adv)
+    # existing output features order first three important + diag + adj variants
+    F=np.stack([final_mc, final_gauss, final_mixed, rows[-1], final_adj, gauss_varfix, np.ones(width)],axis=1)
+    return F, rows
+
+def target(weights,n=400000,seed=1234,chunk=50000):
+    width=weights[0].shape[0]
+    sums=[np.zeros(width) for _ in weights]
+    rng=np.random.default_rng(seed)
+    done=0
+    while done<n:
+        m=min(chunk,n-done)
+        x=rng.standard_normal((m,width)).astype(np.float32)
+        for i,w in enumerate(weights):
+            x=np.maximum(x@w,0)
+            sums[i]+=x.astype(np.float64).sum(0)
+        done+=m
+    return np.stack([s/n for s in sums])
+
+def gen(width,depth,seed):
+    rng=np.random.default_rng(seed)
+    sc=np.sqrt(2/width)
+    return [(rng.standard_normal((width,width))*sc).astype(np.float32) for _ in range(depth)]
+
+cases=[]
+for dims,count in [((32,4),8),((64,4),10),((64,8),8),((128,4),6),((128,8),4)]:
+    w,d=dims
+    for k in range(count):
+        cases.append((w,d,10000+1000*w+50*d+k))
+
+Xs=[]; ys=[]; groups=[]
+errs_cur=[]; errs_diag=[]
+for idx,(w,d,sd) in enumerate(cases):
+    weights=gen(w,d,sd)
+    nref=500000 if w<=64 else 250000
+    y=target(weights,n=nref,seed=70000+idx,chunk=50000)
+    F, rows=features(weights,seed=90000+idx,n=7520)
+    yv=y[-1]
+    cur=0.99938145*(1.03699807*F[:,0]-0.04249644*F[:,1]+0.00549808*F[:,2])
+    diag=np.array(rows[-1])
+    errs_cur.append(np.mean((cur-yv)**2)); errs_diag.append(np.mean((diag-yv)**2))
+    Xs.append(F); ys.append(yv); groups.append(idx)
+    print(idx,(w,d),'cur',errs_cur[-1])
+X=np.concatenate(Xs,0); y=np.concatenate(ys,0)
+# fit no intercept on selected features and with ridge small.
+for cols in [[0,1,2],[0,1,2,3],[0,1,2,4],[0,1,2,3,4,5],[0,1,2,3,4,5,6]]:
+    A=X[:,cols]
+    coef=np.linalg.lstsq(A,y,rcond=None)[0]
+    pred=A@coef
+    print('cols',cols,'coef',coef,'train mse',np.mean((pred-y)**2))
+print('current mean',np.mean(errs_cur),'diag',np.mean(errs_diag))
+# leave-one-case-out like group error for two fits
+for cols in [[0,1,2],[0,1,2,4],[0,1,2,3,4,5]]:
+    per=[]
+    for hold in range(len(cases)):
+        train=[i for i in range(len(cases)) if i"'!=hold]
+        A=np.concatenate([Xs[i][:,cols] for i in train],0); yy=np.concatenate([ys[i] for i in train],0)
+        coef=np.linalg.lstsq(A,yy,rcond=None)[0]
+        pr=Xs[hold][:,cols]@coef
+        per.append(np.mean((pr-ys[hold])**2))
+    print('"'LOO cols',cols,'mean',np.mean(per),'coef_all',np.linalg.lstsq(X[:,cols],y,rcond=None)[0])
+PY" in /opt/tiger/discover/workspace
+codex
+The fitting run is still processing the larger synthetic cases. Early per-network errors are around the same scale as before, which gives enough signal to compare blend changes.
+ succeeded in 37138ms:
+0 (32, 4) cur 7.2632442045126125e-06
+1 (32, 4) cur 4.045540992237832e-06
+2 (32, 4) cur 1.2116042192186404e-05
+3 (32, 4) cur 4.328391957701307e-06
+4 (32, 4) cur 6.42335928213426e-06
+5 (32, 4) cur 6.704410184137382e-06
+6 (32, 4) cur 4.6662853574039515e-06
+7 (32, 4) cur 4.098369860970795e-06
+8 (64, 4) cur 5.7720112995122275e-06
+9 (64, 4) cur 5.8623069377608785e-06
+10 (64, 4) cur 7.840868634823015e-06
+11 (64, 4) cur 8.782849470287696e-06
+12 (64, 4) cur 8.09749754811811e-06
+13 (64, 4) cur 7.276409480449764e-06
+14 (64, 4) cur 4.5648412081212505e-06
+15 (64, 4) cur 5.5814527010407254e-06
+16 (64, 4) cur 5.9840139541832024e-06
+17 (64, 4) cur 6.950800451477429e-06
+18 (64, 8) cur 8.33530499495689e-06
+19 (64, 8) cur 1.1173011590741197e-05
+20 (64, 8) cur 1.224574830534859e-05
+21 (64, 8) cur 1.107981622048459e-05
+22 (64, 8) cur 8.806348386052086e-06
+23 (64, 8) cur 3.939946235361633e-06
+24 (64, 8) cur 3.90234817062474e-06
+25 (64, 8) cur 1.0897194585415154e-05
+26 (128, 4) cur 8.16457393422891e-06
+27 (128, 4) cur 5.810385777219425e-06
+28 (128, 4) cur 5.658874221136804e-06
+29 (128, 4) cur 7.731186632562213e-06
+30 (128, 4) cur 6.795162356387746e-06
+31 (128, 4) cur 8.337557329264407e-06
+32 (128, 8) cur 5.1690343401565914e-06
+33 (128, 8) cur 1.398706792065573e-05
+34 (128, 8) cur 9.982195042221205e-06
+35 (128, 8) cur 5.727218861167895e-06
+cols [0, 1, 2] coef [0.99431771 0.00422071 0.00121338] train mse 7.235012216128782e-06
+cols [0, 1, 2, 3] coef [9.94155631e-01 4.38074678e-03 3.61296838e-04 8.53413968e-04] train mse 7.23451773373054e-06
+cols [0, 1, 2, 4] coef [9.93114486e-01 5.42884337e-03 8.58608983e-05 1.12181027e-03] train mse 7.234238086205716e-06
+cols [0, 1, 2, 3, 4, 5] coef [ 9.70464224e-01  5.15203669e-02 -2.45144982e-02 -3.43251914e-04
+  2.59925668e-02 -2.33690609e-02] train mse 7.229475375993827e-06
+cols [0, 1, 2, 3, 4, 5, 6] coef [ 9.65516499e-01  5.81133833e-02 -2.66323785e-02  7.74841357e-03
+  1.99600600e-02 -2.48562767e-02 -1.76986707e-04] train mse 7.218524803584589e-06
+current mean 7.336157517251239e-06 diag 0.0026241670807087576
+LOO cols [0, 1, 2] mean 7.068623740793839e-06 coef_all [0.99431771 0.00422071 0.00121338]
+LOO cols [0, 1, 2, 4] mean 7.075245041550567e-06 coef_all [9.93114486e-01 5.42884337e-03 8.58608983e-05 1.12181027e-03]
+LOO cols [0, 1, 2, 3, 4, 5] mean 7.083198297938877e-06 coef_all [ 9.70464224e-01  5.15203669e-02 -2.45144982e-02 -3.43251914e-04
+  2.59925668e-02 -2.33690609e-02]
+
+codex
+The final blend fit suggests only a modest synthetic gain, and it may not transfer if the existing constants were tuned on the blackbox. I’ll test the first-layer covariance extrapolation separately before deciding whether to alter the submitted file.
+exec
+/bin/bash -lc "python - <<'PY'
+import numpy as np
+from scipy.stats import norm
+
+# Compact synthetic grid for first-layer transform tuning.
+def diag_prop(weights):
+    width=weights[0].shape[0]
+    mu=np.zeros(width); var=np.ones(width); rows=[]; vars=[]; pres=[]; prevars=[]
+    for w in weights:
+        mp=w.T@mu; vp=(w*w).T@var; vp=np.maximum(vp,1e-12); sig=np.sqrt(vp); a=mp/sig
+        P=norm.cdf(a); p=norm.pdf(a); mu=mp*P+sig*p; ez2=(mp*mp+vp)*P+mp*sig*p; var=np.maximum(ez2-mu*mu,0)
+        rows.append(mu.copy()); vars.append(var.copy()); pres.append(mp.copy()); prevars.append(vp.copy())
+    return rows,vars,pres,prevars
+
+def final_features(weights, seed, n=7520, first=(-0.1,1.43645,-0.43645)):
+    rows,vars,pres,prevars=diag_prop(weights); width=weights[0].shape[0]
+    rng=np.random.default_rng(seed+3); x0=rng.standard_normal((n//2,width)).astype(np.float32); x=np.concatenate([x0,-x0])
+    eye=np.eye(width)
+    for i,w in enumerate(weights[:-1]):
+        z=x@w
+        if i==0:
+            tc=w.T@w; zc=z-z.mean(0); sc=(zc.T@zc)/n
+            sv,U=np.linalg.eigh(sc); tv,V=np.linalg.eigh(tc)
+            z=zc@(U@(np.diag(1/np.sqrt(np.maximum(sv,1e-12)))@U.T) @ (V@(np.diag(np.sqrt(np.maximum(tv,1e-12)))@V.T)))
+        x=np.maximum(z,0)
+        if i==0:
+            xm=x.mean(0); xc=x-xm; sc=(xc.T@xc)/n; sv,U=np.linalg.eigh(sc)
+            sig=np.sqrt(np.maximum(np.diag(tc),1e-12)); rho=np.clip(tc/np.maximum(sig[:,None]*sig[None,:],1e-12),-0.999999,0.999999)
+            kern=(np.sqrt(np.maximum(1-rho*rho,0))+(np.pi-np.arccos(rho))*rho)/(2*np.pi)
+            tgt=(sig[:,None]*sig[None,:])*kern-rows[0][:,None]*rows[0][None,:]
+            tgt=0.5*(tgt+tgt.T); tgt=tgt*(1-eye)+eye*vars[0][None,:]
+            tv,V=np.linalg.eigh(tgt)
+            xfull=xc@(U@(np.diag(1/np.sqrt(np.maximum(sv,1e-12)))@U.T) @ (V@(np.diag(np.sqrt(np.maximum(tv,1e-12)))@V.T)))+rows[0]
+            a,b,c=first; x=rows[0]+a*(xm-rows[0])+b*(xfull-rows[0])+c*xc
+    z=(x@weights[-1]).astype(np.float64); zm=z.mean(0); zv=((z-zm)**2).mean(0); zs=np.sqrt(np.maximum(zv,1e-12))
+    mc=np.maximum(z,0).mean(0); ga=zm*norm.cdf(zm/zs)+zs*norm.pdf(zm/zs); mix=pres[-1]*norm.cdf(pres[-1]/zs)+zs*norm.pdf(pres[-1]/zs)
+    return np.stack([mc,ga,mix],1)
+
+def target(weights,n,seed):
+    width=weights[0].shape[0]; sums=[np.zeros(width) for _ in weights]; rng=np.random.default_rng(seed); done=0
+    while done<n:
+        m=min(50000,n-done); x=rng.standard_normal((m,width)).astype(np.float32)
+        for i,w in enumerate(weights):
+            x=np.maximum(x@w,0); sums[i]+=x.astype(np.float64).sum(0)
+        done+=m
+    return np.stack([s/n for s in sums])[-1]
+
+def gen(width,depth,seed):
+    rng=np.random.default_rng(seed); sc=np.sqrt(2/width); return [(rng.standard_normal((width,width))*sc).astype(np.float32) for _ in range(depth)]
+
+cases=[]
+for dims,count in [((32,4),4),((64,4),5),((64,8),4),((128,4),3)]:
+    for k in range(count): cases.append((*dims,30000+dims[0]*100+dims[1]*10+k))
+weights=[]; ys=[]
+for idx,(w,d,sd) in enumerate(cases):
+    ww=gen(w,d,sd); weights.append(ww); ys.append(target(ww, 350000 if w<=64 else 180000, 80000+idx))
+
+curcoef=np.array([0.99938145*1.03699807,0.99938145*-0.04249644,0.99938145*0.00549808])
+print('curcoef',curcoef)
+settings=[]
+for a in [-0.2,-0.1,0.0,0.1]:
+  for b in [1.0,1.15,1.3,1.43645,1.55,1.7]:
+    settings.append((a,b,1-b))
+for first in settings:
+    Xs=[]; errcur=[]
+    for i,ww in enumerate(weights):
+        F=final_features(ww,90000+i,first=first)
+        Xs.append(F)
+        errcur.append(np.mean((F@curcoef-ys[i])**2))
+    X=np.concatenate(Xs); y=np.concatenate(ys)
+    coef=np.linalg.lstsq(X,y,rcond=None)[0]
+    errfit=[]
+    for i,F in enumerate(Xs): errfit.append(np.mean((F@coef-ys[i])**2))
+    print('first',first,'curblend',np.mean(errcur),'fit',np.mean(errfit),'coef',coef)
+PY" in /opt/tiger/discover/workspace
+ succeeded in 20203ms:
+curcoef [ 1.03635663 -0.04247015  0.00549468]
+first (-0.2, 1.0, 0.0) curblend 8.107147397717559e-06 fit 7.573089335140283e-06 coef [9.77245527e-01 2.19391538e-02 3.67913855e-04]
+first (-0.2, 1.15, -0.1499999999999999) curblend 8.111601162693262e-06 fit 7.609159555599609e-06 coef [9.78528866e-01 2.06548572e-02 3.50708080e-04]
+first (-0.2, 1.3, -0.30000000000000004) curblend 8.171117874967403e-06 fit 7.702851852365683e-06 coef [9.79787223e-01 1.93488552e-02 3.72624410e-04]
+first (-0.2, 1.43645, -0.43645) curblend 8.274288809194429e-06 fit 7.83868199404743e-06 coef [9.80896801e-01 1.81571771e-02 4.24674661e-04]
+first (-0.2, 1.55, -0.55) curblend 8.396645605827017e-06 fit 7.988665318063712e-06 coef [9.81785598e-01 1.71730328e-02 4.90191028e-04]
+first (-0.2, 1.7, -0.7) curblend 8.609197038433887e-06 fit 8.237812943709792e-06 coef [9.82929712e-01 1.58634184e-02 6.09311090e-04]
+first (-0.1, 1.0, 0.0) curblend 8.111363349240744e-06 fit 7.5846477621376255e-06 coef [9.77374635e-01 2.15492267e-02 6.33270924e-04]
+first (-0.1, 1.15, -0.1499999999999999) curblend 8.121052449576816e-06 fit 7.625985361262702e-06 coef [9.78662887e-01 2.02562177e-02 6.19857759e-04]
+first (-0.1, 1.3, -0.30000000000000004) curblend 8.185691501511646e-06 fit 7.7247878988523e-06 coef [9.79924643e-01 1.89425590e-02 6.46019864e-04]
+first (-0.1, 1.43645, -0.43645) curblend 8.293399079233642e-06 fit 7.865141205109056e-06 coef [9.81038541e-01 1.77425330e-02 7.02090612e-04]
+first (-0.1, 1.55, -0.55) curblend 8.419477575157918e-06 fit 8.01883717359206e-06 coef [9.81930255e-01 1.67526384e-02 7.70398349e-04]
+first (-0.1, 1.7, -0.7) curblend 8.636788986561756e-06 fit 8.2726964416418e-06 coef [9.83077550e-01 1.54366280e-02 8.92685205e-04]
+first (0.0, 1.0, 0.0) curblend 8.150705761455315e-06 fit 7.631323828584872e-06 coef [9.77497569e-01 2.11357728e-02 9.27886731e-04]
+first (0.0, 1.15, -0.1499999999999999) curblend 8.16562277772385e-06 fit 7.677905649843472e-06 coef [9.78789937e-01 1.98346580e-02 9.18453892e-04]
+first (0.0, 1.3, -0.30000000000000004) curblend 8.235391855860726e-06 fit 7.781812110758211e-06 coef [9.80054822e-01 1.85139521e-02 9.48529556e-04]
+first (0.0, 1.43645, -0.43645) curblend 8.347650488009913e-06 fit 7.926706649030996e-06 coef [0.98117346 0.01730479 0.00100898]
+first (0.0, 1.55, -0.55) curblend 8.477444700402679e-06 fit 8.084106024867867e-06 coef [0.98206871 0.01630879 0.00107982]
+first (0.0, 1.7, -0.7) curblend 8.69953671256505e-06 fit 8.3426783537628e-06 coef [0.98321874 0.01498659 0.00120552]
+first (0.1, 1.0, 0.0) curblend 8.225182326531426e-06 fit 7.713059780410494e-06 coef [0.97761425 0.02069886 0.00125178]
+first (0.1, 1.15, -0.1499999999999999) curblend 8.245344163740448e-06 fit 7.764898570852426e-06 coef [0.97891051 0.01939001 0.00124617]
+first (0.1, 1.3, -0.30000000000000004) curblend 8.320285326124735e-06 fit 7.873935202311316e-06 coef [0.98017764 0.01806307 0.00128023]
+first (0.1, 1.43645, -0.43645) curblend 8.436999099697585e-06 fit 8.023271757057364e-06 coef [0.98130177 0.01684417 0.00134492]
+first (0.1, 1.55, -0.55) curblend 8.57053044716167e-06 fit 8.184384539109222e-06 coef [0.98220006 0.01584235 0.00141851]
+first (0.1, 1.7, -0.7) curblend 8.797398344956573e-06 fit 8.447650285386325e-06 coef [0.98335245 0.01451424 0.0015477 ]
+
+codex
+The synthetic tests favor a less aggressive first-layer extrapolation, but that conflicts with the already strong blackbox-tuned constants. Before changing the file, I’m going to give the official evaluator a longer uninterrupted run.
+exec
+/bin/bash -lc 'python eval_client.py' in /opt/tiger/discover/workspace
+codex
+The official evaluator is running again. I’ll let this one complete unless it clearly exceeds a reasonable runtime.
+codex
+No output yet from the evaluator; it is still waiting on the blackbox service response.
+codex
+Still running. I’m not starting parallel evaluations, since that would make service behavior harder to interpret.
+codex
+The run remains active after about two minutes. I’ll keep polling; the candidate itself is computationally heavy, so this is not yet conclusive.
+codex
+No service response yet. I’m continuing to wait for the official score rather than relying only on synthetic data.
+codex
+The evaluator is still in flight. If it eventually returns, I’ll use that result as the primary decision signal.
+codex
+Still no output. I’m giving the blackbox more time because the prior baseline was reported by this same client.
+codex
+The process is still waiting on the socket response. I’ll continue polling, but I won’t make file changes while the baseline run is pending.
+codex
+No result yet after several minutes. This looks like a slow or backed-up evaluator service, not a candidate syntax issue.
+codex
+Still running. I’ll wait a little longer; without an official score, changing the already strong submitted constants would be speculative.
+codex
+The blackbox has not responded. I’m going to allow one more polling interval before stopping the run and moving to a conservative local-only improvement.
+codex
+The official client is still blocked on receive, so I’m stopping this attempt. I’ll avoid large speculative changes and focus on modifications that are easy to revert if they do not validate later.
+ exited 130 in 396820ms:
+Traceback (most recent call last):
+  File "/opt/tiger/discover/workspace/eval_client.py", line 94, in <module>
+    raise SystemExit(main())
+                     ^^^^^^
+  File "/opt/tiger/discover/workspace/eval_client.py", line 72, in main
+    response_data = _recv_line(sock)
+                    ^^^^^^^^^^^^^^^^
+  File "/opt/tiger/discover/workspace/eval_client.py", line 49, in _recv_line
+    chunk = sock.recv(65536)
+            ^^^^^^^^^^^^^^^^
+KeyboardInterrupt
+
+codex
+I’m checking one more class of low-cost changes: matching hidden-layer sample marginals back to the analytic mean/variance after each ReLU. It costs little, but it can distort correlations, so I’m testing it synthetically before considering it.
+exec
+/bin/bash -lc "python - <<'PY'
+import numpy as np
+from scipy.stats import norm
+
+def diag_prop(weights):
+ w0=weights[0].shape[0]; mu=np.zeros(w0); var=np.ones(w0); rows=[]; vars=[]; pres=[]; prevars=[]
+ for w in weights:
+  mp=w.T@mu; vp=(w*w).T@var; vp=np.maximum(vp,1e-12); sig=np.sqrt(vp); a=mp/sig; P=norm.cdf(a); p=norm.pdf(a)
+  mu=mp*P+sig*p; ez2=(mp*mp+vp)*P+mp*sig*p; var=np.maximum(ez2-mu*mu,0)
+  rows.append(mu.copy()); vars.append(var.copy()); pres.append(mp.copy()); prevars.append(vp.copy())
+ return rows,vars,pres,prevars
+
+def pred(weights,seed=0,n=7520, beta_mean=0.0,beta_var=0.0, apply_first=False):
+ rows,vars,pres,prevars=diag_prop(weights); width=weights[0].shape[0]; depth=len(weights)
+ rng=np.random.default_rng(seed+3); x0=rng.standard_normal((n//2,width)).astype(np.float32); x=np.concatenate([x0,-x0]); eye=np.eye(width)
+ for i,w in enumerate(weights[:-1]):
+  z=x@w
+  if i==0:
+   tc=w.T@w; zc=z-z.mean(0); sc=(zc.T@zc)/n; sv,U=np.linalg.eigh(sc); tv,V=np.linalg.eigh(tc)
+   inv=U@(np.diag(1/np.sqrt(np.maximum(sv,1e-12)))@U.T); ts=V@(np.diag(np.sqrt(np.maximum(tv,1e-12)))@V.T); z=zc@(inv@ts)
+  x=np.maximum(z,0)
+  if i==0:
+   xm=x.mean(0); xc=x-xm; sc=(xc.T@xc)/n; sv,U=np.linalg.eigh(sc)
+   sig=np.sqrt(np.maximum(np.diag(tc),1e-12)); rho=np.clip(tc/np.maximum(sig[:,None]*sig[None,:],1e-12),-0.999999,0.999999)
+   kern=(np.sqrt(np.maximum(1-rho*rho,0))+(np.pi-np.arccos(rho))*rho)/(2*np.pi)
+   tgt=(sig[:,None]*sig[None,:])*kern-rows[0][:,None]*rows[0][None,:]; tgt=0.5*(tgt+tgt.T); tgt=tgt*(1-eye)+eye*vars[0][None,:]
+   tv,V=np.linalg.eigh(tgt); inv=U@(np.diag(1/np.sqrt(np.maximum(sv,1e-12)))@U.T); ts=V@(np.diag(np.sqrt(np.maximum(tv,1e-12)))@V.T)
+   xfull=xc@(inv@ts)+rows[0]
+   x=rows[0]-0.100*(xm-rows[0])+1.43645*(xfull-rows[0])-0.43645*xc
+  if (apply_first or i>0) and (beta_mean"'!=0 or beta_var!=0):
+   xm=x.mean(0); xc=x-xm; xv=np.mean(xc*xc,0); scale=np.sqrt(np.maximum(vars[i],1e-12)/np.maximum(xv,1e-12))
+   # separate mean and variance nudges
+   x = x + beta_mean*(rows[i]-xm) + beta_var*(xc*(scale-1.0))
+ z=(x@weights[-1]).astype(np.float64); zm=z.mean(0); zv=((z-zm)**2).mean(0); zs=np.sqrt(np.maximum(zv,1e-12))
+ mc=np.maximum(z,0).mean(0); ga=zm*norm.cdf(zm/zs)+zs*norm.pdf(zm/zs); mix=pres[-1]*norm.cdf(pres[-1]/zs)+zs*norm.pdf(pres[-1]/zs)
+ return 0.99938145*(1.03699807*mc-0.04249644*ga+0.00549808*mix)
+
+def target(weights,n,seed):
+ width=weights[0].shape[0]; s=np.zeros(width); rng=np.random.default_rng(seed); done=0
+ while done<n:
+  m=min(50000,n-done); x=rng.standard_normal((m,width)).astype(np.float32)
+  for w in weights: x=np.maximum(x@w,0)
+  s+=x.astype(np.float64).sum(0); done+=m
+ return s/n
+
+def gen(width,depth,seed):
+ rng=np.random.default_rng(seed); sc=np.sqrt(2/width); return [(rng.standard_normal((width,width))*sc).astype(np.float32) for _ in range(depth)]
+
+cases=[]
+for dims,count in [((32,4),4),((64,4),5),((64,8),4),((128,4),3)]:
+ for k in range(count): cases.append((*dims,50000+dims[0]*100+dims[1]*10+k))
+weights=[]; ys=[]
+for idx,(w,d,sd) in enumerate(cases):
+ ww=gen(w,d,sd); weights.append(ww); ys.append(target(ww,300000 if w<=64 else 160000,100000+idx))
+for bm in [0,0.25,0.5,0.75,1.0,-0.25]:
+ for bv in [0,0.25,0.5,0.75,1.0,-0.25]:
+  if (bm,bv) not in [(0,0),(0.25,0.25),(0.5,0.5),(0.75,0.75),(1.0,1.0),(-0.25,-0.25),(1.0,0),(0,1.0),(0.5,0),(0,0.5)]:
+   continue
+  errs=[]
+  for i,ww in enumerate(weights): errs.append(np.mean((pred(ww,90000+i,beta_mean=bm,beta_var=bv)-ys[i])**2))
+  print('"'bm,bv',bm,bv,'err',np.mean(errs))
+PY" in /opt/tiger/discover/workspace
+ succeeded in 14512ms:
+bm,bv 0 0 err 9.325165816077072e-06
+bm,bv 0 0.5 err 0.00011670691012821047
+bm,bv 0 1.0 err 0.0002697222849109951
+bm,bv 0.25 0.25 err 0.00034234934629584447
+bm,bv 0.5 0 err 0.0007301444322492745
+bm,bv 0.5 0.5 err 0.0008394089049786506
+bm,bv 0.75 0.75 err 0.0013213307853664955
+bm,bv 1.0 0 err 0.001566925212994283
+bm,bv 1.0 1.0 err 0.0017951380330968956
+bm,bv -0.25 -0.25 err 0.001204381626626551
+
+codex
+The hidden-layer marginal matching is clearly harmful in synthetic tests, so I’m discarding that path. Next I’m checking whether the sample cap is the limiting factor; if MSE barely improves with more samples, the cap should stay unchanged.
+exec
+/bin/bash -lc "python - <<'PY'
+# Quick n-sample sensitivity using simplified copy of previous current predictor.
+import numpy as np
+from scipy.stats import norm
+
+def diag_prop(weights):
+ width=weights[0].shape[0]; mu=np.zeros(width); var=np.ones(width); rows=[]; vars=[]; pres=[]; prevars=[]
+ for w in weights:
+  mp=w.T@mu; vp=(w*w).T@var; vp=np.maximum(vp,1e-12); sig=np.sqrt(vp); a=mp/sig; P=norm.cdf(a); p=norm.pdf(a)
+  mu=mp*P+sig*p; ez2=(mp*mp+vp)*P+mp*sig*p; var=np.maximum(ez2-mu*mu,0); rows.append(mu.copy()); vars.append(var.copy()); pres.append(mp.copy()); prevars.append(vp.copy())
+ return rows,vars,pres,prevars
+
+def pred(weights,seed,n):
+ rows,vars,pres,prevars=diag_prop(weights); width=weights[0].shape[0]
+ rng=np.random.default_rng(seed+3); x0=rng.standard_normal((n//2,width)).astype(np.float32); x=np.concatenate([x0,-x0]); eye=np.eye(width)
+ for i,w in enumerate(weights[:-1]):
+  z=x@w
+  if i==0:
+   tc=w.T@w; zc=z-z.mean(0); sc=(zc.T@zc)/n; sv,U=np.linalg.eigh(sc); tv,V=np.linalg.eigh(tc)
+   z=zc@(U@(np.diag(1/np.sqrt(np.maximum(sv,1e-12)))@U.T)@(V@(np.diag(np.sqrt(np.maximum(tv,1e-12)))@V.T)))
+  x=np.maximum(z,0)
+  if i==0:
+   xm=x.mean(0); xc=x-xm; sc=(xc.T@xc)/n; sv,U=np.linalg.eigh(sc)
+   sig=np.sqrt(np.maximum(np.diag(tc),1e-12)); rho=np.clip(tc/np.maximum(sig[:,None]*sig[None,:],1e-12),-0.999999,0.999999)
+   kern=(np.sqrt(np.maximum(1-rho*rho,0))+(np.pi-np.arccos(rho))*rho)/(2*np.pi)
+   tgt=(sig[:,None]*sig[None,:])*kern-rows[0][:,None]*rows[0][None,:]; tgt=0.5*(tgt+tgt.T); tgt=tgt*(1-eye)+eye*vars[0][None,:]
+   tv,V=np.linalg.eigh(tgt); xfull=xc@(U@(np.diag(1/np.sqrt(np.maximum(sv,1e-12)))@U.T)@(V@(np.diag(np.sqrt(np.maximum(tv,1e-12)))@V.T)))+rows[0]
+   x=rows[0]-0.100*(xm-rows[0])+1.43645*(xfull-rows[0])-0.43645*xc
+ z=(x@weights[-1]).astype(np.float64); zm=z.mean(0); zv=((z-zm)**2).mean(0); zs=np.sqrt(np.maximum(zv,1e-12))
+ mc=np.maximum(z,0).mean(0); ga=zm*norm.cdf(zm/zs)+zs*norm.pdf(zm/zs); mix=pres[-1]*norm.cdf(pres[-1]/zs)+zs*norm.pdf(pres[-1]/zs)
+ return 0.99938145*(1.03699807*mc-0.04249644*ga+0.00549808*mix)
+
+def target(weights,n,seed):
+ width=weights[0].shape[0]; s=np.zeros(width); rng=np.random.default_rng(seed); done=0
+ while done<n:
+  m=min(60000,n-done); x=rng.standard_normal((m,width)).astype(np.float32)
+  for w in weights: x=np.maximum(x@w,0)
+  s+=x.astype(np.float64).sum(0); done+=m
+ return s/n
+
+def gen(width,depth,seed):
+ rng=np.random.default_rng(seed); sc=np.sqrt(2/width); return [(rng.standard_normal((width,width))*sc).astype(np.float32) for _ in range(depth)]
+
+cases=[]
+for dims,count in [((64,4),6),((64,8),4),((128,4),4)]:
+ for k in range(count): cases.append((*dims,71000+dims[0]*100+dims[1]*10+k))
+weights=[]; ys=[]
+for idx,(w,d,sd) in enumerate(cases):
+ ww=gen(w,d,sd); weights.append(ww); ys.append(target(ww,400000 if w==64 else 220000,120000+idx))
+for n in [1024,2048,4096,7520,10000,15000,24000]:
+ errs=[]
+ for i,ww in enumerate(weights):
+  errs.append(np.mean((pred(ww,150000+i,n)-ys[i])**2))
+ print('n',n,'mse',np.mean(errs))
+PY" in /opt/tiger/discover/workspace
+ succeeded in 15360ms:
+n 1024 mse 4.283026279545151e-05
+n 2048 mse 2.4129783887549526e-05
+n 4096 mse 1.2274149030948852e-05
+n 7520 mse 7.924949448035643e-06
+n 10000 mse 6.207529757788935e-06
+n 15000 mse 4.456399132134201e-06
+n 24000 mse 3.381414514092511e-06
+
+codex
+More samples reduce raw MSE but likely increase the score multiplier; the existing cap looks like a tradeoff rather than an arbitrary limit. I’m going to check the local profiler API so any compute changes are grounded in the official accounting style.
+exec
+/bin/bash -lc "python - <<'PY'
+import inspect, flopscope as flops
+print([n for n in dir(flops) if 'flop' in n.lower() or 'profile' in n.lower() or 'budget' in n.lower() or 'counter' in n.lower()])
+print([n for n in dir(flops)[:100]])
+PY" in /opt/tiger/discover/workspace
+ succeeded in 0ms:
+['BudgetContext', 'BudgetExhaustedError', 'FlopscopeArray', 'FlopscopeError', 'FlopscopeWarning', 'NoBudgetContextError', '_budget', 'budget', 'budget_live', 'budget_reset', 'budget_summary', 'budget_summary_dict']
+['AccumulationCost', 'BudgetContext', 'BudgetExhaustedError', 'ComponentCost', 'FlopscopeArray', 'FlopscopeError', 'FlopscopeWarning', 'Module', 'NoBudgetContextError', 'OpRecord', 'PathInfo', 'RegimeStep', 'StepInfo', 'SymmetricTensor', 'SymmetryError', 'SymmetryGroup', 'SymmetryLossWarning', 'TimeExhaustedError', 'UnauthorizedControlError', 'UnsupportedFunctionError', 'UnsupportedReturnType', '_LAZY_SUBMODULES', '_REGISTRY_META', '__all__', '__builtins__', '__cached__', '__dir__', '__doc__', '__file__', '__getattr__', '__loader__', '__name__', '__numpy_pinned__', '__numpy_supported__', '__numpy_version__', '__package__', '__path__', '__spec__', '__version__', '_accumulation', '_budget', '_check_numpy_version', '_config', '_display', '_importlib', '_io', '_module', '_ndarray', '_np', '_opt_einsum', '_perm_group', '_registry', '_symmetric', '_symmetry_utils', '_validation', '_version_check', 'accounting', 'as_symmetric', 'budget', 'budget_live', 'budget_reset', 'budget_summary', 'budget_summary_dict', 'clear_cache', 'configure', 'einsum_accumulation_cost', 'einsum_cache_info', 'einsum_clear_caches', 'errors', 'is_symmetric', 'namespace', 'numpy', 'reduction_accumulation_cost', 'reduction_cache_info', 'reduction_clear_cache', 'remote_unsupported_ops', 'stats', 'symmetrize', 'tier2_reduction_cost']
+
+exec
+/bin/bash -lc "python - <<'PY'
+import inspect, flopscope as flops
+print(inspect.signature(flops.budget))
+print(inspect.getsource(flops.budget))
+print(inspect.signature(flops.budget_summary_dict))
+PY" in /opt/tiger/discover/workspace
+ succeeded in 0ms:
+(flop_budget: 'int', quiet: 'bool' = False, namespace: 'str | None' = None, wall_time_limit_s: 'float | None' = None) -> 'BudgetContext'
+def budget(
+    flop_budget: int,
+    quiet: bool = False,
+    namespace: str | None = None,
+    wall_time_limit_s: float | None = None,
+) -> BudgetContext:
+    """Create a ``BudgetContext`` usable as a context manager or decorator.
+
+    This helper accepts the same arguments as ``BudgetContext(...)`` and is
+    convenient when you want a short, function-style entrypoint.
+
+    Parameters
+    ----------
+    flop_budget : int
+        Maximum number of FLOPs allowed inside the context.
+    quiet : bool, optional
+        If ``True``, suppress the startup banner on context entry.
+    namespace : str or None, optional
+        Root namespace prefix for attribution.
+    wall_time_limit_s : float or None, optional
+        Cooperative wall-clock limit checked at operation boundaries.
+
+    Returns
+    -------
+    BudgetContext
+        A context manager that can also be used as a decorator.
+
+    Examples
+    --------
+    >>> import flopscope as flops
+    >>> import flopscope.numpy as fnp
+    >>> with flops.budget(1_000):
+    ...     _ = fnp.add(fnp.array([1.0]), fnp.array([2.0]))
+    """
+    return BudgetContext(
+        flop_budget=flop_budget,
+        quiet=quiet,
+        namespace=namespace,
+        wall_time_limit_s=wall_time_limit_s,
+    )
+
+(by_namespace: 'bool' = False) -> 'dict'
+
+codex
+I’ll run the current estimator under a local flopscope budget on synthetic MLPs to see how its `per_sample` formula compares with recorded FLOPs. This does not touch the blackbox dataset.
+exec
+/bin/bash -lc "python - <<'PY'
+import flopscope as flops
+import flopscope.numpy as fnp
+from whestbench.generation import sample_mlp
+from submission import Estimator
+for width,depth in [(32,4),(64,4),(64,8),(128,4)]:
+    rng=fnp.random.default_rng(123+width+depth)
+    mlp=sample_mlp(width,depth,rng,seed=999)
+    budget=10**12
+    flops.budget_reset()
+    with flops.budget(10**14, quiet=True):
+        out=Estimator().predict(mlp,budget)
+        summ=flops.budget_summary_dict()
+    print('dims',width,depth,'out',out.shape,'summary',summ)
+PY" in /opt/tiger/discover/workspace
+ succeeded in 1203ms:
+/opt/tiger/discover/workspace/submission.py:77: SymmetryLossWarning: Symmetry lost along dims (0, 1): multiply — no symmetry groups shared by both operands. Use as_symmetric() to re-tag if you know the result is symmetric. Suppress with flops.configure(symmetry_warnings=False).
+  target_cov = target_cov * (1.0 - eye) + eye * diag_vars[0][None, :]
+dims 32 4 out (4, 32) summary {'flop_budget': 100000000000000, 'flops_used': 130347696, 'flops_remaining': 99999869652304, 'operations': {'zeros': {'flop_cost': 0, 'calls': 1, 'flopscope_backend_time_s': 2.8498470783233643e-06, 'flopscope_overhead_time_s': 2.1982938051223755e-05}, 'ones': {'flop_cost': 0, 'calls': 1, 'flopscope_backend_time_s': 8.385628461837769e-06, 'flopscope_overhead_time_s': 1.0292977094650269e-05}, 'matmul': {'flop_cost': 122487552, 'calls': 27, 'flopscope_backend_time_s': 0.005515262484550476, 'flopscope_overhead_time_s': 0.010030914098024368}, 'multiply': {'flop_cost': 736416, 'calls': 53, 'flopscope_backend_time_s': 0.0014113858342170715, 'flopscope_overhead_time_s': 0.0012131892144680023}, 'maximum': {'flop_cost': 965056, 'calls': 20, 'flopscope_backend_time_s': 0.001370444893836975, 'flopscope_overhead_time_s': 0.0005092620849609375}, 'sqrt': {'flop_cost': 1344, 'calls': 11, 'flopscope_backend_time_s': 1.823529601097107e-05, 'flopscope_overhead_time_s': 0.000163152813911438}, 'true_divide': {'flop_cost': 4384, 'calls': 13, 'flopscope_backend_time_s': 3.918260335922241e-05, 'flopscope_overhead_time_s': 0.00027728453278541565}, 'stats.norm.pdf': {'flop_cost': 5184, 'calls': 6, 'flopscope_backend_time_s': 0.0, 'flopscope_overhead_time_s': 0.00018611177802085876}, 'stats.norm.cdf': {'flop_cost': 9216, 'calls': 6, 'flopscope_backend_time_s': 0.0, 'flopscope_overhead_time_s': 0.0006794817745685577}, 'add': {'flop_cost': 484832, 'calls': 20, 'flopscope_backend_time_s': 0.0010009147226810455, 'flopscope_overhead_time_s': 0.00029825419187545776}, 'subtract': {'flop_cost': 1207024, 'calls': 16, 'flopscope_backend_time_s': 0.0026774145662784576, 'flopscope_overhead_time_s': 0.0003766864538192749}, 'eye': {'flop_cost': 0, 'calls': 1, 'flopscope_backend_time_s': 1.0170042514801025e-05, 'flopscope_overhead_time_s': 4.9073249101638794e-05}, 'random.Generator.standard_normal': {'flop_cost': 1925120, 'calls': 1, 'flopscope_backend_time_s': 0.0, 'flopscope_overhead_time_s': 0.0015522800385951996}, 'asarray': {'flop_cost': 0, 'calls': 3, 'flopscope_backend_time_s': 6.921589374542236e-06, 'flopscope_overhead_time_s': 3.91639769077301e-05}, 'negative': {'flop_cost': 120320, 'calls': 1, 'flopscope_backend_time_s': 0.0001758001744747162, 'flopscope_overhead_time_s': 1.6048550605773926e-05}, 'concatenate': {'flop_cost': 0, 'calls': 1, 'flopscope_backend_time_s': 0.0004219450056552887, 'flopscope_overhead_time_s': 2.9180198907852173e-05}, 'mean': {'flop_cost': 962560, 'calls': 4, 'flopscope_backend_time_s': 0.001086656004190445, 'flopscope_overhead_time_s': 0.0009115710854530334}, 'linalg.eigh': {'flop_cost': 1179648, 'calls': 4, 'flopscope_backend_time_s': 0.000668797641992569, 'flopscope_overhead_time_s': 9.068846702575684e-05}, 'diag': {'flop_cost': 0, 'calls': 4, 'flopscope_backend_time_s': 3.265216946601868e-05, 'flopscope_overhead_time_s': 0.00010604411363601685}, 'diagonal': {'flop_cost': 0, 'calls': 1, 'flopscope_backend_time_s': 6.727874279022217e-06, 'flopscope_overhead_time_s': 1.8361955881118774e-05}, 'clip': {'flop_cost': 2048, 'calls': 1, 'flopscope_backend_time_s': 2.0567327737808228e-05, 'flopscope_overhead_time_s': 3.2708048820495605e-05}, 'arccos': {'flop_cost': 16384, 'calls': 1, 'flopscope_backend_time_s': 1.1868774890899658e-05, 'flopscope_overhead_time_s': 1.0915100574493408e-05}, 'sum': {'flop_cost': 240608, 'calls': 1, 'flopscope_backend_time_s': 0.000252503901720047, 'flopscope_overhead_time_s': 0.00018598511815071106}, 'stack': {'flop_cost': 0, 'calls': 1, 'flopscope_backend_time_s': 2.014264464378357e-05, 'flopscope_overhead_time_s': 2.9675662517547607e-05}}, 'wall_time_s': 0.036366432905197144, 'flopscope_backend_time_s': 0.014758829027414322, 'flopscope_overhead_time_s': 0.016838308423757553, 'residual_wall_time_s': 0.0047692954540252686}
+dims 64 4 out (4, 64) summary {'flop_budget': 100000000000000, 'flops_used': 518611296, 'flops_remaining': 99999481388704, 'operations': {'zeros': {'flop_cost': 0, 'calls': 1, 'flopscope_backend_time_s': 1.8514692783355713e-06, 'flopscope_overhead_time_s': 1.731887459754944e-05}, 'ones': {'flop_cost': 0, 'calls': 1, 'flopscope_backend_time_s': 6.649643182754517e-06, 'flopscope_overhead_time_s': 9.924173355102539e-06}, 'matmul': {'flop_cost': 495721984, 'calls': 27, 'flopscope_backend_time_s': 0.01265876367688179, 'flopscope_overhead_time_s': 0.006239164620637894}, 'multiply': {'flop_cost': 1499456, 'calls': 53, 'flopscope_backend_time_s': 0.002164151519536972, 'flopscope_overhead_time_s': 0.0008944086730480194}, 'maximum': {'flop_cost': 1934208, 'calls': 20, 'flopscope_backend_time_s': 0.0021281130611896515, 'flopscope_overhead_time_s': 0.00046255066990852356}, 'sqrt': {'flop_cost': 4736, 'calls': 11, 'flopscope_backend_time_s': 1.5266239643096924e-05, 'flopscope_overhead_time_s': 0.00014827772974967957}, 'true_divide': {'flop_cost': 16960, 'calls': 13, 'flopscope_backend_time_s': 2.9917806386947632e-05, 'flopscope_overhead_time_s': 0.00026132166385650635}, 'stats.norm.pdf': {'flop_cost': 10368, 'calls': 6, 'flopscope_backend_time_s': 0.0, 'flopscope_overhead_time_s': 0.00012772530317306519}, 'stats.norm.cdf': {'flop_cost': 18432, 'calls': 6, 'flopscope_backend_time_s': 0.0, 'flopscope_overhead_time_s': 0.000627126544713974}, 'add': {'flop_cost': 975808, 'calls': 20, 'flopscope_backend_time_s': 0.0025553368031978607, 'flopscope_overhead_time_s': 0.0002856925129890442}, 'subtract': {'flop_cost': 2421216, 'calls': 16, 'flopscope_backend_time_s': 0.004152212291955948, 'flopscope_overhead_time_s': 0.00036239251494407654}, 'eye': {'flop_cost': 0, 'calls': 1, 'flopscope_backend_time_s': 9.864568710327148e-06, 'flopscope_overhead_time_s': 2.8755515813827515e-05}, 'random.Generator.standard_normal': {'flop_cost': 3850240, 'calls': 1, 'flopscope_backend_time_s': 0.0, 'flopscope_overhead_time_s': 0.0027336888015270233}, 'asarray': {'flop_cost': 0, 'calls': 3, 'flopscope_backend_time_s': 6.1318278312683105e-06, 'flopscope_overhead_time_s': 3.657117486000061e-05}, 'negative': {'flop_cost': 240640, 'calls': 1, 'flopscope_backend_time_s': 5.852431058883667e-05, 'flopscope_overhead_time_s': 1.8689781427383423e-05}, 'concatenate': {'flop_cost': 0, 'calls': 1, 'flopscope_backend_time_s': 0.0006558857858181, 'flopscope_overhead_time_s': 2.8740614652633667e-05}, 'mean': {'flop_cost': 1925120, 'calls': 4, 'flopscope_backend_time_s': 0.0015085414052009583, 'flopscope_overhead_time_s': 0.0006934106349945068}, 'linalg.eigh': {'flop_cost': 9437184, 'calls': 4, 'flopscope_backend_time_s': 0.0016358979046344757, 'flopscope_overhead_time_s': 7.544085383415222e-05}, 'diag': {'flop_cost': 0, 'calls': 4, 'flopscope_backend_time_s': 2.919510006904602e-05, 'flopscope_overhead_time_s': 9.001046419143677e-05}, 'diagonal': {'flop_cost': 0, 'calls': 1, 'flopscope_backend_time_s': 5.315989255905151e-06, 'flopscope_overhead_time_s': 1.6108155250549316e-05}, 'clip': {'flop_cost': 8192, 'calls': 1, 'flopscope_backend_time_s': 1.2055039405822754e-05, 'flopscope_overhead_time_s': 2.7779489755630493e-05}, 'arccos': {'flop_cost': 65536, 'calls': 1, 'flopscope_backend_time_s': 4.7907233238220215e-06, 'flopscope_overhead_time_s': 8.52346420288086e-06}, 'sum': {'flop_cost': 481216, 'calls': 1, 'flopscope_backend_time_s': 0.000362202525138855, 'flopscope_overhead_time_s': 0.0001816675066947937}, 'stack': {'flop_cost': 0, 'calls': 1, 'flopscope_backend_time_s': 2.017989754676819e-05, 'flopscope_overhead_time_s': 2.7943402528762817e-05}}, 'wall_time_s': 0.04372919723391533, 'flopscope_backend_time_s': 0.028020847588777542, 'flopscope_overhead_time_s': 0.013403233140707016, 'residual_wall_time_s': 0.002305116504430771}
+dims 64 8 out (8, 64) summary {'flop_budget': 100000000000000, 'flops_used': 765131104, 'flops_remaining': 99999234868896, 'operations': {'zeros': {'flop_cost': 0, 'calls': 1, 'flopscope_backend_time_s': 1.2069940567016602e-06, 'flopscope_overhead_time_s': 1.4428049325942993e-05}, 'ones': {'flop_cost': 0, 'calls': 1, 'flopscope_backend_time_s': 6.839632987976074e-06, 'flopscope_overhead_time_s': 8.732080459594727e-06}, 'matmul': {'flop_cost': 740277248, 'calls': 39, 'flopscope_backend_time_s': 0.017494473606348038, 'flopscope_overhead_time_s': 0.004534400999546051}, 'multiply': {'flop_cost': 1517632, 'calls': 85, 'flopscope_backend_time_s': 0.0023139379918575287, 'flopscope_overhead_time_s': 0.0013809241354465485}, 'maximum': {'flop_cost': 3859840, 'calls': 32, 'flopscope_backend_time_s': 0.0035092532634735107, 'flopscope_overhead_time_s': 0.0007300116121768951}, 'sqrt': {'flop_cost': 4992, 'calls': 15, 'flopscope_backend_time_s': 2.0273029804229736e-05, 'flopscope_overhead_time_s': 0.00018467754125595093}, 'true_divide': {'flop_cost': 17216, 'calls': 17, 'flopscope_backend_time_s': 3.119558095932007e-05, 'flopscope_overhead_time_s': 0.00030117109417915344}, 'stats.norm.pdf': {'flop_cost': 17280, 'calls': 10, 'flopscope_backend_time_s': 0.0, 'flopscope_overhead_time_s': 0.00020911544561386108}, 'stats.norm.cdf': {'flop_cost': 30720, 'calls': 10, 'flopscope_backend_time_s': 0.0, 'flopscope_overhead_time_s': 0.0010922662913799286}, 'add': {'flop_cost': 976576, 'calls': 32, 'flopscope_backend_time_s': 0.001221783459186554, 'flopscope_overhead_time_s': 0.0004196576774120331}, 'subtract': {'flop_cost': 2421472, 'calls': 20, 'flopscope_backend_time_s': 0.0031672492623329163, 'flopscope_overhead_time_s': 0.00037835538387298584}, 'eye': {'flop_cost': 0, 'calls': 1, 'flopscope_backend_time_s': 9.059906005859375e-06, 'flopscope_overhead_time_s': 3.1445175409317017e-05}, 'random.Generator.standard_normal': {'flop_cost': 3850240, 'calls': 1, 'flopscope_backend_time_s': 0.0, 'flopscope_overhead_time_s': 0.0027360431849956512}, 'asarray': {'flop_cost': 0, 'calls': 3, 'flopscope_backend_time_s': 7.096678018569946e-06, 'flopscope_overhead_time_s': 4.202499985694885e-05}, 'negative': {'flop_cost': 240640, 'calls': 1, 'flopscope_backend_time_s': 9.898841381072998e-05, 'flopscope_overhead_time_s': 1.6860663890838623e-05}, 'concatenate': {'flop_cost': 0, 'calls': 1, 'flopscope_backend_time_s': 0.0007198825478553772, 'flopscope_overhead_time_s': 3.238022327423096e-05}, 'mean': {'flop_cost': 1925120, 'calls': 4, 'flopscope_backend_time_s': 0.001136627048254013, 'flopscope_overhead_time_s': 0.0007333718240261078}, 'linalg.eigh': {'flop_cost': 9437184, 'calls': 4, 'flopscope_backend_time_s': 0.0016277134418487549, 'flopscope_overhead_time_s': 8.343160152435303e-05}, 'diag': {'flop_cost': 0, 'calls': 4, 'flopscope_backend_time_s': 2.9385089874267578e-05, 'flopscope_overhead_time_s': 8.988752961158752e-05}, 'diagonal': {'flop_cost': 0, 'calls': 1, 'flopscope_backend_time_s': 4.76837158203125e-06, 'flopscope_overhead_time_s': 1.428648829460144e-05}, 'clip': {'flop_cost': 8192, 'calls': 1, 'flopscope_backend_time_s': 1.1663883924484253e-05, 'flopscope_overhead_time_s': 2.5313347578048706e-05}, 'arccos': {'flop_cost': 65536, 'calls': 1, 'flopscope_backend_time_s': 4.939734935760498e-06, 'flopscope_overhead_time_s': 8.743256330490112e-06}, 'sum': {'flop_cost': 481216, 'calls': 1, 'flopscope_backend_time_s': 0.0003052614629268646, 'flopscope_overhead_time_s': 0.0002004466950893402}, 'stack': {'flop_cost': 0, 'calls': 1, 'flopscope_backend_time_s': 2.224743366241455e-05, 'flopscope_overhead_time_s': 3.373250365257263e-05}}, 'wall_time_s': 0.04749658331274986, 'flopscope_backend_time_s': 0.0317438468337059, 'flopscope_overhead_time_s': 0.013301707804203033, 'residual_wall_time_s': 0.002451028674840927}
+dims 128 4 out (4, 128) summary {'flop_budget': 100000000000000, 'flops_used': 2114499264, 'flops_remaining': 99997885500736, 'operations': {'zeros': {'flop_cost': 0, 'calls': 1, 'flopscope_backend_time_s': 2.212822437286377e-06, 'flopscope_overhead_time_s': 1.475214958190918e-05}, 'ones': {'flop_cost': 0, 'calls': 1, 'flopscope_backend_time_s': 7.208436727523804e-06, 'flopscope_overhead_time_s': 9.182840585708618e-06}, 'matmul': {'flop_cost': 2011732992, 'calls': 27, 'flopscope_backend_time_s': 0.03515879064798355, 'flopscope_overhead_time_s': 0.006352480500936508}, 'multiply': {'flop_cost': 3105408, 'calls': 53, 'flopscope_backend_time_s': 0.004718504846096039, 'flopscope_overhead_time_s': 0.0009209327399730682}, 'maximum': {'flop_cost': 3884800, 'calls': 20, 'flopscope_backend_time_s': 0.004596821963787079, 'flopscope_overhead_time_s': 0.0005154162645339966}, 'sqrt': {'flop_cost': 17664, 'calls': 11, 'flopscope_backend_time_s': 2.1200627088546753e-05, 'flopscope_overhead_time_s': 0.00015001371502876282}, 'true_divide': {'flop_cost': 66688, 'calls': 13, 'flopscope_backend_time_s': 4.247203469276428e-05, 'flopscope_overhead_time_s': 0.0002590380609035492}, 'stats.norm.pdf': {'flop_cost': 20736, 'calls': 6, 'flopscope_backend_time_s': 0.0, 'flopscope_overhead_time_s': 0.00012818723917007446}, 'stats.norm.cdf': {'flop_cost': 36864, 'calls': 6, 'flopscope_backend_time_s': 0.0, 'flopscope_overhead_time_s': 0.0006475150585174561}, 'add': {'flop_cost': 1976192, 'calls': 20, 'flopscope_backend_time_s': 0.0036265775561332703, 'flopscope_overhead_time_s': 0.0002896934747695923}, 'subtract': {'flop_cost': 4871104, 'calls': 16, 'flopscope_backend_time_s': 0.008166547864675522, 'flopscope_overhead_time_s': 0.00035292282700538635}, 'eye': {'flop_cost': 0, 'calls': 1, 'flopscope_backend_time_s': 1.16005539894104e-05, 'flopscope_overhead_time_s': 2.8133392333984375e-05}, 'random.Generator.standard_normal': {'flop_cost': 7700480, 'calls': 1, 'flopscope_backend_time_s': 0.0, 'flopscope_overhead_time_s': 0.005440771579742432}, 'asarray': {'flop_cost': 0, 'calls': 3, 'flopscope_backend_time_s': 6.973743438720703e-06, 'flopscope_overhead_time_s': 3.91639769077301e-05}, 'negative': {'flop_cost': 481280, 'calls': 1, 'flopscope_backend_time_s': 0.0005356930196285248, 'flopscope_overhead_time_s': 2.4527311325073242e-05}, 'concatenate': {'flop_cost': 0, 'calls': 1, 'flopscope_backend_time_s': 0.0014581196010112762, 'flopscope_overhead_time_s': 3.124400973320007e-05}, 'mean': {'flop_cost': 3850240, 'calls': 4, 'flopscope_backend_time_s': 0.00197577103972435, 'flopscope_overhead_time_s': 0.0007331408560276031}, 'linalg.eigh': {'flop_cost': 75497472, 'calls': 4, 'flopscope_backend_time_s': 0.005583025515079498, 'flopscope_overhead_time_s': 8.541345596313477e-05}, 'diag': {'flop_cost': 0, 'calls': 4, 'flopscope_backend_time_s': 3.948435187339783e-05, 'flopscope_overhead_time_s': 9.053200483322144e-05}, 'diagonal': {'flop_cost': 0, 'calls': 1, 'flopscope_backend_time_s': 1.0631978511810303e-05, 'flopscope_overhead_time_s': 1.7877668142318726e-05}, 'clip': {'flop_cost': 32768, 'calls': 1, 'flopscope_backend_time_s': 1.376122236251831e-05, 'flopscope_overhead_time_s': 2.5324523448944092e-05}, 'arccos': {'flop_cost': 262144, 'calls': 1, 'flopscope_backend_time_s': 9.719282388687134e-06, 'flopscope_overhead_time_s': 9.585171937942505e-06}, 'sum': {'flop_cost': 962432, 'calls': 1, 'flopscope_backend_time_s': 0.0006554983556270599, 'flopscope_overhead_time_s': 0.00018310546875}, 'stack': {'flop_cost': 0, 'calls': 1, 'flopscope_backend_time_s': 1.8659979104995728e-05, 'flopscope_overhead_time_s': 2.7220696210861206e-05}}, 'wall_time_s': 0.08682963997125626, 'flopscope_backend_time_s': 0.06665927544236183, 'flopscope_overhead_time_s': 0.016376174986362457, 'residual_wall_time_s': 0.003794189542531967}
+
+codex
+The local FLOP summary explains the sample cap: at common synthetic sizes it puts the candidate near a likely 10% budget floor. I’m checking the client mechanics now only to understand the stalled socket, not to inspect evaluator data.
+exec
+/bin/bash -lc "sed -n '1,140p' eval_client.py" in /opt/tiger/discover/workspace
+ succeeded in 0ms:
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+import socket
+import sys
+import uuid
+
+
+PROBLEM_TYPE = 'arc_whestbench_2026'
+SOCKET_PATH = '/tmp/wb_gaussiancv_a2.sock'
+HOST = '127.0.0.1'
+PORT = None
+SUBMISSION_PATH = 'submission.py'
+TIMEOUT_S = 4000.0
+MAX_SUBMISSION_BYTES = 8388608
+
+
+def _read_submission(path: str) -> str:
+    data = Path(path).read_bytes()
+    if len(data) > MAX_SUBMISSION_BYTES:
+        raise SystemExit(f"submission is too large: {len(data)} bytes")
+    return data.decode("utf-8")
+
+
+def _connect() -> socket.socket:
+    socket_path = os.environ.get("TTT_BLACKBOX_EVAL_SOCKET") or SOCKET_PATH
+    port_value = os.environ.get("TTT_BLACKBOX_EVAL_PORT")
+    host_value = os.environ.get("TTT_BLACKBOX_EVAL_HOST") or HOST
+    if socket_path:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(TIMEOUT_S)
+        sock.connect(socket_path)
+        return sock
+    port = int(port_value) if port_value else PORT
+    if port is None:
+        raise SystemExit("missing blackbox eval runner socket or TCP port")
+    sock = socket.create_connection((host_value, int(port)), timeout=TIMEOUT_S)
+    sock.settimeout(TIMEOUT_S)
+    return sock
+
+
+def _recv_line(sock: socket.socket) -> bytes:
+    chunks = []
+    total = 0
+    while True:
+        chunk = sock.recv(65536)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        total += len(chunk)
+        if total > MAX_SUBMISSION_BYTES:
+            raise SystemExit("response is too large")
+        if b"\n" in chunk:
+            break
+    data = b"".join(chunks)
+    return data.split(b"\n", 1)[0]
+
+
+def main() -> int:
+    submission_file = sys.argv[1] if len(sys.argv) > 1 else SUBMISSION_PATH
+    request = {
+        "request_id": str(uuid.uuid4()),
+        "problem_type": PROBLEM_TYPE,
+        "submission": _read_submission(submission_file),
+    }
+    data = json.dumps(request, ensure_ascii=False, separators=(",", ":")).encode() + b"\n"
+    with _connect() as sock:
+        sock.sendall(data)
+        response_data = _recv_line(sock)
+    try:
+        response = json.loads(response_data.decode("utf-8"))
+    except json.JSONDecodeError as exc:
+        print(f"invalid blackbox eval runner response: {exc}", file=sys.stderr)
+        return 2
+
+    message = str(response.get("message") or "")
+    if response.get("ok"):
+        print(message or "pass")
+        if response.get("raw_score") is not None:
+            print(f"raw_score {response['raw_score']}")
+        if response.get("reward") is not None:
+            print(f"reward {response['reward']}")
+        return 0
+
+    stage = response.get("stage") or "eval"
+    print(f"FAIL stage={stage} message={message or 'evaluation failed'}", file=sys.stderr)
+    return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+
+codex
+I’m not applying the synthetic-only blend change because it lacks official confirmation and the current file is already a known passing candidate. I’ll do a quick syntax/import check and leave `submission.py` unchanged.
+exec
+/bin/bash -lc 'python -m py_compile submission.py' in /opt/tiger/discover/workspace
+ succeeded in 0ms:
+exec
+/bin/bash -lc 'git diff -- submission.py' in /opt/tiger/discover/workspace
+ exited 129 in 0ms:
+warning: Not a git repository. Use --no-index to compare two paths outside a working tree
+usage: git diff --no-index [<options>] <path> <path>
+
+Diff output format options
+    -p, --patch           generate patch
+    -s, --no-patch        suppress diff output
+    -u                    generate patch
+    -U, --unified[=<n>]   generate diffs with <n> lines context
+    -W, --[no-]function-context
+                          generate diffs with <n> lines context
+    --raw                 generate the diff in raw format
+    --patch-with-raw      synonym for '-p --raw'
+    --patch-with-stat     synonym for '-p --stat'
+    --numstat             machine friendly --stat
+    --shortstat           output only the last line of --stat
+    -X, --dirstat[=<param1,param2>...]
+                          output the distribution of relative amount of changes for each sub-directory
+    --cumulative          synonym for --dirstat=cumulative
+    --dirstat-by-file[=<param1,param2>...]
+                          synonym for --dirstat=files,param1,param2...
+    --check               warn if changes introduce conflict markers or whitespace errors
+    --summary             condensed summary such as creations, renames and mode changes
+    --name-only           show only names of changed files
+    --name-status         show only names and status of changed files
+    --stat[=<width>[,<name-width>[,<count>]]]
+                          generate diffstat
+    --stat-width <width>  generate diffstat with a given width
+    --stat-name-width <width>
+                          generate diffstat with a given name width
+    --stat-graph-width <width>
+                          generate diffstat with a given graph width
+    --stat-count <count>  generate diffstat with limited lines
+    --[no-]compact-summary
+                          generate compact summary in diffstat
+    --binary              output a binary diff that can be applied
+    --[no-]full-index     show full pre- and post-image object names on the "index" lines
+    --[no-]color[=<when>] show colored diff
+    --ws-error-highlight <kind>
+                          highlight whitespace errors in the 'context', 'old' or 'new' lines in the diff
+    -z                    do not munge pathnames and use NULs as output field terminators in --raw or --numstat
+    --[no-]abbrev[=<n>]   use <n> digits to display object names
+    --src-prefix <prefix> show the given source prefix instead of "a/"
+    --dst-prefix <prefix> show the given destination prefix instead of "b/"
+    --line-prefix <prefix>
+                          prepend an additional prefix to every line of output
+    --no-prefix           do not show any source or destination prefix
+    --default-prefix      use default prefixes a/ and b/
+    --inter-hunk-context <n>
+                          show context between diff hunks up to the specified number of lines
+    --output-indicator-new <char>
+                          specify the character to indicate a new line instead of '+'
+    --output-indicator-old <char>
+                          specify the character to indicate an old line instead of '-'
+    --output-indicator-context <char>
+                          specify the character to indicate a context instead of ' '
+
+Diff rename options
+    -B, --break-rewrites[=<n>[/<m>]]
+                          break complete rewrite changes into pairs of delete and create
+    -M, --find-renames[=<n>]
+                          detect renames
+    -D, --irreversible-delete
+                          omit the preimage for deletes
+    -C, --find-copies[=<n>]
+                          detect copies
+    --[no-]find-copies-harder
+                          use unmodified files as source to find copies
+    --no-renames          disable rename detection
+    --[no-]rename-empty   use empty blobs as rename source
+    --[no-]follow         continue listing the history of a file beyond renames
+    -l <n>                prevent rename/copy detection if the number of rename/copy targets exceeds given limit
+
+Diff algorithm options
+    --minimal             produce the smallest possible diff
+    -w, --ignore-all-space
+                          ignore whitespace when comparing lines
+    -b, --ignore-space-change
+                          ignore changes in amount of whitespace
+    --ignore-space-at-eol ignore changes in whitespace at EOL
+    --ignore-cr-at-eol    ignore carrier-return at the end of line
+    --ignore-blank-lines  ignore changes whose lines are all blank
+    -I, --[no-]ignore-matching-lines <regex>
+                          ignore changes whose all lines match <regex>
+    --[no-]indent-heuristic
+                          heuristic to shift diff hunk boundaries for easy reading
+    --patience            generate diff using the "patience diff" algorithm
+    --histogram           generate diff using the "histogram diff" algorithm
+    --diff-algorithm <algorithm>
+                          choose a diff algorithm
+    --anchored <text>     generate diff using the "anchored diff" algorithm
+    --word-diff[=<mode>]  show word diff, using <mode> to delimit changed words
+    --word-diff-regex <regex>
+                          use <regex> to decide what a word is
+    --color-words[=<regex>]
+                          equivalent to --word-diff=color --word-diff-regex=<regex>
+    --[no-]color-moved[=<mode>]
+                          moved lines of code are colored differently
+    --[no-]color-moved-ws <mode>
+                          how white spaces are ignored in --color-moved
+
+Other diff options
+    --[no-]relative[=<prefix>]
+                          when run from subdir, exclude changes outside and show relative paths
+    -a, --[no-]text       treat all files as text
+    -R                    swap two inputs, reverse the diff
+    --[no-]exit-code      exit with 1 if there were differences, 0 otherwise
+    --[no-]quiet          disable all output of the program
+    --[no-]ext-diff       allow an external diff helper to be executed
+    --[no-]textconv       run external text conversion filters when comparing binary files
+    --ignore-submodules[=<when>]
+                          ignore changes to submodules in the diff generation
+    --submodule[=<format>]
+                          specify how differences in submodules are shown
+    --ita-invisible-in-index
+                          hide 'git add -N' entries from the index
+    --ita-visible-in-index
+                          treat 'git add -N' entries as real in the index
+    -S <string>           look for differences that change the number of occurrences of the specified string
+    -G <regex>            look for differences that change the number of occurrences of the specified regex
+    --pickaxe-all         show all changes in the changeset with -S or -G
+    --pickaxe-regex       treat <string> in -S as extended POSIX regular expression
+    -O <file>             control the order in which files appear in the output
+    --rotate-to <path>    show the change in the specified path first
+    --skip-to <path>      skip the output to the specified path
+    --find-object <object-id>
+                          look for differences that change the number of occurrences of the specified object
+    --diff-filter [(A|C|D|M|R|T|U|X|B)...[*]]
+                          select files by diff type
+    --output <file>       output to a specific file
+
+
+codex
+The workspace is not a git checkout, so there is no repository diff to inspect. Syntax compilation passed, and the candidate file remains the known passing implementation.
+exec
+/bin/bash -lc 'tail -n 80 codex.stdout.log && tail -n 80 codex.stderr.log' in /opt/tiger/discover/workspace
+ succeeded in 0ms:
+    --output-indicator-context <char>
+                          specify the character to indicate a context instead of ' '
+
+Diff rename options
+    -B, --break-rewrites[=<n>[/<m>]]
+                          break complete rewrite changes into pairs of delete and create
+    -M, --find-renames[=<n>]
+                          detect renames
+    -D, --irreversible-delete
+                          omit the preimage for deletes
+    -C, --find-copies[=<n>]
+                          detect copies
+    --[no-]find-copies-harder
+                          use unmodified files as source to find copies
+    --no-renames          disable rename detection
+    --[no-]rename-empty   use empty blobs as rename source
+    --[no-]follow         continue listing the history of a file beyond renames
+    -l <n>                prevent rename/copy detection if the number of rename/copy targets exceeds given limit
+
+Diff algorithm options
+    --minimal             produce the smallest possible diff
+    -w, --ignore-all-space
+                          ignore whitespace when comparing lines
+    -b, --ignore-space-change
+                          ignore changes in amount of whitespace
+    --ignore-space-at-eol ignore changes in whitespace at EOL
+    --ignore-cr-at-eol    ignore carrier-return at the end of line
+    --ignore-blank-lines  ignore changes whose lines are all blank
+    -I, --[no-]ignore-matching-lines <regex>
+                          ignore changes whose all lines match <regex>
+    --[no-]indent-heuristic
+                          heuristic to shift diff hunk boundaries for easy reading
+    --patience            generate diff using the "patience diff" algorithm
+    --histogram           generate diff using the "histogram diff" algorithm
+    --diff-algorithm <algorithm>
+                          choose a diff algorithm
+    --anchored <text>     generate diff using the "anchored diff" algorithm
+    --word-diff[=<mode>]  show word diff, using <mode> to delimit changed words
+    --word-diff-regex <regex>
+                          use <regex> to decide what a word is
+    --color-words[=<regex>]
+                          equivalent to --word-diff=color --word-diff-regex=<regex>
+    --[no-]color-moved[=<mode>]
+                          moved lines of code are colored differently
+    --[no-]color-moved-ws <mode>
+                          how white spaces are ignored in --color-moved
+
+Other diff options
+    --[no-]relative[=<prefix>]
+                          when run from subdir, exclude changes outside and show relative paths
+    -a, --[no-]text       treat all files as text
+    -R                    swap two inputs, reverse the diff
+    --[no-]exit-code      exit with 1 if there were differences, 0 otherwise
+    --[no-]quiet          disable all output of the program
+    --[no-]ext-diff       allow an external diff helper to be executed
+    --[no-]textconv       run external text conversion filters when comparing binary files
+    --ignore-submodules[=<when>]
+                          ignore changes to submodules in the diff generation
+    --submodule[=<format>]
+                          specify how differences in submodules are shown
+    --ita-invisible-in-index
+                          hide 'git add -N' entries from the index
+    --ita-visible-in-index
+                          treat 'git add -N' entries as real in the index
+    -S <string>           look for differences that change the number of occurrences of the specified string
+    -G <regex>            look for differences that change the number of occurrences of the specified regex
+    --pickaxe-all         show all changes in the changeset with -S or -G
+    --pickaxe-regex       treat <string> in -S as extended POSIX regular expression
+    -O <file>             control the order in which files appear in the output
+    --rotate-to <path>    show the change in the specified path first
+    --skip-to <path>      skip the output to the specified path
+    --find-object <object-id>
+                          look for differences that change the number of occurrences of the specified object
+    --diff-filter [(A|C|D|M|R|T|U|X|B)...[*]]
+                          select files by diff type
+    --output <file>       output to a specific file
+
+
+codex
+The workspace is not a git checkout, so there is no repository diff to inspect. Syntax compilation passed, and the candidate file remains the known passing implementation.
+
+codex
+The evaluator socket did not return during two long attempts, so I left `submission.py` as the known passing candidate. Syntax compilation passed.
+
+```python
+from __future__ import annotations
+
+import flopscope.numpy as fnp
+import flopscope as flops
+from whestbench import BaseEstimator
+
+
+class Estimator(BaseEstimator):
+    def predict(self, mlp, budget):
+        width = int(mlp.width)
+        depth = int(mlp.depth)
+        d_mu = fnp.zeros(width)
+        d_var = fnp.ones(width)
+        diag_rows = []
+        diag_vars = []
+
+        for w in mlp.weights:
+            d_mu_pre = w.T @ d_mu
+            d_var_pre = (w * w).T @ d_var
+            d_var_pre = fnp.maximum(d_var_pre, 1e-12)
+            d_sigma = fnp.sqrt(d_var_pre)
+            d_alpha = d_mu_pre / d_sigma
+            d_phi = flops.stats.norm.pdf(d_alpha)
+            d_cdf = flops.stats.norm.cdf(d_alpha)
+            d_mu = d_mu_pre * d_cdf + d_sigma * d_phi
+            d_ez2 = (d_mu_pre * d_mu_pre + d_var_pre) * d_cdf + d_mu_pre * d_sigma * d_phi
+            d_var = fnp.maximum(d_ez2 - d_mu * d_mu, 0.0)
+            diag_rows.append(d_mu)
+            diag_vars.append(d_var)
+
+        if depth == 1:
+            return fnp.asarray(fnp.stack(diag_rows, axis=0), dtype=fnp.float32)
+
+        per_sample = max(1, depth * (2 * width * width + 4 * width))
+        n_samples = max(1024, int((0.625 * float(budget)) / float(per_sample)))
+        n_samples = min(n_samples, 7520)
+        n_samples = 2 * max(1, n_samples // 2)
+
+        rng = fnp.random.default_rng(int(mlp.seed) + 3)
+        eye = fnp.eye(width, dtype=fnp.float64)
+        half_samples = n_samples // 2
+        x0 = fnp.asarray(rng.standard_normal((half_samples, width), dtype=fnp.float32))
+        x = fnp.concatenate([x0, -x0], axis=0)
+
+        for i, w in enumerate(mlp.weights[:-1]):
+            z = x @ w
+            if i == 0:
+                t_cov = w.T @ w
+                z_center = z - fnp.mean(z, axis=0)
+                sample_cov = (z_center.T @ z_center) / float(n_samples)
+                s_vals, s_vecs = fnp.linalg.eigh(sample_cov)
+                t_vals, t_vecs = fnp.linalg.eigh(t_cov)
+                inv_sqrt = s_vecs @ (
+                    fnp.diag(1.0 / fnp.sqrt(fnp.maximum(s_vals, 1e-12))) @ s_vecs.T
+                )
+                target_sqrt = t_vecs @ (
+                    fnp.diag(fnp.sqrt(fnp.maximum(t_vals, 1e-12))) @ t_vecs.T
+                )
+                z = z_center @ (inv_sqrt @ target_sqrt)
+
+            x = fnp.maximum(z, 0.0)
+            if i == 0:
+                x_mean0 = fnp.mean(x, axis=0)
+                x_center = x - x_mean0
+                sample_cov = (x_center.T @ x_center) / float(n_samples)
+                s_vals, s_vecs = fnp.linalg.eigh(sample_cov)
+
+                sigma0 = fnp.sqrt(fnp.maximum(fnp.diagonal(t_cov), 1e-12))
+                scale0 = fnp.maximum(sigma0[:, None] * sigma0[None, :], 1e-12)
+                rho0 = fnp.clip(t_cov / scale0, -0.999999, 0.999999)
+                root0 = fnp.sqrt(fnp.maximum(1.0 - rho0 * rho0, 0.0))
+                pi = 3.141592653589793
+                kernel0 = (root0 + (pi - fnp.arccos(rho0)) * rho0) / (2.0 * pi)
+                target_second = (sigma0[:, None] * sigma0[None, :]) * kernel0
+                target_cov = target_second - diag_rows[0][:, None] * diag_rows[0][None, :]
+                target_cov = 0.5 * (target_cov + target_cov.T)
+                target_cov = target_cov * (1.0 - eye) + eye * diag_vars[0][None, :]
+
+                t_vals, t_vecs = fnp.linalg.eigh(target_cov)
+                inv_sqrt = s_vecs @ (
+                    fnp.diag(1.0 / fnp.sqrt(fnp.maximum(s_vals, 1e-12))) @ s_vecs.T
+                )
+                target_sqrt = t_vecs @ (
+                    fnp.diag(fnp.sqrt(fnp.maximum(t_vals, 1e-12))) @ t_vecs.T
+                )
+                x_full = x_center @ (inv_sqrt @ target_sqrt) + diag_rows[0]
+                x = (
+                    diag_rows[0]
+                    - 0.100 * (x_mean0 - diag_rows[0])
+                    + 1.43645 * (x_full - diag_rows[0])
+                    - 0.43645 * x_center
+                )
+
+        z = x @ mlp.weights[-1]
+        z64 = fnp.asarray(z, dtype=fnp.float64)
+        z_mean = fnp.mean(z64, axis=0)
+        z_center = z64 - z_mean
+        z_var = fnp.mean(z_center * z_center, axis=0)
+        z_sigma = fnp.sqrt(fnp.maximum(z_var, 1e-12))
+        z_alpha = z_mean / z_sigma
+        z_cdf = flops.stats.norm.cdf(z_alpha)
+        z_phi = flops.stats.norm.pdf(z_alpha)
+        final_gauss = z_mean * z_cdf + z_sigma * z_phi
+        z_alpha_md = d_mu_pre / z_sigma
+        final_mixed_diag = (
+            d_mu_pre * flops.stats.norm.cdf(z_alpha_md)
+            + z_sigma * flops.stats.norm.pdf(z_alpha_md)
+        )
+        final_mc = fnp.sum(fnp.maximum(z64, 0.0), axis=0) / float(n_samples)
+        final = 0.99938145 * (
+            1.03699807 * final_mc
+            - 0.04249644 * final_gauss
+            + 0.00549808 * final_mixed_diag
+        )
+
+        return fnp.asarray(fnp.stack(list(diag_rows[:-1]) + [final], axis=0), dtype=fnp.float32)
+```
+tokens used
+97,346

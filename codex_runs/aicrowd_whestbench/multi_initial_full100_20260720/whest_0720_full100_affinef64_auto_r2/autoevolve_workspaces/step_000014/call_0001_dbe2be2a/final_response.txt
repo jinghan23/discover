@@ -1,0 +1,246 @@
+```python
+"""Setup-cached whitened antithetic submission candidate."""
+
+from __future__ import annotations
+
+import math
+
+import flopscope.numpy as fnp
+from whestbench import BaseEstimator
+
+
+_BUDGET_FRACTION = 0.2318
+_MIN_SAMPLES = 32
+_MAX_SAMPLES = 1_000_000
+_ARRAY_BYTES_LIMIT = 100 * 1024 * 1024
+_WORST_CASE_ITEMSIZE = 8
+_SETUP_SEED_OFFSET = 3
+_INV_SQRT_2PI = 0.3989422804014327
+_PI = 3.141592653589793
+_TWO_PI = 6.283185307179586
+_FIRST_VARIANCE_FACTOR = 1.0
+_SECOND_VARIANCE_FACTOR = 1.0
+_SECOND_POST_BLEND = 0.3
+_THIRD_POST_BLEND = -0.01
+_FINAL_SCALE = 0.99998
+_WHITEN_ROUNDS = 1
+_THIRD_MOMENT_BLEND = -0.018
+
+
+def _sample_count(budget: int, width: int, depth: int) -> int:
+    per_sample = (2 * depth - 1) * width * width + depth * width + width * width
+    fixed = 2 * (2 * width**3)
+    k = (int(_BUDGET_FRACTION * budget) - fixed) // max(per_sample, 1)
+    max_k_by_bytes = _ARRAY_BYTES_LIMIT // max(width * _WORST_CASE_ITEMSIZE, 1)
+    k = int(max(_MIN_SAMPLES, min(_MAX_SAMPLES, max_k_by_bytes, k)))
+    return k - (k & 1)
+
+
+def _radial_mean(width: int) -> float:
+    return math.sqrt(2.0) * math.exp(
+        math.lgamma(0.5 * (float(width) + 1.0)) - math.lgamma(0.5 * float(width))
+    )
+
+
+def _first_relu_second(weight, variance):
+    gram = weight.T @ weight
+    std = fnp.sqrt(fnp.maximum(variance, 1e-12))
+    scale = std[:, None] * std[None, :]
+    rho = fnp.clip(gram / fnp.maximum(scale, 1e-12), -1.0, 1.0)
+    root = fnp.sqrt(fnp.maximum(1.0 - rho * rho, 0.0))
+    return scale * (root + (_PI - fnp.arccos(rho)) * rho) / _TWO_PI
+
+
+def _normal_cdf(x):
+    ax = fnp.abs(x)
+    t = 1.0 / (1.0 + 0.2316419 * ax)
+    poly = t * (
+        0.319381530
+        + t
+        * (
+            -0.356563782
+            + t * (1.781477937 + t * (-1.821255978 + t * 1.330274429))
+        )
+    )
+    tail = _INV_SQRT_2PI * fnp.exp(-0.5 * ax * ax) * poly
+    return fnp.where(x >= 0.0, 1.0 - tail, tail)
+
+
+def _normal_relu_moments(mean, variance):
+    variance = fnp.maximum(variance, 1e-12)
+    std = fnp.sqrt(variance)
+    alpha = mean / std
+    density = _INV_SQRT_2PI * fnp.exp(-0.5 * alpha * alpha)
+    probability = _normal_cdf(alpha)
+    relu_mean = std * density + mean * probability
+    relu_second = (variance + mean * mean) * probability + mean * std * density
+    return relu_mean, relu_second
+
+
+class Estimator(BaseEstimator):
+    def setup(self, context):
+        self._width = int(context.width)
+        self._depth = int(context.depth)
+        self._radial_mean = _radial_mean(self._width)
+        self._samples = self._make_samples(
+            self._width,
+            _sample_count(int(context.flop_budget), self._width, self._depth),
+            int(context.seed) + _SETUP_SEED_OFFSET,
+        )
+
+    def _make_samples(self, width, k, seed):
+        rng = fnp.random.default_rng(seed)
+        return self._make_sample_block(rng, width, k // 2)
+
+    def _make_sample_block(self, rng, width, count):
+        u = rng.standard_normal((count, width), dtype=fnp.float32)
+        norm = fnp.sqrt(fnp.maximum(fnp.sum(u * u, axis=1, keepdims=True), 1e-12))
+        half = u / norm
+        for _ in range(_WHITEN_ROUNDS):
+            u64 = fnp.asarray(half, dtype=fnp.float64)
+            covariance = (u64.T @ u64) * (float(width) / float(count))
+            eigenvalues, eigenvectors = fnp.linalg.eigh(covariance)
+            eigenvalues = fnp.maximum(eigenvalues, 1e-6)
+            inverse_sqrt = (eigenvectors / fnp.sqrt(eigenvalues)) @ eigenvectors.T
+            half = fnp.asarray(u64 @ inverse_sqrt, dtype=fnp.float32)
+            norm = fnp.sqrt(fnp.maximum(fnp.sum(half * half, axis=1, keepdims=True), 1e-12))
+            half = half / norm
+        return half
+
+    def predict(self, mlp, budget):
+        width = mlp.width
+        depth = mlp.depth
+        if (
+            not hasattr(self, "_samples")
+            or self._samples.shape[1] != width
+            or getattr(self, "_depth", depth) != depth
+        ):
+            self._samples = self._make_samples(width, _sample_count(budget, width, depth), mlp.seed)
+            self._depth = depth
+            self._radial_mean = _radial_mean(width)
+
+        first_weight = mlp.weights[0]
+        first_variance = fnp.sum(first_weight * first_weight, axis=0)
+        radial_mean = float(getattr(self, "_radial_mean", _radial_mean(width)))
+        first_mean = fnp.sqrt(first_variance) * (_INV_SQRT_2PI / radial_mean)
+        first_projection = self._samples @ first_weight
+        x = fnp.concatenate(
+            [fnp.maximum(first_projection, 0.0), fnp.maximum(-first_projection, 0.0)],
+            axis=0,
+        )
+        if depth == 1:
+            final_mean = first_mean * radial_mean
+            zero_rows = fnp.zeros((depth - 1, width), dtype=fnp.float32)
+            return fnp.concatenate([zero_rows, final_mean[None, :]], axis=0)
+
+        sample_mean = fnp.mean(x, axis=0)
+        sample_second = fnp.mean(x * x, axis=0)
+        sample_variance = fnp.maximum(sample_second - sample_mean * sample_mean, 1e-6)
+        target_variance = fnp.maximum(
+            (first_variance * (0.5 / float(width)) - first_mean * first_mean)
+            * _FIRST_VARIANCE_FACTOR,
+            1e-12,
+        )
+        x = (x - sample_mean) * fnp.sqrt(target_variance / sample_variance) + first_mean
+
+        first_second = _first_relu_second(first_weight, first_variance) / float(width)
+        first_covariance = first_second - first_mean[:, None] * first_mean[None, :]
+        second_weight = mlp.weights[1]
+        z = x @ second_weight
+        target_mean = first_mean @ second_weight
+        covariance_weight = first_covariance @ second_weight
+        target_variance = fnp.maximum(
+            fnp.sum(second_weight * covariance_weight, axis=0) * _SECOND_VARIANCE_FACTOR,
+            1e-8,
+        )
+        z_mean = fnp.mean(z, axis=0)
+        z_second = fnp.mean(z * z, axis=0)
+        z_variance = fnp.maximum(z_second - z_mean * z_mean, 1e-8)
+        x = fnp.maximum(
+            (z - z_mean) * fnp.sqrt(target_variance / z_variance) + target_mean,
+            0.0,
+        )
+        second_mean, second_second = _normal_relu_moments(target_mean, target_variance)
+
+        if _SECOND_POST_BLEND:
+            post_mean = fnp.mean(x, axis=0)
+            post_second = fnp.mean(x * x, axis=0)
+            post_variance = fnp.maximum(post_second - post_mean * post_mean, 1e-8)
+            target_post_variance = fnp.maximum(
+                second_second - second_mean * second_mean,
+                1e-8,
+            )
+            blended_post_mean = (
+                post_mean * (1.0 - _SECOND_POST_BLEND)
+                + second_mean * _SECOND_POST_BLEND
+            )
+            blended_post_variance = (
+                post_variance * (1.0 - _SECOND_POST_BLEND)
+                + target_post_variance * _SECOND_POST_BLEND
+            )
+            blended_post_variance = fnp.maximum(blended_post_variance, 1e-8)
+            x = (
+                (x - post_mean)
+                * fnp.sqrt(blended_post_variance / post_variance)
+                + blended_post_mean
+            )
+
+        for layer_index, weight in enumerate(mlp.weights[2:], start=2):
+            z = x @ weight
+
+            if layer_index == 2 and _THIRD_MOMENT_BLEND:
+                z_mean = fnp.mean(z, axis=0)
+                z_second = fnp.mean(z * z, axis=0)
+                z_variance = fnp.maximum(z_second - z_mean * z_mean, 1e-8)
+                diagonal_centered = fnp.maximum(
+                    second_second - second_mean * second_mean,
+                    1e-8,
+                )
+                moment_mean = second_mean @ weight
+                diagonal_variance = fnp.maximum(diagonal_centered @ (weight * weight), 1e-8)
+                blended_mean = (
+                    z_mean * (1.0 - _THIRD_MOMENT_BLEND)
+                    + moment_mean * _THIRD_MOMENT_BLEND
+                )
+                blended_variance = (
+                    z_variance * (1.0 - _THIRD_MOMENT_BLEND)
+                    + diagonal_variance * _THIRD_MOMENT_BLEND
+                )
+                z = (z - z_mean) * fnp.sqrt(blended_variance / z_variance) + blended_mean
+                second_mean, second_second = _normal_relu_moments(
+                    blended_mean, blended_variance
+                )
+
+            x = fnp.maximum(z, 0.0)
+
+            if layer_index == 2 and _THIRD_POST_BLEND:
+                post_mean = fnp.mean(x, axis=0)
+                post_second = fnp.mean(x * x, axis=0)
+                post_variance = fnp.maximum(post_second - post_mean * post_mean, 1e-8)
+                target_post_variance = fnp.maximum(
+                    second_second - second_mean * second_mean,
+                    1e-8,
+                )
+                blended_post_mean = (
+                    post_mean * (1.0 - _THIRD_POST_BLEND)
+                    + second_mean * _THIRD_POST_BLEND
+                )
+                blended_post_variance = (
+                    post_variance * (1.0 - _THIRD_POST_BLEND)
+                    + target_post_variance * _THIRD_POST_BLEND
+                )
+                blended_post_variance = fnp.maximum(blended_post_variance, 1e-8)
+                x = (
+                    (x - post_mean)
+                    * fnp.sqrt(blended_post_variance / post_variance)
+                    + blended_post_mean
+                )
+
+        sample_final_mean = fnp.asarray(
+            fnp.mean(fnp.asarray(x, dtype=fnp.float64), axis=0),
+            dtype=fnp.float32,
+        )
+        final_mean = sample_final_mean * (radial_mean * _FINAL_SCALE)
+        zero_rows = fnp.zeros((depth - 1, width), dtype=fnp.float32)
+        return fnp.concatenate([zero_rows, final_mean[None, :]], axis=0)
+```

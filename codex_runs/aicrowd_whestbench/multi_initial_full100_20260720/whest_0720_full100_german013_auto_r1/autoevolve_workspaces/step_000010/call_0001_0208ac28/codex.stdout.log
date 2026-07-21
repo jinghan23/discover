@@ -1,0 +1,125 @@
+```python
+from __future__ import annotations
+
+import flopscope as flops
+import flopscope.numpy as fnp
+from whestbench import BaseEstimator
+
+
+_BUDGET_FRACTION = 0.230
+_MIN_SAMPLES = 32
+_MAX_SAMPLES = 1_000_000
+_ARRAY_BYTES_LIMIT = 100 * 1024 * 1024
+_WORST_CASE_ITEMSIZE = 8
+_SAMPLE_ADJUST = -2
+_INV_SQRT_TWO_PI = 0.3989422804014327
+_INV_TWO_PI = 0.15915494309189535
+_SECOND_MEAN_STRENGTH = -15.00
+_SECOND_VARIANCE_STRENGTH = 1.075
+
+
+def _column_norm(weight):
+    weight_stats = fnp.asarray(weight, dtype=fnp.float64)
+    return fnp.asarray(
+        fnp.sqrt(fnp.maximum(fnp.sum(weight_stats * weight_stats, axis=0), 1e-30)),
+        dtype=fnp.float32,
+    )
+
+
+def _sample_count(budget: int, width: int, depth: int) -> int:
+    per_sample = depth * (2 * width * width + width) + width * width + 48 * width
+    fixed = 9 * width**3 + 2 * (2 * width**3)
+    k = (int(_BUDGET_FRACTION * budget) - fixed) // max(per_sample, 1)
+    max_k_by_bytes = _ARRAY_BYTES_LIMIT // max(width * _WORST_CASE_ITEMSIZE, 1)
+    k = int(max(_MIN_SAMPLES, min(_MAX_SAMPLES, max_k_by_bytes, k)))
+    k = k - (k & 1)
+    return max(_MIN_SAMPLES, k + _SAMPLE_ADJUST)
+
+
+def _match_second_preactivation(x, first_weight, second_weight):
+    first_weight_stats = fnp.asarray(first_weight, dtype=fnp.float64)
+    second_weight_stats = fnp.asarray(second_weight, dtype=fnp.float64)
+    gram = first_weight_stats.T @ first_weight_stats
+    first_variance = fnp.maximum(fnp.diag(gram), 1e-30)
+    first_scale = fnp.sqrt(first_variance)
+    denominator = first_scale[:, None] * first_scale[None, :]
+    correlation = fnp.clip(gram / denominator, -1.0, 1.0)
+    relu_second = denominator * (
+        fnp.sqrt(fnp.maximum(1.0 - correlation * correlation, 0.0))
+        + (float(fnp.pi) - fnp.arccos(correlation)) * correlation
+    ) * _INV_TWO_PI
+    relu_mean = first_scale * _INV_SQRT_TWO_PI
+    relu_covariance = relu_second - relu_mean[:, None] * relu_mean[None, :]
+
+    z = x @ second_weight
+    true_mean = fnp.asarray(relu_mean @ second_weight_stats, dtype=fnp.float32)
+    covariance_times_weight = relu_covariance @ second_weight_stats
+    true_variance = fnp.asarray(
+        fnp.maximum(
+            fnp.sum(covariance_times_weight * second_weight_stats, axis=0), 1e-30
+        ),
+        dtype=fnp.float32,
+    )
+    sample_mean = fnp.mean(z, axis=0)
+    sample_second = fnp.mean(z * z, axis=0)
+    sample_variance = fnp.maximum(sample_second - sample_mean * sample_mean, 1e-30)
+
+    variance_scale = fnp.sqrt(true_variance / sample_variance)
+    variance_scale = 1.0 + _SECOND_VARIANCE_STRENGTH * (variance_scale - 1.0)
+    matched_mean = (
+        (1.0 - _SECOND_MEAN_STRENGTH) * sample_mean
+        + _SECOND_MEAN_STRENGTH * true_mean
+    )
+    z = (z - sample_mean) * variance_scale + matched_mean
+    return fnp.maximum(z, 0.0)
+
+
+class Estimator(BaseEstimator):
+    def predict(self, mlp, budget):
+        width = mlp.width
+        depth = mlp.depth
+        weights = mlp.weights
+        if depth == 1:
+            first_scale = _column_norm(weights[0])
+            return (first_scale * _INV_SQRT_TWO_PI)[None, :]
+
+        k = _sample_count(budget, width, depth)
+        half = k // 2
+        rng = fnp.random.default_rng(mlp.seed)
+
+        u = rng.standard_normal((half, width)).astype(fnp.float32)
+
+        covariance = (u.T @ u) / float(half)
+        if half > width + 1:
+            cholesky = fnp.linalg.cholesky(covariance)
+            whitening_times_weight = fnp.linalg.solve(cholesky.T, weights[0])
+        else:
+            eigenvalues, eigenvectors = fnp.linalg.eigh(covariance)
+            eigenvalues = fnp.maximum(eigenvalues, 1e-6)
+            inverse_sqrt = (eigenvectors / fnp.sqrt(eigenvalues)) @ eigenvectors.T
+            whitening_times_weight = inverse_sqrt @ weights[0]
+
+        first_preactivation = u @ whitening_times_weight
+        ordering = fnp.argsort(first_preactivation, axis=0)
+
+        marginal_probs = (fnp.arange(half, dtype=fnp.float32) + 0.5) / float(half)
+        marginal_quantiles = flops.stats.norm.ppf(marginal_probs).astype(fnp.float32)
+        first_scale = _column_norm(weights[0])
+
+        sorted_marginals = marginal_quantiles[:, None] * first_scale[None, :]
+        transported = fnp.empty_like(first_preactivation)
+        fnp.put_along_axis(transported, ordering, sorted_marginals, axis=0)
+        first_preactivation = transported
+
+        x = fnp.concatenate([first_preactivation, -first_preactivation], axis=0)
+        x = fnp.maximum(x, 0.0)
+        x = _match_second_preactivation(x, weights[0], weights[1])
+        for weight in weights[2:]:
+            x = fnp.maximum(x @ weight, 0.0)
+
+        final_mean = fnp.asarray(
+            fnp.mean(fnp.asarray(x, dtype=fnp.float64), axis=0), dtype=fnp.float32
+        )
+        zero_rows = fnp.zeros((depth - 1, width), dtype=fnp.float32)
+        return fnp.concatenate([zero_rows, final_mean[None, :]], axis=0)
+```

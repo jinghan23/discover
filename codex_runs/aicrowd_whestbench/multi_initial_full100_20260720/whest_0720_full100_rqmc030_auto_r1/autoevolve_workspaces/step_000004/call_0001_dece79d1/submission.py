@@ -1,0 +1,355 @@
+"""Scrambled Sobol estimator with exact first-layer means."""
+
+from __future__ import annotations
+
+import base64
+import math
+import struct
+import zlib
+
+import flopscope as flops
+import flopscope.numpy as fnp
+from whestbench import BaseEstimator
+
+
+_TARGET_FLOP_FRACTION = 0.13
+_SEED_OFFSET = 0
+_TAIL_CLIP = 1e-11
+_PRE2_MATCH = True
+_POST2_MATCH = True
+_POST2_BETA = 0.5
+_BITS = 30
+_UINT_SCALE = 1.0 / 1073741824.0
+_SOBOL_DIMENSIONS = 256
+_SOBOL_MAXDEG = 18
+
+_SOBOL_BLOB = (
+    "c-oDc0c6$d8^@pL_uFs3|M{Q)am+EtF*C``%*-"
+    "S+Gc%LPBuQpwW{$}unMr15a!ry+k|as4BuVC)%#|dWOy)|GNv=%tcU_ZACi{Qh-?{VW-uL;fj?dZX_5R-"
+    "Xd7tO|JkR@^ibx1CWFZFyC_y7MLmPBJ7j#1(48s_lgwrquKfy(~3|HV5+=B<O3{T-"
+    "1tio$}0~_!sY{C|Nhk6xhfmS#Iqfmx%n1D&R01I#*p2He^g0D~$h}6M8XoUkX1fwtkXW$&n!UebnKf_&k1drhftif-"
+    "v4qxFL6fjmTG{Amnhb}k@!!QP?;51CZ9L&RISb}9(fmL_~Z{Qt#gwL=InJU%~P0$MCa0br9C3pdE;S+p;9mqwT8SIC4=!QNRgi|m"
+    "Nm*G0xffd+*E!c)aHT!}_=zu;r3d1lBb8r!s;2FGz5AYp|I8Qz7gHGs&BX9zSpbWFH09RoV*5M0$gXmw(0WHu9{ZNK+n1mTvfNO9"
+    "Y?!zLi!Ef+8e1iYNSIA}94>UqEbU`;9g2QkOhG7cM!W{erm*D|Cgk@NPcd!9lp#LULpa8Yd42NM1PQx_J!8}}nTW}8^z%Q@_Z{P!"
+    "bhCg8wwjm_=GEf5tpa*(k0ES=`#^DUi!UeblSK%5wg2(U#Ucx%OhfnYaWdDO*pacyt2xCCF?D_A<#)LmKM)w?}KQt!X<9TjGl&D$"
+    "yJQ1Io9~cwuF(yVm3wzF!zBm1AXW2dX6-"
+    "mP$V?xQWruIFam6uvR>F1S`x*wP)PO(sBo;)*^_Ox>$$uRaj&dx>VI+;2q$0sj`QvD~#xc$<TYUd0;OLA}z`(&8sRO*-"
+    "r8+My#R@uArpJsFSmGy+lx(}uLVUF*D>1P%DxX36Z`P{ZohMm_Z`9Cebiu~4*`YgBNE;Gg|_HlC^Ox>6BjiT%`Bf7HpnD1_xNgb1"
+    "6j&9SVE3xA&-NDn+{kege+U0ACecYHXd~7Ubo^0|tBHvQS)Jco<vvzx5E|#-"
+    "$Oj=XVqQr`N<!H*YocCn;?N!QIWEfM6cic*iQ^kTqN#$qRIb_utR@0w4PhOhj92T&B)mf+kEB~IVt3_<sDT^u3it*DL>fZi6Vz~z"
+    "&dy}#r7tJkr^n9v@*Ym74c_<&$vQIX7;%RJj$lRC9Urp>Sl0miCTuOZLq<m3p9_NKM>}*0Fr)X4$RgcLhIi=Q^JigJ2Zp1RDww)U"
+    "ob)0VDed>AT<&1n_ob{|6^W=%tlH5tr`4U!cl0ngwz1MPDv&3Md+W9@pcPHN3r)jlBju;G+UdYntBHz8TE$eFehGORye!J$a1$Ot"
+    "<kmR|Yr0?<jk6Tj@F*q!9DRq>K_!&n0VcI!n%?-rG7ulz_Z`5GJvv|*c)%I0Q*8H0cskNRw-"
+    "<|Z6u~&b0qdmqx$7D?&rRZ2biPRmh*6-$1mzO8#P}|LYRq|6OzHu!j-"
+    "Xli13g@=iKIVLALKeI#wVQY9$QRQxE_t<Uk}Nwqz_=;X$CUGG#h?4-XSLVtG-CpF8A!<~Zq0qH=!M!jC6oAKojg-JR~CrCCOk23+"
+    "DDUoaagX%Ov*fY&b^-JeKg}V<XLrcf(U%1cHW7o*^2U9M$9p;QmA9iUDB*}jg(Cye$$%?EB48wKb`FCi8o{Ho>vAHJB-"
+    "r3GkqhM?5ik~-b!KDpNolZd^d7RMWeFNN~GG)im`DcYo3v-DfN$=t5H6p(5vd-mmATP#NY*wN>%2GlTKxjUA>dRz|y)58Xgllr*z"
+    "A#`3uRoKKMPba;~d-W3p3^-"
+    "VLmHZ(zmF&(@Ng9;=3IVq}|a>V2{HRf}(o@x<GDG4!ullc)8Q<?ebEdRJFnO?#XQXf?TI^7}@HF$JF1hF@E?ah_A{kx{v$Z;Z2WH"
+    "GhWnbmFV$)vEa$c*;0qn&gC9Ii-RBpQW}rtxbWo_Z(yTh@9v8Jn(CRvtbU68j^?lBD8AJ8q}~A``kiXt$HKJh+)Q_mko10#biATa"
+    "$UL%Kg=c-+X&s>IlX0SxT_{wSkryE8d^T)s+Mt{wxW}P-"
+    "Fp@}u{Lt$@xa<wL@ub8o75yn0xOmy{Cy7pi1bxp*S$p)p%43PhE@z_Iq_PeV#bp#clEHI?@`wL2{p5POc`~SnU*zFtEaBzS+nw59"
+    "_#DC(s@^{PT?Ev5`~r~WKpqk&a20}o{AniKkPxFmUPk3`8cU0M%dRK{is$C;!aEDDeEbkwM~h0&#<EP<Tl!`8!?f5fco&F9#AWPx"
+    "p`{H+{ZLD@~NwPYp63@$pyF6(gb(6Q>J=;BX0w%7Ik$(3qG_hL!sqkS^Ue@*mK$!T6@nWc_o%_dehXyC{dSN@<hL?br#BMGGwMH8"
+    "3`;sbn8Bc|E%ce(5io2#t5lt2V@|$;=<L&!{nxMZ+z)r{#>GpdLc!<saCFZ+R}xOJ@r&uyM0rA;`QIL;fPw=;(DuY6lx`TbKuu!m"
+    "kUmzV+)>Jp#R?|l&Fy=<e<I|t=_Z1{-"
+    "?<9Bidr#rMMN(@LkZ`q1Er?@trp8+@?!v>3p1cNLg;^nsKK2#8)SI+9W#l_YAgsSKun3L6r9#72=9vXQy_jWkY_!>;Ik&cKb@F^d"
+    "-*gs<s9<B7cA3@^YWNrLtQL*Q@+{uR(t@bh!`pom{T==ajl+cO!hp!cvvr4@=l^n%sU?XEa;wzwgcR|E=<hYBckYyS-"
+    "g)2~n0<7U|U1!XYCr>i9W{g16{aFcSLD!rcu<)OD9+Cj2w@+sAq0X?aEuGWw7Ezg_>S)SAs$x<4$3{xK!aeTM3AQWnCuMlL8O727"
+    "<c`gK0^*CaW1?QU+~>q>Ac@@te^%>drBBu~OEqmQdg;{Cd0wJb}KzvhpU8_g?>eiOWp{92bu?({ZLyV0N}_Ul;buN$YgXu_P)Hx;"
+    "SEosZ@8e0Z(es>kX%`GRz4bFdiu?}Vcyr!>jB-VVM+{ys(Vu{PGTq?fc@?LUiL(uHuMdP(Nh>KRMuYKgd57Y!_ZuID6PN-ee4cI@"
+    "wW>d{pfW%uM`5Lfv%)9LCcYu=H2!M1T;8OGIe8r||NT&(izYCh@XM(B3R;RoYANDVumL*@I3vGywem|{}buHa{lI#BJeTk=V*b&d"
+    "SJ5%j3_9wbL4F@$~MU?uSHtI`XvQfrOL$=HAQUe7tyQbT50_Y0$st4r>d$K|E|99*xq?ieH1`;2Jr2y&r+jJwU9lp}Ie9|wa~R!@"
+    "D9bANz0HtTow`@E|~CsCifGW?I~c-"
+    "KCzGZ;_q;|}SIYQILgN_~ov%oWZDet&kpdKSyvCJNWpU(>ppzmwW{L&t;JYOB`jK*>IEVkhKF<nIgIJD^q~^{KY#K;*BD-"
+    "95=!xh$RftJlXWeL<G97?Ww8*7uRM_x;30FIl&k{5^rMw+hjgQKD-~?rS;pYm_pkjx2bL_=-"
+    "Y*j&r%PET4(@mtnh61C&tbGAH^~O5wRGe=qFr)jL>oztm}s`s;bO>T#;oGP!b~+IsKV!zq+Gk3WKr$X^50G1D~9+mY2^pIYw%3V7"
+    "KEJi05mV4SIY|24~co=a2kvf7_dD{omR(96~EOW=Q(<W$wYX?&{N!FO-%=e#gXG<;L9YdNs$u?GCzb$r{p8vF14!erD9xu-"
+    "{EOZ|Ddz=;)!Q&-Qwi2eRk%f6<u&pcJxa$ucTfnAlQN52P4kw1UAXSq{-An$@-jsDB!ofGKue*G=^+a=$*m-"
+    "rl^#y+CIgzbj@)S!qRWVs#s+^?~})^ax~896DR^+EW>$SLkE$B;adNj+|8R4&oXesp77&ghN6-"
+    "|N*fYJih(kY4Sp_V*wz!g>=AIIP9M(w1D3pJsGJ=hUC$T+McZ-"
+    "s-a!!qZiL-H6bqMmdi^H|tilzm6&-{mv5o*K)8K`|BSUU%k{whx7?q-g?JcWUdHZJrvX#{_Ju}uN;?UIU4qazI{1GboZ-ydXOERj"
+    "Q#g5E-SY(W<k&EiNIgCxSV^KT5CtA!p$m6>kcqx8I@iO??it8arcm}cRH?($=}QQYOMxlD4@M(WhR&l{O`!3L|u-"
+    "fbtC#H_P=v+U9Ni<IVPjw+rQc8e?ZDukp"
+)
+
+_SOBOL_PARAMS = None
+_BASE_DIRECTIONS = {}
+
+
+def _sobol_params():
+    global _SOBOL_PARAMS
+    if _SOBOL_PARAMS is None:
+        raw = zlib.decompress(base64.b85decode(_SOBOL_BLOB.encode("ascii")))
+        poly = struct.unpack("<256I", raw[: 256 * 4])
+        vinit = struct.unpack(
+            "<4608H", raw[256 * 4 : 256 * 4 + 4608 * 2]
+        )
+        rows = tuple(
+            vinit[i * _SOBOL_MAXDEG : (i + 1) * _SOBOL_MAXDEG]
+            for i in range(_SOBOL_DIMENSIONS)
+        )
+        _SOBOL_PARAMS = (poly, rows)
+    return _SOBOL_PARAMS
+
+
+def _base_directions(width: int, bits: int) -> tuple[tuple[int, ...], ...]:
+    key = (width, bits)
+    cached = _BASE_DIRECTIONS.get(key)
+    if cached is not None:
+        return cached
+
+    poly, vinit = _sobol_params()
+    directions = []
+    for dim in range(width):
+        row = [0] * bits
+        if dim == 0:
+            for bit in range(bits):
+                row[bit] = 1 << (bits - 1 - bit)
+            directions.append(tuple(row))
+            continue
+
+        polynomial = int(poly[dim])
+        degree = polynomial.bit_length() - 1
+        for bit in range(degree):
+            row[bit] = int(vinit[dim][bit]) << (bits - 1 - bit)
+        for bit in range(degree, bits):
+            value = row[bit - degree] ^ (row[bit - degree] >> degree)
+            for k in range(1, degree):
+                if (polynomial >> k) & 1:
+                    value ^= row[bit - degree + k]
+            row[bit] = value
+        directions.append(tuple(row))
+
+    cached = tuple(directions)
+    _BASE_DIRECTIONS[key] = cached
+    return cached
+
+
+def _scrambled_directions(
+    width: int, bits: int, rng: fnp.random.Generator
+) -> fnp.ndarray:
+    base = _base_directions(width, bits)
+    ltm_bits = rng.integers(0, 2, size=(width, bits, bits), dtype=fnp.uint8)
+    ltm = ltm_bits.tolist()
+
+    scrambled = []
+    for dim in range(width):
+        masks = []
+        for row_index in range(bits):
+            mask = 1 << (bits - 1 - row_index)
+            row_bits = ltm[dim][row_index]
+            for column_index in range(row_index):
+                if row_bits[column_index]:
+                    mask |= 1 << (bits - 1 - column_index)
+            masks.append(mask)
+
+        out_row = []
+        for direction in base[dim]:
+            value = 0
+            for row_index, mask in enumerate(masks):
+                if (direction & mask).bit_count() & 1:
+                    value |= 1 << (bits - 1 - row_index)
+            out_row.append(value)
+        scrambled.append(out_row)
+
+    return fnp.array(scrambled, dtype=fnp.uint32)
+
+
+def _sobol_uniforms(
+    n_samples: int,
+    width: int,
+    rng: fnp.random.Generator,
+    directions: fnp.ndarray | None = None,
+) -> fnp.ndarray:
+    if directions is None:
+        directions = _scrambled_directions(width, _BITS, rng)
+    indices = fnp.arange(n_samples, dtype=fnp.uint32)
+    gray = fnp.bitwise_xor(indices, fnp.right_shift(indices, 1))
+    points = fnp.zeros((n_samples, width), dtype=fnp.uint32)
+    n_bits = max(1, int(math.ceil(math.log2(n_samples))))
+
+    one = fnp.array(1, dtype=fnp.uint32)
+    for bit in range(n_bits):
+        mask = fnp.bitwise_and(fnp.right_shift(gray, bit), one).astype(fnp.uint32)
+        points = fnp.bitwise_xor(
+            points, mask[:, None] * directions[None, :, bit]
+        )
+
+    shift = rng.integers(0, 2**_BITS, size=width, dtype=fnp.uint32)
+    points = fnp.bitwise_xor(points, shift[None, :])
+    return points.astype(fnp.float64) * _UINT_SCALE
+
+
+def _exact_first_layer_mean(first_weight: fnp.ndarray) -> fnp.ndarray:
+    standard_deviation = fnp.sqrt(fnp.sum(first_weight * first_weight, axis=0))
+    return standard_deviation / fnp.sqrt(2.0 * fnp.pi)
+
+
+def _exact_first_layer_moments(
+    first_weight: fnp.ndarray,
+) -> tuple[fnp.ndarray, fnp.ndarray]:
+    variance_pre = fnp.sum(first_weight * first_weight, axis=0)
+    mean = fnp.sqrt(variance_pre) / fnp.sqrt(2.0 * fnp.pi)
+    second_moment = 0.5 * variance_pre
+    variance = fnp.maximum(second_moment - mean * mean, 1e-30)
+    return mean, variance
+
+
+def _exact_first_layer_full_moments(
+    first_weight: fnp.ndarray,
+) -> tuple[fnp.ndarray, fnp.ndarray, fnp.ndarray]:
+    covariance_pre = first_weight.T @ first_weight
+    variance_pre = fnp.maximum(fnp.diag(covariance_pre), 1e-30)
+    standard_deviation = fnp.sqrt(variance_pre)
+    mean = standard_deviation / fnp.sqrt(2.0 * fnp.pi)
+    normalizer = fnp.maximum(
+        standard_deviation[:, None] * standard_deviation[None, :], 1e-30
+    )
+    correlation = fnp.clip(covariance_pre / normalizer, -1.0, 1.0)
+    sine_term = fnp.sqrt(fnp.maximum(1.0 - correlation * correlation, 0.0))
+    angle_term = fnp.pi - fnp.arccos(correlation)
+    second_moment = (
+        normalizer * (sine_term + angle_term * correlation) / (2.0 * fnp.pi)
+    )
+    variance = fnp.maximum(fnp.diag(second_moment) - mean * mean, 1e-30)
+    return mean, variance, second_moment
+
+
+def _second_layer_preactivation_moments(
+    first_weight: fnp.ndarray, second_weight: fnp.ndarray
+) -> tuple[fnp.ndarray, fnp.ndarray, fnp.ndarray, fnp.ndarray]:
+    first_mean, first_variance, first_second = _exact_first_layer_full_moments(
+        first_weight
+    )
+    mean_pre = first_mean @ second_weight
+    second_pre = fnp.sum(second_weight * (first_second @ second_weight), axis=0)
+    variance_pre = fnp.maximum(second_pre - mean_pre * mean_pre, 1e-30)
+    return first_mean, first_variance, mean_pre, variance_pre
+
+
+def _relu_normal_moments(
+    mean_pre: fnp.ndarray, variance_pre: fnp.ndarray
+) -> tuple[fnp.ndarray, fnp.ndarray]:
+    standard_deviation = fnp.sqrt(fnp.maximum(variance_pre, 1e-30))
+    normalized = mean_pre / standard_deviation
+    cdf = flops.stats.norm.cdf(normalized)
+    pdf = fnp.exp(-0.5 * normalized * normalized) / fnp.sqrt(2.0 * fnp.pi)
+    mean = standard_deviation * pdf + mean_pre * cdf
+    second_moment = (
+        (variance_pre + mean_pre * mean_pre) * cdf
+        + mean_pre * standard_deviation * pdf
+    )
+    variance = fnp.maximum(second_moment - mean * mean, 1e-30)
+    return mean, variance
+
+
+def _sample_count(budget: int, width: int, depth: int) -> int:
+    normal_per_sample = 92 * width
+    forward_per_sample = depth * (2 * width * width + width)
+    later_means_per_sample = max(depth - 1, 0) * width
+    first_moment_match_per_sample = 4 * width if depth > 1 else 0
+    per_sample = (
+        normal_per_sample
+        + forward_per_sample
+        + later_means_per_sample
+        + first_moment_match_per_sample
+    )
+    fixed = 2 * width * width + 16 * width
+    raw = max(1, (int(_TARGET_FLOP_FRACTION * budget) - fixed) // per_sample)
+    return 1 << max(0, int(math.floor(math.log2(raw))))
+
+
+class Estimator(BaseEstimator):
+    """LMS+shift Sobol estimator with an exact first output row."""
+
+    def setup(self, context):
+        try:
+            _base_directions(context.width, _BITS)
+        except Exception:
+            pass
+
+    def predict(self, mlp, budget):
+        if mlp.depth == 1:
+            return fnp.stack([_exact_first_layer_mean(mlp.weights[0])], axis=0)
+
+        n_samples = _sample_count(budget, mlp.width, mlp.depth)
+        rng = fnp.random.default_rng((int(mlp.seed) + _SEED_OFFSET) & 0xFFFFFFFF)
+        first_mean = None
+        first_variance = None
+        second_pre_mean = None
+        second_pre_variance = None
+        second_post_mean = None
+        second_post_variance = None
+        if (_PRE2_MATCH or _POST2_MATCH) and mlp.depth > 1:
+            (
+                first_mean,
+                first_variance,
+                second_pre_mean,
+                second_pre_variance,
+            ) = _second_layer_preactivation_moments(mlp.weights[0], mlp.weights[1])
+            if _POST2_MATCH:
+                second_post_mean, second_post_variance = _relu_normal_moments(
+                    second_pre_mean, second_pre_variance
+                )
+        uniforms = _sobol_uniforms(n_samples, mlp.width, rng)
+        uniforms = fnp.clip(uniforms, _TAIL_CLIP, 1.0 - _TAIL_CLIP)
+        activations = flops.stats.norm.ppf(uniforms)
+
+        rows = []
+        for layer_index, weight in enumerate(mlp.weights):
+            preactivations = activations @ weight
+            if _PRE2_MATCH and layer_index == 1 and second_pre_mean is not None:
+                sample_pre_mean = fnp.mean(preactivations, axis=0)
+                centered_pre = preactivations - sample_pre_mean[None, :]
+                sample_pre_variance = fnp.mean(centered_pre * centered_pre, axis=0)
+                preactivations = (
+                    second_pre_mean[None, :]
+                    + centered_pre
+                    * fnp.sqrt(
+                        second_pre_variance
+                        / fnp.maximum(sample_pre_variance, 1e-30)
+                    )[None, :]
+                )
+            activations = fnp.maximum(preactivations, 0.0)
+            if layer_index == 1 and second_post_mean is not None:
+                sample_post_mean = fnp.mean(activations, axis=0)
+                centered_post = activations - sample_post_mean[None, :]
+                sample_post_variance = fnp.mean(
+                    centered_post * centered_post, axis=0
+                )
+                target_post_mean = (
+                    _POST2_BETA * second_post_mean
+                    + (1.0 - _POST2_BETA) * sample_post_mean
+                )
+                target_post_variance = (
+                    _POST2_BETA * second_post_variance
+                    + (1.0 - _POST2_BETA) * sample_post_variance
+                )
+                activations = (
+                    target_post_mean[None, :]
+                    + centered_post
+                    * fnp.sqrt(
+                        target_post_variance
+                        / fnp.maximum(sample_post_variance, 1e-30)
+                    )[None, :]
+                )
+            if layer_index == 0:
+                if first_mean is None or first_variance is None:
+                    exact_mean, exact_variance = _exact_first_layer_moments(weight)
+                else:
+                    exact_mean = first_mean
+                    exact_variance = first_variance
+                rows.append(exact_mean)
+            else:
+                rows.append(fnp.mean(activations, axis=0))
+
+            if layer_index == 0:
+                sample_mean = fnp.mean(activations, axis=0)
+                centered = activations - sample_mean[None, :]
+                sample_variance = fnp.mean(centered * centered, axis=0)
+                scale = fnp.sqrt(
+                    exact_variance / fnp.maximum(sample_variance, 1e-30)
+                )
+                activations = exact_mean[None, :] + centered * scale[None, :]
+        return fnp.stack(rows, axis=0)
