@@ -49,9 +49,11 @@ class DiscoverConfig:
     # AB-MCTS local sampler
     abmcts_variant: ABMCTSVariantName = "a"
     abmcts_actions: Any = ("default",)
+    abmcts_root_min_width: int = 0
     abmcts_dist_type: ABMCTSDistName = "gaussian"
     abmcts_model_selection_strategy: ABMCTSStrategyName = "multiarm_bandit_thompson"
     abmcts_invalid_score: float = 0.0
+    abmcts_reward_scale: float = 1.0
     abmcts_prior_mean: float = 0.0
     abmcts_prior_std: float = 1.0
     abmcts_prior_strength: float = 1.0

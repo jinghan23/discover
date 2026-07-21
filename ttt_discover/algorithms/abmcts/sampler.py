@@ -450,9 +450,11 @@ class ABMCTSSampler(StateSampler):
         batch_size: int = 1,
         resume_step: int | None = None,
         actions: list[str] | tuple[str, ...] | str | None = None,
+        root_min_width: int = 0,
         dist_type: DistributionType = "gaussian",
         model_selection_strategy: ModelSelectionStrategy = "multiarm_bandit_thompson",
         invalid_score: float = 0.0,
+        reward_scale: float = 1.0,
         prior_mean: float = 0.0,
         prior_std: float = 1.0,
         prior_strength: float = 1.0,
@@ -465,9 +467,13 @@ class ABMCTSSampler(StateSampler):
         self.problem_type = problem_type
         self.batch_size = int(batch_size)
         self.actions = self._normalize_actions(actions)
+        self.root_min_width = max(0, int(root_min_width))
         self.dist_type = dist_type
         self.model_selection_strategy = model_selection_strategy
         self.invalid_score = float(invalid_score)
+        self.reward_scale = float(reward_scale)
+        if not math.isfinite(self.reward_scale) or self.reward_scale <= 0:
+            raise ValueError("abmcts_reward_scale must be a finite positive number")
         self.prior_mean = float(prior_mean)
         self.prior_std = max(float(prior_std), 1e-6)
         self.prior_strength = max(float(prior_strength), 1e-6)
@@ -512,6 +518,7 @@ class ABMCTSSampler(StateSampler):
             batch_size=cfg.groups_per_batch,
             resume_step=start_batch if start_batch > 0 else None,
             actions=getattr(cfg, "abmcts_actions", ("default",)),
+            root_min_width=getattr(cfg, "abmcts_root_min_width", 0),
             dist_type=getattr(cfg, "abmcts_dist_type", "gaussian"),
             model_selection_strategy=getattr(
                 cfg,
@@ -519,6 +526,7 @@ class ABMCTSSampler(StateSampler):
                 "multiarm_bandit_thompson",
             ),
             invalid_score=getattr(cfg, "abmcts_invalid_score", 0.0),
+            reward_scale=getattr(cfg, "abmcts_reward_scale", 1.0),
             prior_mean=getattr(cfg, "abmcts_prior_mean", 0.0),
             prior_std=getattr(cfg, "abmcts_prior_std", 1.0),
             prior_strength=getattr(cfg, "abmcts_prior_strength", 1.0),
@@ -579,11 +587,15 @@ class ABMCTSSampler(StateSampler):
         self._root_node_id = int(store.get("root_node_id", 0))
         self._next_node_id = int(store.get("next_node_id", 1))
         self.actions = [str(x) for x in store.get("actions", self.actions)] or ["default"]
+        self.root_min_width = max(
+            0, int(store.get("root_min_width", self.root_min_width))
+        )
         self.dist_type = str(store.get("dist_type", self.dist_type))
         self.model_selection_strategy = str(
             store.get("model_selection_strategy", self.model_selection_strategy)
         )
         self.invalid_score = _as_float(store.get("invalid_score"), self.invalid_score)
+        self.reward_scale = _as_float(store.get("reward_scale"), self.reward_scale)
         self._nodes = {
             int(item["node_id"]): ABMCTSNode.from_dict(item, state_type=state_cls)
             for item in store.get("nodes", [])
@@ -620,9 +632,11 @@ class ABMCTSSampler(StateSampler):
             "root_node_id": self._root_node_id,
             "next_node_id": self._next_node_id,
             "actions": list(self.actions),
+            "root_min_width": self.root_min_width,
             "dist_type": self.dist_type,
             "model_selection_strategy": self.model_selection_strategy,
             "invalid_score": self.invalid_score,
+            "reward_scale": self.reward_scale,
             "prior_mean": self.prior_mean,
             "prior_std": self.prior_std,
             "prior_strength": self.prior_strength,
@@ -654,6 +668,7 @@ class ABMCTSSampler(StateSampler):
         if state is None:
             return self.invalid_score
         score = _as_float(getattr(state, "value", None), self.invalid_score)
+        score *= self.reward_scale
         if self.dist_type == "beta":
             return max(0.0, min(1.0, score))
         return score
@@ -693,6 +708,15 @@ class ABMCTSSampler(StateSampler):
 
     def _select_expansion(self) -> tuple[ABMCTSNode, str]:
         node = self._nodes[self._root_node_id]
+        if len(node.children) < self.root_min_width:
+            root_attempts = sum(
+                trial.node_to_expand == self._root_node_id
+                for trial in (
+                    *self._running_trials.values(),
+                    *self._finished_trials.values(),
+                )
+            )
+            return node, self.actions[root_attempts % len(self.actions)]
         while node.children:
             selection = self._get_prob_state(node.node_id).select_next(
                 self._all_rewards_store,
@@ -815,7 +839,9 @@ class ABMCTSSampler(StateSampler):
         parent_node_id: int,
         trial: ABMCTSTrial,
     ) -> None:
-        metadata = dict(getattr(child, "metadata", {}) or {})
+        parent_metadata = getattr(self._nodes[parent_node_id].state, "metadata", {}) or {}
+        metadata = dict(parent_metadata) if isinstance(parent_metadata, dict) else {}
+        metadata.update(dict(getattr(child, "metadata", {}) or {}))
         metadata["abmcts"] = {
             "node_id": node_id,
             "parent_node_id": parent_node_id,
@@ -975,6 +1001,14 @@ class ABMCTSSampler(StateSampler):
             "abmcts/running_trials": len(self._running_trials),
             "abmcts/finished_trials": len(self._finished_trials),
             "abmcts/actions": len(self.actions),
+            "abmcts/root_width": len(
+                self._nodes[self._root_node_id].children
+            ),
+            "abmcts/root_min_width": self.root_min_width,
+            "abmcts/root_width_satisfied": int(
+                len(self._nodes[self._root_node_id].children)
+                >= self.root_min_width
+            ),
             "abmcts/last_sampled": len(self._last_sampled_states),
             "abmcts/max_depth": max(depths) if depths else 0,
         }
