@@ -8,7 +8,7 @@ Usage: bash repro/aicrowd_whestbench/run_official_mini.sh [all|ttt|autoevolve|au
 This is a CPU workload; CUDA/GPU settings are intentionally not used.
 
 Environment overrides:
-  RUN_WHEST_SMOKE=1                  One epoch/sample on the first mini MLP
+  RUN_WHEST_SMOKE=1                  One epoch/sample
   RUN_WHEST_DRY_RUN=1                Print configs without launching
   RUN_WHEST_LOG_ROOT=...             Discovery log root
   RUN_WHEST_TTT_NUM_EPOCHS=...       Override TTT-Discover epochs
@@ -18,7 +18,7 @@ Environment overrides:
   RUN_WHEST_BLACKBOX_CACHE=1         Cache exact duplicate submissions
   RUN_WHEST_VERIFIER_WORKERS=...     CPU verifier workers (default 1)
   WHEST_INITIAL_ESTIMATOR_PATH=...    Seed AutoEvolve from an estimator source file
-  WHEST_SEARCH_N_MLPS=...            MLPs per candidate (standalone default 10; batch launch 100)
+  WHEST_SEARCH_N_MLPS=...            MLPs per candidate (default 100)
   WHEST_DEPS_PATH=...                 Directory containing whestbench/flopscope
   HF_HOME=...                         Hugging Face cache (default /tmp/hf-whest-cache)
   TTT_AUTONOMOUS_MASK_PATHS=...       Paths hidden from the AutoEvolve agent
@@ -67,7 +67,7 @@ CODEX_MODEL="${RUN_WHEST_CODEX_MODEL:-gpt-5.5}"
 CODEX_COMMAND="${RUN_WHEST_CODEX_COMMAND:-codex}"
 NUM_CPUS_PER_TASK="${RUN_WHEST_NUM_CPUS_PER_TASK:-1}"
 EVAL_TIMEOUT="${RUN_WHEST_EVAL_TIMEOUT:-4000}"
-SEARCH_N_MLPS="${WHEST_SEARCH_N_MLPS:-10}"
+SEARCH_N_MLPS="${WHEST_SEARCH_N_MLPS:-100}"
 VERIFIER_WORKERS="${RUN_WHEST_VERIFIER_WORKERS:-1}"
 BLACKBOX_MAX_EVALUATIONS="${RUN_WHEST_BLACKBOX_MAX_EVALUATIONS:-}"
 BLACKBOX_CACHE="${RUN_WHEST_BLACKBOX_CACHE:-0}"
@@ -86,7 +86,6 @@ AUTO_MAX_CONCURRENT_REQUESTS="${RUN_WHEST_AUTO_MAX_CONCURRENT_REQUESTS:-2}"
 AUTO_MAX_EVALUATOR_CALLS="${RUN_WHEST_AUTO_MAX_EVALUATOR_CALLS:-null}"
 
 if [[ "${RUN_WHEST_SMOKE:-0}" == "1" ]]; then
-    SEARCH_N_MLPS="${WHEST_SEARCH_N_MLPS:-1}"
     TTT_NUM_EPOCHS="${RUN_WHEST_TTT_NUM_EPOCHS:-1}"
     TTT_GROUP_SIZE="${RUN_WHEST_TTT_GROUP_SIZE:-1}"
     TTT_GROUPS_PER_BATCH="${RUN_WHEST_TTT_GROUPS_PER_BATCH:-1}"
