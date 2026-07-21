@@ -334,4 +334,12 @@ cd {isolated_workspace_shell}
             ),
             encoding="utf-8",
         )
-        return ["unshare", "-Ur", "-m", "bash", "-lc", script]
+        # Keep autonomous agents from inspecting or signalling sibling search
+        # processes.  Mount isolation alone is insufficient here: concurrent
+        # agents all see the host PID namespace and may mistake another run's
+        # evaluator sweep for a conflicting writer.  A nested PID namespace
+        # makes signals to ancestor/sibling processes fail while preserving
+        # the existing filesystem and Unix-socket access used by evaluation.
+        # We intentionally do not use --mount-proc because it is unavailable
+        # in some of the user-namespace environments where this runner is used.
+        return ["unshare", "-Ur", "-m", "-p", "-f", "bash", "-lc", script]

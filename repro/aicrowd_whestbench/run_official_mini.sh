@@ -18,7 +18,7 @@ Environment overrides:
   RUN_WHEST_BLACKBOX_CACHE=1         Cache exact duplicate submissions
   RUN_WHEST_VERIFIER_WORKERS=...     CPU verifier workers (default 1)
   WHEST_INITIAL_ESTIMATOR_PATH=...    Seed AutoEvolve from an estimator source file
-  WHEST_SEARCH_N_MLPS=...            MLPs per candidate (default 10; full mini 100)
+  WHEST_SEARCH_N_MLPS=...            MLPs per candidate (standalone default 10; batch launch 100)
   WHEST_DEPS_PATH=...                 Directory containing whestbench/flopscope
   HF_HOME=...                         Hugging Face cache (default /tmp/hf-whest-cache)
   TTT_AUTONOMOUS_MASK_PATHS=...       Paths hidden from the AutoEvolve agent
