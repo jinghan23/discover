@@ -326,7 +326,12 @@ def _workspace_candidates(completer: Any) -> list[GeneratedCandidate]:
             candidates.append(candidate)
 
     candidates.extend(_manifest_candidates(workspace))
-    for dirname in ("state_pool", "candidate_pool", "pool"):
+    for dirname in (
+        "state_pool",
+        "candidate_pool",
+        "pool",
+        "autoevolve_snapshots",
+    ):
         pool_dir = workspace / dirname
         if not pool_dir.is_dir():
             continue
