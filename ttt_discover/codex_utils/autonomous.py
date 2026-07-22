@@ -18,6 +18,28 @@ from ttt_discover.codex_utils.completers import CodexCliCompleter, TextCompleter
 logger = logging.getLogger(__name__)
 
 
+_TIME_WINDOW_PROTOCOL = """
+
+--- Time-Window Search Protocol ---
+Your autonomous search process has a hard 3000-second wall-clock limit. Work
+empirically and manage elapsed time, since evaluator runtimes can vary widely.
+Evaluate the starting submission early, then explore coherent hypotheses while
+keeping a plain-text experiment log. After every improvement, immediately copy
+the best valid implementation to a separate checkpoint in the workspace so a
+later regression or timeout cannot erase it. Shift from broad exploration to
+refining the strongest mechanism as the deadline approaches. By about 2700
+seconds, stop starting risky or long experiments, restore the best checkpoint
+to `submission.py`, and use the remaining time only for final validation and
+robustness checks. Leave the best actually measured implementation, not merely
+the most recent one, in `submission.py`. Never fabricate a score.
+"""
+
+
+def _append_time_window_protocol(prompt: str) -> str:
+    """Add harness-level deadline and checkpoint discipline to a task prompt."""
+    return prompt.rstrip() + _TIME_WINDOW_PROTOCOL
+
+
 def autonomous_submission_from_workspace(
     completer: TextCompleter,
 ) -> tuple[str | None, str | None]:
@@ -122,6 +144,7 @@ class AutonomousCodexCliCompleter(CodexCliCompleter):
                 eval_timeout=self.eval_timeout,
                 num_cpus_per_task=self.num_cpus_per_task,
             )
+            full_prompt = _append_time_window_protocol(full_prompt)
             if self.isolate_danger_full_access:
                 full_prompt = full_prompt.replace(
                     str(workspace),
