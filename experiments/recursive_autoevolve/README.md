@@ -3,7 +3,7 @@
 This folder contains the protocol, the task description for the outer Codex
 agent, and the protected local meta-evaluation launcher. The launcher runs each
 committed harness in a detached Git worktree, starts three fresh inner
-AutoEvolve tasks, enforces the evaluator-call limit in the blackbox servers,
+AutoEvolve tasks, enforces a one-hour wall-time limit for each inner task,
 and stores its incumbent ledger outside the repository.
 
 The design is inspired by Weco's
@@ -23,8 +23,8 @@ TTT-Discover AutoEvolve implementation:
    candidate change.
 3. A protected meta-evaluator checks out that committed candidate and launches
    three fresh inner AutoEvolve runs.
-4. Each inner run executes exactly one AutoEvolve epoch with a hard budget of at
-   most 25 evaluator calls.
+4. Each inner run executes exactly one AutoEvolve epoch with no evaluator-call
+   cap and a hard one-hour wall-time limit.
 5. The meta-evaluator reports task results, costs, and inner-run locations.
 6. The candidate is retained only when it beats the incumbent under the
    protected selection rule. A rejected candidate is reverted on the fixed
@@ -44,7 +44,7 @@ checkpoint handling.
 The outer agent must not modify task environments, reward evaluators,
 public/private data, benchmark manifests, model settings, cost accounting,
 meta-evaluation code, or the selection rule. These form the trusted evaluation
-boundary. In particular, reducing a budget, hiding a failure, changing a task,
+boundary. In particular, extending wall time, hiding a failure, changing a task,
 or increasing parallelism is not a harness improvement.
 
 ## Inner benchmark suite
@@ -84,19 +84,19 @@ with:
 ```yaml
 algorithm: autoevolve
 num_epochs: 1
-max_evaluator_calls: 25
+max_evaluator_calls: null
+cli_timeout: 3000
 ```
 
-The intended maximum is therefore 25 evaluator calls per task and 75 across a
-complete three-task candidate evaluation. The meta-evaluator must enforce the
-limit rather than trusting candidate code or post-hoc logs. An inner agent may
-use fewer calls because of invalid candidates, failure, or timeout, but it may
-not exceed the cap or transfer unused calls between tasks.
+The blackbox evaluator does not impose a call-count cap. Each task instead has
+a hard 3600-second process limit. The autonomous Codex search receives up to
+3000 seconds, leaving the remainder for candidate collection, final scoring,
+and cleanup. The three task clocks are independent and their unused time cannot
+be transferred.
 
 Token counts, evaluator calls, elapsed time, and compute usage should still be
-recorded for analysis. The phase-one acceptance constraint is the fixed
-one-epoch/25-evaluation protocol. A later version may replace this proxy with a
-token-and-compute cost ledger closer to Weco's dollar-denominated budget.
+recorded for analysis. The acceptance constraint is the fixed one-epoch,
+one-hour-per-task protocol.
 
 ## What the outer agent receives
 
@@ -192,8 +192,8 @@ incumbent before evaluating the candidate.
 ### Fixed phase-one manifest
 
 - Every inner run uses AutoEvolve, one epoch, one autonomous Codex call,
-  `gpt-5.5` with the harness's fixed high reasoning effort, and a blackbox
-  evaluator capped at 25 calls.
+  `gpt-5.5` with the harness's fixed high reasoning effort, no evaluator-call
+  cap, and a hard one-hour task wall-time limit.
 - Erdős starts from one deterministic protected construction.
 - This branch's lightweight NumPy WhestBench environment uses seeds 0–49 as
   `public-50` and seeds 50–99 as `private-50`. Monte Carlo targets are cached

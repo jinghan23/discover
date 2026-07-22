@@ -39,7 +39,9 @@ EDITABLE_PREFIXES = (
 )
 
 INNER_EPOCHS = 1
-MAX_EVALUATOR_CALLS = 25
+MAX_EVALUATOR_CALLS: int | None = None
+TASK_WALL_TIME_SECONDS = 3_600
+AUTONOMOUS_SEARCH_SECONDS = 3_000
 MODEL_NAME = "gpt-5.5"
 GPU_DEVICES = (7,)
 WHEST_PUBLIC_SEEDS = tuple(range(0, 50))
@@ -73,24 +75,24 @@ TASK_SPECS = (
         env_type="examples.erdos_min_overlap.env:ErdosMinOverlapEnv",
         problem_type="",
         eval_timeout=500,
-        cli_timeout=7200,
-        process_timeout=14_400,
+        cli_timeout=AUTONOMOUS_SEARCH_SECONDS,
+        process_timeout=TASK_WALL_TIME_SECONDS,
     ),
     TaskSpec(
         name="arc_whestbench",
         env_type="examples.aicrowd_whestbench.env:WhestBenchEnv",
         problem_type="arc_whestbench_2026",
         eval_timeout=1200,
-        cli_timeout=7200,
-        process_timeout=14_400,
+        cli_timeout=AUTONOMOUS_SEARCH_SECONDS,
+        process_timeout=TASK_WALL_TIME_SECONDS,
     ),
     TaskSpec(
         name="kernel",
         env_type="examples.gpu_mode.env:GpuModeEnv",
         problem_type="trimul",
         eval_timeout=1200,
-        cli_timeout=7200,
-        process_timeout=21_600,
+        cli_timeout=AUTONOMOUS_SEARCH_SECONDS,
+        process_timeout=TASK_WALL_TIME_SECONDS,
         uses_gpu=True,
     ),
 )
@@ -194,13 +196,15 @@ def validate_candidate_scope(incumbent_sha: str, candidate_sha: str) -> list[str
 
 def _protocol_payload() -> dict[str, Any]:
     return {
-        "version": 1,
+        "version": 2,
         "fixed_branch": FIXED_BRANCH,
         "editable_prefixes": EDITABLE_PREFIXES,
         "inner": {
             "algorithm": "autoevolve",
             "num_epochs": INNER_EPOCHS,
             "max_evaluator_calls": MAX_EVALUATOR_CALLS,
+            "task_wall_time_seconds": TASK_WALL_TIME_SECONDS,
+            "autonomous_search_seconds": AUTONOMOUS_SEARCH_SECONDS,
             "model": MODEL_NAME,
             "group_size": 1,
             "groups_per_batch": 1,
@@ -587,7 +591,7 @@ def summarize_inner_run(
         failures.append(f"inner process exited {process_result.get('returncode')}")
     if process_result.get("timed_out"):
         failures.append("inner process timed out")
-    if calls > MAX_EVALUATOR_CALLS:
+    if MAX_EVALUATOR_CALLS is not None and calls > MAX_EVALUATOR_CALLS:
         failures.append(
             f"evaluator budget exceeded: {calls}/{MAX_EVALUATOR_CALLS}"
         )

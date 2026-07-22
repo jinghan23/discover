@@ -28,11 +28,13 @@ def _evaluation(
     }
 
 
-def test_protocol_fixes_budget_model_tasks_and_gpu_pool() -> None:
+def test_protocol_fixes_time_model_tasks_and_gpu_pool() -> None:
     protocol = meta_eval._protocol_payload()
 
     assert protocol["inner"]["num_epochs"] == 1
-    assert protocol["inner"]["max_evaluator_calls"] == 25
+    assert protocol["inner"]["max_evaluator_calls"] is None
+    assert protocol["inner"]["task_wall_time_seconds"] == 3600
+    assert protocol["inner"]["autonomous_search_seconds"] == 3000
     assert protocol["inner"]["model"] == "gpt-5.5"
     assert protocol["kernel"] == {
         "task": "trimul",
@@ -45,7 +47,9 @@ def test_protocol_fixes_budget_model_tasks_and_gpu_pool() -> None:
     assert len(protocol["whestbench_manifest"]["private_seeds"]) == 50
 
 
-def test_inner_config_cannot_raise_candidate_budget(tmp_path: Path) -> None:
+def test_inner_config_has_no_call_cap_and_enforces_one_hour_wall_time(
+    tmp_path: Path,
+) -> None:
     for spec in meta_eval.TASK_SPECS:
         payload = meta_eval._inner_config(spec, tmp_path / spec.name, None)
         config = payload["runs"]["inner"]
@@ -53,7 +57,9 @@ def test_inner_config_cannot_raise_candidate_budget(tmp_path: Path) -> None:
         assert config["algorithm"] == "autoevolve"
         assert config["eval_runner"] == "blackbox"
         assert config["num_epochs"] == 1
-        assert config["max_evaluator_calls"] == 25
+        assert config["max_evaluator_calls"] is None
+        assert config["cli_timeout"] == 3000
+        assert spec.process_timeout == 3600
         assert config["group_size"] == 1
         assert config["groups_per_batch"] == 1
         assert config["max_concurrent_requests"] == 1
@@ -102,7 +108,7 @@ def test_selection_rejects_invalid_candidate() -> None:
     assert result["selection_score"] is None
 
 
-def test_run_summary_uses_best_valid_kernel_state_and_server_budget(
+def test_run_summary_uses_best_valid_kernel_state_and_server_call_count(
     tmp_path: Path,
 ) -> None:
     pool = {
@@ -138,7 +144,7 @@ def test_run_summary_uses_best_valid_kernel_state_and_server_budget(
             "returncode": 0,
             "timed_out": False,
             "wall_time_seconds": 1.0,
-            "gpu_device": 4,
+            "gpu_device": 7,
         },
     )
 

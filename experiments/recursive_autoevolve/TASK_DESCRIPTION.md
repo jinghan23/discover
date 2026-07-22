@@ -8,7 +8,7 @@ sequence of code changes and empirical evaluations.
 The experiment is inspired by Weco's
 [AIDE²](https://www.weco.ai/blog/first-evidence-of-recursive-self-improvement):
 an outer autoresearch agent rewrites an inner autoresearch harness, evaluates
-the rewritten harness across heterogeneous tasks under a fixed cost budget, and
+the rewritten harness across heterogeneous tasks under a fixed wall-time budget, and
 keeps a rewrite only when it performs better than the incumbent.
 
 ## Objective
@@ -21,7 +21,7 @@ not its score on only one benchmark:
 3. GPU kernel engineering, initially the `trimul` task.
 
 Every candidate harness is evaluated by running one fresh AutoEvolve epoch per
-task with a hard maximum of 25 evaluator calls per run.
+task with no evaluator-call cap and a hard one-hour wall-time limit per run.
 
 ## Editable scope
 
@@ -43,13 +43,13 @@ Do not modify, bypass, replace, or derive hidden information from:
 - the ARC public/private split or private instances;
 - the three-task benchmark manifest;
 - meta-evaluation and candidate-selection code;
-- model selection, evaluator-call limits, timeouts, resource limits, or cost
+- model selection, timeouts, resource limits, or cost
   accounting;
 - inner-run result files after they have been produced;
 - any code outside the editable scope.
 
-Do not obtain a better score by increasing calls, tokens, compute,
-parallelism, wall time, or evaluator access. Do not special-case benchmark
+Do not obtain a better score by increasing parallelism, wall time, or evaluator
+access beyond the fixed protocol. Do not special-case benchmark
 names, known instances, seeds, expected answers, or private-score behavior.
 
 ## Information available to you
@@ -93,9 +93,10 @@ is reached or the protected evaluator reports a terminal failure:
 8. Invoke exactly the meta-evaluation command supplied by the operator for the
    committed `HEAD`. Do not construct a substitute evaluator or change its
    arguments.
-9. Wait for all three fresh inner runs to finish. Each uses `num_epochs=1` and
-   `max_evaluator_calls=25` with a unique log directory and no state carried
-   over from another harness candidate. If the meta-evaluation tool call yields
+9. Wait for all three fresh inner runs to finish. Each uses `num_epochs=1`, no
+   evaluator-call cap, a hard one-hour task wall-time limit, a unique log
+   directory, and no state carried over from another harness candidate. If the
+   meta-evaluation tool call yields
    a live session ID, enforce a 20-minute cooldown before checking that session:
 
    - Start a blocking local cooldown command equivalent to `sleep 1200`.
@@ -134,7 +135,7 @@ The three task results are complementary. A change that improves one task by
 overfitting its prompt or failure mode is not a general harness improvement.
 Prefer mechanisms that plausibly transfer across tasks, such as better context
 selection, lineage management, exploration scheduling, failure recovery,
-candidate validation, or budget allocation within the fixed limits.
+candidate validation, or effective use of the fixed wall-time window.
 
 ARC's private score is a first-order generalization check. A large public gain
 that disappears on `private-50` is evidence against the candidate, not an
