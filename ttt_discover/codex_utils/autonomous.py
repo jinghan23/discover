@@ -18,27 +18,6 @@ from ttt_discover.codex_utils.completers import CodexCliCompleter, TextCompleter
 logger = logging.getLogger(__name__)
 
 
-_SEARCH_PROTOCOL = """
-
---- Fixed-Budget Search Protocol ---
-The reward evaluator has a strict, non-renewable limit of 25 calls for this
-entire run. Treat every invocation of the provided evaluator command as one
-call, including failures. Work empirically: evaluate the starting submission,
-form a concrete hypothesis from that result, change one coherent mechanism at
-a time, and compare against the best valid score seen so far. Keep a small
-plain-text experiment log in the workspace so regressions and failed ideas are
-not repeated. Preserve the best valid implementation separately before risky
-changes, and leave that best implementation in `submission.py` at the end.
-Reserve a few calls for validating the final choice; do not exhaust the budget
-on untested variants or cosmetic rewrites. Never fabricate a score.
-"""
-
-
-def _append_search_protocol(prompt: str) -> str:
-    """Add harness-level budget discipline to a task-owned agent prompt."""
-    return prompt.rstrip() + _SEARCH_PROTOCOL
-
-
 def autonomous_submission_from_workspace(
     completer: TextCompleter,
 ) -> tuple[str | None, str | None]:
@@ -143,7 +122,6 @@ class AutonomousCodexCliCompleter(CodexCliCompleter):
                 eval_timeout=self.eval_timeout,
                 num_cpus_per_task=self.num_cpus_per_task,
             )
-            full_prompt = _append_search_protocol(full_prompt)
             if self.isolate_danger_full_access:
                 full_prompt = full_prompt.replace(
                     str(workspace),
