@@ -18,6 +18,24 @@ from ttt_discover.codex_utils.completers import CodexCliCompleter, TextCompleter
 logger = logging.getLogger(__name__)
 
 
+_EVIDENCE_GATED_PROTOCOL = """
+
+--- Evidence-Gated Search ---
+Optimize for a simple mechanism that should generalize beyond the observed
+evaluations. First measure the current submission and preserve it as the
+incumbent. Before each risky revision, keep a restorable copy; promote a trial
+to incumbent only after valid measurements show an improvement across the
+available configurations, otherwise roll it back promptly. Use local synthetic
+or perturbed checks when possible to challenge unexplained gains. At the end,
+restore the strongest measured incumbent to `submission.py` rather than
+submitting the latest experiment.
+"""
+
+
+def _append_evidence_gated_protocol(prompt: str) -> str:
+    return prompt.rstrip() + _EVIDENCE_GATED_PROTOCOL
+
+
 def autonomous_submission_from_workspace(
     completer: TextCompleter,
 ) -> tuple[str | None, str | None]:
@@ -122,6 +140,7 @@ class AutonomousCodexCliCompleter(CodexCliCompleter):
                 eval_timeout=self.eval_timeout,
                 num_cpus_per_task=self.num_cpus_per_task,
             )
+            full_prompt = _append_evidence_gated_protocol(full_prompt)
             if self.isolate_danger_full_access:
                 full_prompt = full_prompt.replace(
                     str(workspace),
