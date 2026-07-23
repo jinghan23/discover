@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
-from collections import deque
 import json
 import logging
 import os
@@ -97,50 +95,6 @@ class AutonomousCodexCliCompleter(CodexCliCompleter):
         self.prompt_builder = prompt_builder
         self.isolate_danger_full_access = isolate_danger_full_access
         self._call_idx = 0
-        self._submission_snapshots: deque[str] = deque(maxlen=2)
-
-    def _capture_submission_snapshot(self) -> None:
-        workspace = getattr(self, "_workspace", None)
-        if workspace is None:
-            return
-        try:
-            code = (Path(workspace) / "submission.py").read_text(encoding="utf-8")
-            compile(code, "submission.py", "exec")
-        except (OSError, SyntaxError, ValueError):
-            return
-        if not code.strip():
-            return
-        if self._submission_snapshots and self._submission_snapshots[-1] == code:
-            return
-        self._submission_snapshots.append(code)
-
-    async def _monitor_submission(self, search_task: asyncio.Task[str]) -> None:
-        while not search_task.done():
-            self._capture_submission_snapshot()
-            await asyncio.sleep(1.0)
-        self._capture_submission_snapshot()
-
-    def _write_submission_snapshots(self) -> None:
-        workspace = getattr(self, "_workspace", None)
-        if workspace is None or not self._submission_snapshots:
-            return
-        snapshot_dir = Path(workspace) / "autoevolve_snapshots"
-        snapshot_dir.mkdir(parents=True, exist_ok=True)
-        for idx, code in enumerate(self._submission_snapshots):
-            (snapshot_dir / f"snapshot_{idx:04d}.py").write_text(
-                code,
-                encoding="utf-8",
-            )
-
-    async def _call_unlocked(self, prompt: str) -> str:
-        self._submission_snapshots.clear()
-        search_task = asyncio.create_task(super()._call_unlocked(prompt))
-        monitor_task = asyncio.create_task(self._monitor_submission(search_task))
-        try:
-            return await search_task
-        finally:
-            await monitor_task
-            self._write_submission_snapshots()
 
     def _isolated_workspace(self) -> Path:
         return self.repo_cwd / "workspace"
