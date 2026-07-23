@@ -1,11 +1,11 @@
 # WhestBench Submission Tracker
 
-Generated at `2026-07-21T20:46:46+08:00` from the local registry and the AIcrowd API.
+Generated at `2026-07-23T12:43:55+08:00` from the local registry and the AIcrowd API.
 Lower adjusted score is better. This file is generated; do not edit it by hand.
 
 ## Summary
 
-- registered submissions: **39**; graded with an official score: **38**
+- registered submissions: **46**; graded with an official score: **45**
 - best official result among registered submissions: [#316192](https://www.aicrowd.com/challenges/arc-white-box-estimation-challenge-2026/submissions/316192) German reproduction, 13% budget at `2.787552892e-07`
 - official score is measured on the hosted public-50 suite; local rows use either mini first-10 or mini full-100 and are not interchangeable
 - protocol and column glossary: [`docs/PROTOCOLS.md`](docs/PROTOCOLS.md)
@@ -16,14 +16,17 @@ Lower adjusted score is better. This file is generated; do not edit it by hand.
 
 | Local protocol | Submissions | Mean delta | Median abs delta | Pearson r | Spearman rho |
 |---|---:|---:|---:|---:|---:|
-| mini n=100 | 25 | -3.571% | 12.421% | 0.703 | 0.406 |
+| mini n=100 | 32 | -2.064% | 11.659% | 0.612 | 0.335 |
 | mini n=10 | 13 | 9.783% | 12.240% | 0.887 | 0.571 |
 
 ### Drift by protocol and family
 
 | Local protocol | Family | Submissions | Mean delta | Median abs delta | Spearman rho |
 |---|---|---:|---:|---:|---:|
+| mini n=100 | acronym_search | 3 | 1.859% | 8.198% | -0.500 |
 | mini n=100 | autoevolve | 20 | -0.375% | 11.940% | 0.528 |
+| mini n=100 | diversity_orthogonal | 1 | 11.544% | 11.544% | - |
+| mini n=100 | diversity_rqmc | 3 | 2.043% | 7.891% | -0.500 |
 | mini n=100 | german | 1 | -24.056% | 24.056% | - |
 | mini n=100 | hybrid_mc | 1 | -5.310% | 5.310% | - |
 | mini n=100 | rqmc | 1 | -26.372% | 26.372% | - |
@@ -76,6 +79,13 @@ Official `MSE` is AIcrowd's `score_secondary` for these Phase 1 submissions. `S/
 | [#317473](https://www.aicrowd.com/challenges/arc-white-box-estimation-challenge-2026/submissions/317473) | AutoEvolve shifted Box-Muller lattice with first-two-layer analytic moment corrections, 10.7% | 100 | `3.020315e-07` | `2.788439e-06` | 0.1083 | 0 | `2.987926e-07` | `2.719052e-06` | 0.1099 | -1.07% | graded |
 | [#317475](https://www.aicrowd.com/challenges/arc-white-box-estimation-challenge-2026/submissions/317475) | AutoEvolve cached two-shift spherical RQMC with gate-propagated first-layer control, 10.24% | 100 | `3.059810e-07` | `3.005756e-06` | 0.1018 | 0 | `3.643942e-07` | `3.542099e-06` | 0.1029 | 19.09% | graded |
 | [#317723](https://www.aicrowd.com/challenges/arc-white-box-estimation-challenge-2026/submissions/317723) | AutoEvolve shifted Box-Muller lattice with strengthened early-layer moment corrections, 12% | 100 | `2.563439e-07` | `2.103149e-06` | 0.1219 | 0 | `3.130976e-07` | `2.544813e-06` | 0.1230 | 22.14% | graded |
+| [#317922](https://www.aicrowd.com/challenges/arc-white-box-estimation-challenge-2026/submissions/317922) | Diversity primitive-root tent RQMC with exact first-layer marginal calibration, 15.5% | 100 | `3.026566e-07` | `1.849721e-06` | 0.1627 | 0 | `2.852186e-07` | `1.811489e-06` | 0.1574 | -5.76% | graded |
+| [#317924](https://www.aicrowd.com/challenges/arc-white-box-estimation-challenge-2026/submissions/317924) | Diversity pure primitive-root tent RQMC with antithetic ZCA, 15.5% | 100 | `3.134437e-07` | `1.996024e-06` | 0.1572 | 0 | `2.887088e-07` | `1.830784e-06` | 0.1577 | -7.89% | graded |
+| [#317925](https://www.aicrowd.com/challenges/arc-white-box-estimation-challenge-2026/submissions/317925) | Diversity exact-radial estimator with 13 signed-Hadamard bases and common polar rotation | 100 | `3.224360e-07` | `3.056773e-06` | 0.1056 | 0 | `3.596574e-07` | `3.372513e-06` | 0.1066 | 11.54% | graded |
+| [#317926](https://www.aicrowd.com/challenges/arc-white-box-estimation-challenge-2026/submissions/317926) | Diversity base-2 Korobov RQMC with exact first-layer marginal calibration, n=4201 | 100 | `3.025845e-07` | `2.241660e-06` | 0.1350 | 0 | `3.624420e-07` | `2.678283e-06` | 0.1353 | 19.78% | graded |
+| [#318093](https://www.aicrowd.com/challenges/arc-white-box-estimation-challenge-2026/submissions/318093) | Acronym ADA: Haar-stratified exact-radius antipodal sampling with first-layer covariance calibration, 20% | 100 | `3.180688e-07` | `1.451771e-06` | 0.2191 | 0 | `3.441437e-07` | `1.569540e-06` | 0.2193 | 8.20% | graded |
+| [#318094](https://www.aicrowd.com/challenges/arc-white-box-estimation-challenge-2026/submissions/318094) | Acronym AAY: analytic antithetic yoking with cross-fitted linear-shadow control, 10.2% | 100 | `3.419277e-07` | `3.273080e-06` | 0.1045 | 0 | `3.686147e-07` | `3.440888e-06` | 0.1071 | 7.80% | graded |
+| [#318095](https://www.aicrowd.com/challenges/arc-white-box-estimation-challenge-2026/submissions/318095) | Acronym ACL: end-to-end Monte Carlo with analytic affine control linearization, 20% | 100 | `3.438783e-07` | `1.677290e-06` | 0.2051 | 0 | `3.080306e-07` | `1.489765e-06` | 0.2068 | -10.42% | graded |
 
 ## Provenance
 
@@ -120,6 +130,13 @@ Official `MSE` is AIcrowd's `score_secondary` for these Phase 1 submissions. `S/
 | #317473 | autoevolve | `/opt/tiger/discover/codex_runs/aicrowd_whestbench/multi_initial_full100_20260720/whest_0720_full100_german013_auto_r2/autoevolve_workspaces/step_000002/call_0001_1f0dc726/submission.py` | `repro_external/aicrowd_whestbench/submissions/candidates/autoevolve_shifted_lattice_earlymoments_abe74aed629f_full100_eval_20260720.json` | `repro_external/aicrowd_whestbench/submissions/packages/autoevolve_shifted_lattice_earlymoments_d76265cadf7f_phase1_20260720.tar.gz` | `cad8e2ff93a85fb525b4c911903ab468499b0f6310c084af146cd5519e573a5b` |
 | #317475 | autoevolve | `/opt/tiger/discover/codex_runs/aicrowd_whestbench/multi_initial_full100_20260720/whest_0720_full100_sphericalrb_auto_r1/autoevolve_workspaces/step_000003/call_0001_e049c866/submission.py` | `repro_external/aicrowd_whestbench/submissions/candidates/autoevolve_spherical_gate_cv_e422c0842e59_full100_eval_20260720.json` | `repro_external/aicrowd_whestbench/submissions/packages/autoevolve_spherical_gate_cv_030f2d559498_phase1_20260720.tar.gz` | `f5992c936335da37ebb6b03482655f5ce394e2088dbaeb880fca98617f4e6f76` |
 | #317723 | autoevolve | `codex_runs/aicrowd_whestbench/multi_initial_full100_20260720/manual_3seed_review_20260721T084856Z/candidates/german013_auto_r2_a246e72ffbfd.py` | `repro_external/aicrowd_whestbench/submissions/reviews/manual_3seed_20260721/reports/german013_auto_r2_a246e72ffbfd_seed0_full100.json` | `repro_external/aicrowd_whestbench/submissions/packages/autoevolve_shifted_lattice_earlymatch_a246e72ffbfd_phase1_20260721T094843Z.tar.gz` | `29f69ebe4f00d5ea79789495a34f12d9b84b0a4bb5cad0580882911539db7c75` |
+| #317922 | diversity_rqmc | `codex_runs/aicrowd_whestbench/diversity_mode_pipeline_full100_20260722/followup_runs/followup_rqmc_pure_tent155_full100_r2/autoevolve_workspaces/step_000000/call_0001_5b965421/submission.py` | `repro_external/aicrowd_whestbench/submissions/candidates/diversity_tent_marginalcal_0f86a106_full100_outer_20260722.json` | `repro_external/aicrowd_whestbench/submissions/packages/diversity_tent_marginalcal_0f86a106_phase1_20260722T095230Z.tar.gz` | `daf88ca2d37c4f09fe76d622ce777167321aab9e2ebacccd75508d6c1ea571ca` |
+| #317924 | diversity_rqmc | `codex_runs/aicrowd_whestbench/diversity_mode_pipeline_full100_20260722/followup_runs/followup_rqmc_pure_tent155_full100_r2/autoevolve_workspaces/step_000000/call_0001_51db5f9f/submission.py` | `repro_external/aicrowd_whestbench/submissions/candidates/diversity_tent_pure_a97e80c4_full100_outer_20260722.json` | `repro_external/aicrowd_whestbench/submissions/packages/diversity_tent_pure_a97e80c4_phase1_20260722T095230Z.tar.gz` | `33ec91af833ff41523aadea0fa970e7c5d837833444ce26977cad2ee2181cc5f` |
+| #317925 | diversity_orthogonal | `codex_runs/aicrowd_whestbench/diversity_mode_pipeline_full100_20260722/followup_runs/followup_exact_a_simple10_full100_r1/autoevolve_workspaces/step_000000/call_0001_18e32df2/submission.py` | `repro_external/aicrowd_whestbench/submissions/candidates/diversity_hadamard13_fe1b13f5_full100_outer_20260722.json` | `repro_external/aicrowd_whestbench/submissions/packages/diversity_hadamard13_fe1b13f5_phase1_20260722T095230Z.tar.gz` | `bb3399e9af9e7edeb9d40b11f5160025901471f470ebb0da98e899319a0f11b3` |
+| #317926 | diversity_rqmc | `codex_runs/aicrowd_whestbench/diversity_mode_pipeline_full100_20260722/followup_runs/followup_rqmc_base2_4201_full100_r2/autoevolve_workspaces/step_000000/call_0001_0de4f09b/submission.py` | `repro_external/aicrowd_whestbench/submissions/candidates/diversity_base2_marginalcal_0452f731_full100_outer_20260722.json` | `repro_external/aicrowd_whestbench/submissions/packages/diversity_base2_marginalcal_0452f731_phase1_20260722T095230Z.tar.gz` | `de4d16b305ed0cbfe4c95c4df96d847017b00d1402849098555caae9a4d1db65` |
+| #318093 | acronym_search | `codex_runs/aicrowd_whestbench/acronym_sweep_20260722_175032/batches/batch_0006_acu_adf/autoevolve_ada_acronym_sweep_20260722_175032_0006_acu_adf/autoevolve_workspaces/step_000000/call_0001_958f40d7/submission.py` | `repro_external/aicrowd_whestbench/submissions/candidates/acronym_ada_angular_deterministic_antithetics_1d0ed44708c6_full100_outer_20260723.json` | `repro_external/aicrowd_whestbench/submissions/packages/acronym_ada_angular_deterministic_antithetics_1d0ed44708c6_phase1_20260723.tar.gz` | `1c30d2806e80b79684d80e7166bed509882129e2b019194596bf843c3ae4fda8` |
+| #318094 | acronym_search | `codex_runs/aicrowd_whestbench/acronym_sweep_20260722_175032/batches/batch_0002_aay_abj/autoevolve_aay_acronym_sweep_20260722_175032_0002_aay_abj/autoevolve_workspaces/step_000000/call_0001_e4467fb1/submission.py` | `repro_external/aicrowd_whestbench/submissions/candidates/acronym_aay_analytic_antithetic_yoking_76a41f56b3f7_full100_outer_20260723.json` | `repro_external/aicrowd_whestbench/submissions/packages/acronym_aay_analytic_antithetic_yoking_76a41f56b3f7_phase1_20260723.tar.gz` | `12d7174753feccccc59543b6e2bf9ab0fce1c40f51b27cc113669491ffa5bc98` |
+| #318095 | acronym_search | `codex_runs/aicrowd_whestbench/acronym_sweep_20260722_175032/batches/batch_0005_aci_act/autoevolve_acl_acronym_sweep_20260722_175032_0005_aci_act/autoevolve_workspaces/step_000000/call_0001_b2d94816/submission.py` | `repro_external/aicrowd_whestbench/submissions/candidates/acronym_acl_analytic_control_linearization_27a8ab266343_full100_outer_20260723.json` | `repro_external/aicrowd_whestbench/submissions/packages/acronym_acl_analytic_control_linearization_27a8ab266343_phase1_20260723.tar.gz` | `f99f29b79574700f1f66ddcc6986194345bb06f71f5e4e0e0408b35a3c87594b` |
 
 ### Artifact integrity notes
 
