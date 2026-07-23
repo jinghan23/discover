@@ -18,23 +18,6 @@ from ttt_discover.codex_utils.completers import CodexCliCompleter, TextCompleter
 logger = logging.getLogger(__name__)
 
 
-_GENERALIZATION_PROTOCOL = """
-
---- Generalization Check ---
-Treat evaluator feedback as evidence about a general mechanism, not as values
-to fit by repeated instance-specific tuning. Prefer the simplest implementation
-that explains improvements across configurations. Before finalizing, use any
-available local machinery to stress-test plausible unseen inputs, seeds,
-shapes, or distributions, and reject brittle gains that depend on observed
-cases, lookup values, or unexplained constants. Keep the strongest measured
-candidate that survives those checks in `submission.py`.
-"""
-
-
-def _append_generalization_protocol(prompt: str) -> str:
-    return prompt.rstrip() + _GENERALIZATION_PROTOCOL
-
-
 def autonomous_submission_from_workspace(
     completer: TextCompleter,
 ) -> tuple[str | None, str | None]:
@@ -139,7 +122,6 @@ class AutonomousCodexCliCompleter(CodexCliCompleter):
                 eval_timeout=self.eval_timeout,
                 num_cpus_per_task=self.num_cpus_per_task,
             )
-            full_prompt = _append_generalization_protocol(full_prompt)
             if self.isolate_danger_full_access:
                 full_prompt = full_prompt.replace(
                     str(workspace),
