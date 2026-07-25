@@ -26,8 +26,29 @@ from whestbench.scoring import (
 )
 
 from examples.aicrowd_whestbench.prompt import WHESTBENCH_PROMPT
-from ttt_discover import BaseRewardEvaluator, DiscoverConfig, Environment, State, discover
-from ttt_discover.eval_runners.blackbox_eval import build_eval_client_source
+try:
+    from ttt_discover import BaseRewardEvaluator, DiscoverConfig, Environment, State, discover
+    from ttt_discover.eval_runners.blackbox_eval import build_eval_client_source
+except ModuleNotFoundError:
+    # The standalone official reproduction runner only needs the suite loading
+    # and scoring helpers above.  Keep that path usable in the lightweight
+    # whestbench/flopscope environment without installing the full discovery
+    # stack (Ray, Tinker, etc.).
+    BaseRewardEvaluator = object  # type: ignore[assignment,misc]
+    Environment = object  # type: ignore[assignment,misc]
+
+    class State:  # type: ignore[no-redef]
+        pass
+
+    DiscoverConfig = None  # type: ignore[assignment,misc]
+
+    def discover(*args, **kwargs):  # type: ignore[no-redef]
+        del args, kwargs
+        raise RuntimeError("the optional discovery dependencies are not installed")
+
+    def build_eval_client_source(*args, **kwargs):  # type: ignore[no-redef]
+        del args, kwargs
+        raise RuntimeError("the optional discovery dependencies are not installed")
 
 
 _CODE_BLOCK_RE = re.compile(r"```(?:python|py)?\s*([\s\S]*?)```")
@@ -242,12 +263,18 @@ def _score_code(
     code: str,
     data: ContestData,
     config: OfficialSuiteConfig,
+    submission_assets: dict[str, bytes] | None = None,
 ) -> dict[str, Any]:
     runner = _runner_for(config)
     with tempfile.TemporaryDirectory(prefix="ttt-whestbench-") as tmp:
         submission_dir = Path(tmp)
         estimator_path = submission_dir / "estimator.py"
         estimator_path.write_text(code, encoding="utf-8")
+        for name, payload in (submission_assets or {}).items():
+            asset_path = Path(name)
+            if asset_path.is_absolute() or asset_path.name != name:
+                raise ValueError(f"submission asset must be a basename: {name!r}")
+            (submission_dir / name).write_bytes(payload)
         scratch_dir = submission_dir / "scratch"
         scratch_dir.mkdir()
 

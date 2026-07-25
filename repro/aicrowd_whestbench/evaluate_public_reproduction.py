@@ -28,6 +28,13 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("estimator", type=Path)
     parser.add_argument("output", type=Path)
+    parser.add_argument(
+        "--asset",
+        action="append",
+        default=[],
+        type=Path,
+        help="Sidecar file copied next to estimator.py (repeatable).",
+    )
     parser.add_argument("--n-mlps", type=int, default=100)
     parser.add_argument("--dataset", default=DATASET)
     parser.add_argument("--revision", default=REVISION)
@@ -47,6 +54,14 @@ def main() -> None:
     args = parser.parse_args()
 
     source = args.estimator.read_text(encoding="utf-8")
+    assets: dict[str, bytes] = {}
+    asset_sources: dict[str, str] = {}
+    for path in args.asset:
+        name = path.name
+        if name in assets:
+            raise ValueError(f"duplicate submission asset basename: {name}")
+        assets[name] = path.read_bytes()
+        asset_sources[name] = str(path)
     config = OfficialSuiteConfig(
         dataset=args.dataset,
         revision=args.revision,
@@ -61,7 +76,7 @@ def main() -> None:
     data = _load_contest_data(config)
 
     started = time.perf_counter()
-    results = _score_code(source, data, config)
+    results = _score_code(source, data, config, submission_assets=assets)
     elapsed = time.perf_counter() - started
 
     summary_keys = (
@@ -81,6 +96,13 @@ def main() -> None:
     )
 
     report = {
+        "assets": {
+            name: {
+                "source": asset_sources[name],
+                "sha256": hashlib.sha256(payload).hexdigest(),
+            }
+            for name, payload in assets.items()
+        },
         "code_sha256": hashlib.sha256(source.encode("utf-8")).hexdigest(),
         "dataset": {
             "repo": args.dataset,
