@@ -93,6 +93,7 @@ class BlackboxRunner(EvalRunner):
                 "raw_score": float(raw_score),
                 "result_construction": response.get("result_construction"),
                 "stdout": message,
+                "details": response.get("details") or {},
                 "metrics": {
                     "blackbox/ok": ok,
                     "blackbox/stage": response.get("stage"),

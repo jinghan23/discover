@@ -23,6 +23,7 @@ class VerifyResult:
     result_construction: Any
     stdout: str
     metrics: dict[str, Any] = field(default_factory=dict)
+    details: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_reward_dict(cls, out: Any) -> "VerifyResult":
@@ -36,6 +37,7 @@ class VerifyResult:
                 result_construction=None,
                 stdout="",
                 metrics={},
+                details={},
             )
         return cls(
             reward=out["reward"],
@@ -45,6 +47,7 @@ class VerifyResult:
             result_construction=out.get("result_construction", None),
             stdout=out.get("stdout", ""),
             metrics=out.get("metrics", {}),
+            details=out.get("details") or {},
         )
 
 

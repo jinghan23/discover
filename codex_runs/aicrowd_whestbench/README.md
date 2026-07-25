@@ -31,3 +31,17 @@ Three autonomous `codex.stderr.log` transcripts that printed a host credential
 during process inspection are also excluded.  Their neighboring prompt,
 stdout, final response, command metadata, and `submission.py` remain in the
 snapshot; the unredacted transcripts remain local and ignored.
+
+## 2026-07-24 baseline-gate snapshot
+
+The `whestbench_baseline_gate_epoch1_20260724/` snapshot records the two
+parallel AutoEvolve calls used to validate the 50-MLP test gate followed by the
+disjoint 50-MLP holdout gate.  It retains the run-level metric, score, agent
+output, and state streams; the final cumulative pool snapshot; and each call's
+prompt, command, sanitized environment, stdout/stderr transcript, timeout
+marker, and final `submission.py`.
+
+As above, the snapshot excludes the disposable `*_codex_home/` trees,
+generated evaluator clients, Python caches, and the earlier cumulative pool
+snapshot.  The retained call files were scanned for credential-like strings
+before being added.

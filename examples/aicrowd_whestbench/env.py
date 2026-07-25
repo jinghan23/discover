@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import re
 import shlex
+import subprocess
 import tempfile
 from dataclasses import dataclass, replace
 from functools import lru_cache
@@ -55,9 +56,10 @@ _CODE_BLOCK_RE = re.compile(r"```(?:python|py)?\s*([\s\S]*?)```")
 _DEFAULT_DATASET = "aicrowd/arc-whestbench-public-2026"
 _DEFAULT_REVISION = "v1-phase1"
 _DEFAULT_SPLIT = "mini"
-_DEFAULT_N_MLPS = 100
+_DEFAULT_N_MLPS = 50
 _DEFAULT_FLOP_BUDGET = 272_000_000_000
 _DEFAULT_LAMBDA_FLOPS_PER_SECOND = 1e11
+_DEFAULT_ACCEPTANCE_THRESHOLD = 1e-7
 _TARGET_ADJUSTED_SCORE = 1e-7
 _INITIAL_ESTIMATOR_PATH_ENV = "WHEST_INITIAL_ESTIMATOR_PATH"
 
@@ -68,6 +70,7 @@ class OfficialSuiteConfig:
     revision: str | None = _DEFAULT_REVISION
     split: str = _DEFAULT_SPLIT
     n_mlps: int = _DEFAULT_N_MLPS
+    mlp_offset: int = 0
     flop_budget: int = _DEFAULT_FLOP_BUDGET
     setup_timeout_s: float = 5.0
     predict_timeout_s: float = 30.0
@@ -86,12 +89,26 @@ class OfficialSuiteConfig:
             raise ValueError("WHEST_DATASET_SPLIT must not be empty")
         if self.n_mlps <= 0:
             raise ValueError("WHEST_N_MLPS must be positive")
+        if self.mlp_offset < 0:
+            raise ValueError("MLP suite offset must be non-negative")
         if self.flop_budget <= 0:
             raise ValueError("WHEST_FLOP_BUDGET must be positive")
         if self.lambda_flops_per_second <= 0:
             raise ValueError("WHEST_LAMBDA_FLOPS_PER_SECOND must be positive")
         if self.runner not in {"local", "subprocess"}:
             raise ValueError("WHEST_RUNNER must be 'local' or 'subprocess'")
+
+
+@dataclass(frozen=True)
+class WhestBenchGateConfig:
+    test_threshold: float = _DEFAULT_ACCEPTANCE_THRESHOLD
+    holdout_threshold: float = _DEFAULT_ACCEPTANCE_THRESHOLD
+
+    def validate(self) -> None:
+        if self.test_threshold < 0:
+            raise ValueError("WHEST_TEST_ACCEPTANCE_THRESHOLD must be non-negative")
+        if self.holdout_threshold < 0:
+            raise ValueError("WHEST_HOLDOUT_ACCEPTANCE_THRESHOLD must be non-negative")
 
 
 INITIAL_ESTIMATOR_CODE = '''from __future__ import annotations
@@ -155,7 +172,18 @@ def _suite_from_env() -> OfficialSuiteConfig:
         dataset=dataset,
         revision=revision_value or None,
         split=os.environ.get("WHEST_DATASET_SPLIT", _DEFAULT_SPLIT).strip(),
-        n_mlps=int(os.environ.get("WHEST_N_MLPS", _DEFAULT_N_MLPS)),
+        n_mlps=int(
+            os.environ.get(
+                "WHEST_TEST_N_MLPS",
+                os.environ.get("WHEST_N_MLPS", _DEFAULT_N_MLPS),
+            )
+        ),
+        mlp_offset=int(
+            os.environ.get(
+                "WHEST_TEST_MLP_OFFSET",
+                os.environ.get("WHEST_MLP_OFFSET", 0),
+            )
+        ),
         flop_budget=int(os.environ.get("WHEST_FLOP_BUDGET", _DEFAULT_FLOP_BUDGET)),
         setup_timeout_s=float(os.environ.get("WHEST_SETUP_TIMEOUT", 5.0)),
         predict_timeout_s=float(os.environ.get("WHEST_PREDICT_TIMEOUT", 30.0)),
@@ -172,6 +200,64 @@ def _suite_from_env() -> OfficialSuiteConfig:
         seed=int(os.environ.get("WHEST_SETUP_SEED", 0)),
         runner=os.environ.get("WHEST_RUNNER", "subprocess").strip().lower(),
         streaming=_bool_env("WHEST_DATASET_STREAMING", False),
+    )
+    config.validate()
+    return config
+
+
+def _holdout_suite_from_env(
+    test_config: OfficialSuiteConfig,
+) -> OfficialSuiteConfig | None:
+    raw_n_mlps = os.environ.get("WHEST_HOLDOUT_N_MLPS")
+    if raw_n_mlps is None or int(raw_n_mlps) <= 0:
+        return None
+
+    dataset = os.environ.get("WHEST_HOLDOUT_DATASET", test_config.dataset).strip()
+    revision_value = os.environ.get(
+        "WHEST_HOLDOUT_DATASET_REVISION",
+        test_config.revision or "",
+    ).strip()
+    split = os.environ.get("WHEST_HOLDOUT_DATASET_SPLIT", test_config.split).strip()
+    same_dataset = (
+        dataset == test_config.dataset
+        and (revision_value or None) == test_config.revision
+        and split == test_config.split
+    )
+    default_offset = (
+        test_config.mlp_offset + test_config.n_mlps if same_dataset else 0
+    )
+    config = replace(
+        test_config,
+        dataset=dataset,
+        revision=revision_value or None,
+        split=split,
+        n_mlps=int(raw_n_mlps),
+        mlp_offset=int(
+            os.environ.get("WHEST_HOLDOUT_MLP_OFFSET", default_offset)
+        ),
+        streaming=_bool_env(
+            "WHEST_HOLDOUT_DATASET_STREAMING",
+            test_config.streaming,
+        ),
+    )
+    config.validate()
+    return config
+
+
+def _gate_config_from_env() -> WhestBenchGateConfig:
+    config = WhestBenchGateConfig(
+        test_threshold=float(
+            os.environ.get(
+                "WHEST_TEST_ACCEPTANCE_THRESHOLD",
+                _DEFAULT_ACCEPTANCE_THRESHOLD,
+            )
+        ),
+        holdout_threshold=float(
+            os.environ.get(
+                "WHEST_HOLDOUT_ACCEPTANCE_THRESHOLD",
+                _DEFAULT_ACCEPTANCE_THRESHOLD,
+            )
+        ),
     )
     config.validate()
     return config
@@ -201,10 +287,17 @@ def _load_contest_data(config: OfficialSuiteConfig) -> ContestData:
     )
     dataset_metadata = metadata(dataset)
     available = int(dataset_metadata.get("n_mlps") or 0)
-    if available and config.n_mlps > available:
+    required = config.mlp_offset + config.n_mlps
+    if available and required > available:
         raise ValueError(
-            f"WHEST_N_MLPS={config.n_mlps} exceeds dataset split size {available}"
+            f"MLP range [{config.mlp_offset}, {required}) exceeds "
+            f"dataset split size {available}"
         )
+    if config.mlp_offset:
+        if config.streaming:
+            dataset = dataset.skip(config.mlp_offset)
+        else:
+            dataset = dataset.select(range(config.mlp_offset, required))
 
     spec = ContestSpec(
         width=int(dataset_metadata["width"]),
@@ -220,7 +313,16 @@ def _load_contest_data(config: OfficialSuiteConfig) -> ContestData:
         seed=config.seed,
         lambda_flops_per_second=config.lambda_flops_per_second,
     )
-    return make_contest_from_dataset(spec, dataset, config.n_mlps)
+    seed_protocol = dataset_metadata.get("seed_protocol") or {}
+    seed_protocol_version = (
+        seed_protocol.get("version") if isinstance(seed_protocol, dict) else None
+    )
+    return make_contest_from_dataset(
+        spec,
+        dataset,
+        config.n_mlps,
+        seed_protocol_version=seed_protocol_version,
+    )
 
 
 class _RunnerEstimator(BaseEstimator):
@@ -250,7 +352,18 @@ def _runner_for(config: OfficialSuiteConfig) -> LocalRunner | SubprocessRunner:
 def _close_runner(runner: LocalRunner | SubprocessRunner) -> None:
     # whestbench 0.12.0rc5 terminates the worker but leaves its Popen pipes open.
     process = getattr(runner, "_process", None)
-    runner.close()
+    try:
+        runner.close()
+    except subprocess.TimeoutExpired:
+        # The worker may take longer than the package's hard-coded one-second
+        # post-kill wait while large NumPy allocations are being released.
+        # It has already received SIGKILL, so finish reaping it here instead of
+        # discarding a successfully computed evaluation.
+        if process is not None:
+            try:
+                process.wait(timeout=30.0)
+            except subprocess.TimeoutExpired:
+                pass
     if process is None:
         return
     for stream_name in ("stdin", "stdout", "stderr"):
@@ -312,9 +425,17 @@ def _score_code(
             _close_runner(runner)
 
 
+@lru_cache(maxsize=256)
+def _score_code_for_config(
+    code: str,
+    config: OfficialSuiteConfig,
+) -> dict[str, Any]:
+    return _score_code(code, _load_contest_data(config), config)
+
+
 @lru_cache(maxsize=4)
 def _official_baseline_report(config: OfficialSuiteConfig) -> dict[str, Any]:
-    return _score_code(INITIAL_ESTIMATOR_CODE, _load_contest_data(config), config)
+    return _score_code_for_config(INITIAL_ESTIMATOR_CODE, config)
 
 
 @lru_cache(maxsize=8)
@@ -331,7 +452,7 @@ def _configured_initial_estimator(
         raise ValueError(
             f"{_INITIAL_ESTIMATOR_PATH_ENV} must define an Estimator.predict method: {path}"
         )
-    return code, _score_code(code, _load_contest_data(config), config)
+    return code, _score_code_for_config(code, config)
 
 
 def _per_mlp_summary(report: dict[str, Any]) -> list[dict[str, Any]]:
@@ -350,6 +471,75 @@ def _per_mlp_summary(report: dict[str, Any]) -> list[dict[str, Any]]:
         "error_code",
     )
     return [{key: row.get(key) for key in keys if key in row} for row in report["per_mlp"]]
+
+
+def _row_identity(row: dict[str, Any]) -> tuple[str, Any]:
+    name = row.get("mlp_name")
+    if name is not None:
+        return ("name", name)
+    return ("index", row.get("mlp_index"))
+
+
+def _gate_decision(
+    candidate_rows: list[dict[str, Any]],
+    incumbent_rows: list[dict[str, Any]],
+    *,
+    threshold: float,
+) -> dict[str, Any]:
+    incumbent_by_id = {_row_identity(row): row for row in incumbent_rows}
+    deltas: list[float] = []
+    for candidate in candidate_rows:
+        incumbent = incumbent_by_id.get(_row_identity(candidate))
+        if incumbent is None:
+            raise ValueError("candidate and incumbent MLP suites do not match")
+        deltas.append(
+            float(candidate["adjusted_final_layer_score"])
+            - float(incumbent["adjusted_final_layer_score"])
+        )
+    if not deltas or len(deltas) != len(incumbent_rows):
+        raise ValueError("candidate and incumbent MLP suites do not match")
+
+    mean_delta = sum(deltas) / len(deltas)
+    improvement = -mean_delta
+    margin = improvement - threshold
+    return {
+        "evaluated": True,
+        "passed": bool(mean_delta + threshold < 0.0),
+        "n_mlps": len(deltas),
+        "threshold": float(threshold),
+        "candidate_minus_incumbent": float(mean_delta),
+        "improvement": float(improvement),
+        "margin_over_threshold": float(margin),
+    }
+
+
+def _same_dataset(
+    left: OfficialSuiteConfig,
+    right: OfficialSuiteConfig,
+) -> bool:
+    return (
+        left.dataset == right.dataset
+        and left.revision == right.revision
+        and left.split == right.split
+    )
+
+
+def _validate_disjoint_suites(
+    test_config: OfficialSuiteConfig,
+    holdout_config: OfficialSuiteConfig | None,
+) -> None:
+    if holdout_config is None or not _same_dataset(test_config, holdout_config):
+        return
+    test_range = range(
+        test_config.mlp_offset,
+        test_config.mlp_offset + test_config.n_mlps,
+    )
+    holdout_range = range(
+        holdout_config.mlp_offset,
+        holdout_config.mlp_offset + holdout_config.n_mlps,
+    )
+    if test_range.start < holdout_range.stop and holdout_range.start < test_range.stop:
+        raise ValueError("WhestBench test and holdout MLP ranges must not overlap")
 
 
 def _format_report(report: dict[str, Any]) -> str:
@@ -374,52 +564,74 @@ def _format_report(report: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-class WhestBenchRewardEvaluator(BaseRewardEvaluator):
-    def __init__(self, *args, **kwargs):
-        del args
-        self.problem_type = kwargs.pop("problem_type", "arc_whestbench_2026")
-        self.config = kwargs.pop("suite_config", None) or _suite_from_env()
-        provided_contest_data = kwargs.pop("contest_data", None)
-        self.contest_data = provided_contest_data or _load_contest_data(self.config)
-        self.baseline = kwargs.pop("baseline_report", None)
-        if self.baseline is None:
-            if provided_contest_data is None:
-                self.baseline = _official_baseline_report(self.config)
-            else:
-                self.baseline = _score_code(
-                    INITIAL_ESTIMATOR_CODE, self.contest_data, self.config
-                )
+class WhestBenchRewardResult(dict[str, Any]):
+    """Structured WhestBench result compatible with the generic reward contract."""
 
-    def get_reward(self, code: str, state: State) -> dict[str, Any]:
-        del state
-        candidate_code = _extract_python_code(code)
-        if not candidate_code.strip():
-            return self._infrastructure_failure("Empty candidate.")
+    SCHEMA_VERSION = 2
 
-        try:
-            candidate = _score_code(candidate_code, self.contest_data, self.config)
-        except Exception as exc:
-            return self._infrastructure_failure(f"Official evaluator failed: {exc}")
-
+    @classmethod
+    def from_report(
+        cls,
+        *,
+        candidate: dict[str, Any],
+        baseline: dict[str, Any],
+        config: OfficialSuiteConfig,
+        test_gate: dict[str, Any],
+        holdout_gate: dict[str, Any],
+    ) -> "WhestBenchRewardResult":
         score = float(candidate["adjusted_final_layer_score"])
-        baseline_score = float(self.baseline["adjusted_final_layer_score"])
+        baseline_score = float(baseline["adjusted_final_layer_score"])
         reward = baseline_score / max(score, 1e-30)
-        n_mlps = len(candidate["per_mlp"])
+        per_mlp = _per_mlp_summary(candidate)
+        n_mlps = len(per_mlp)
         n_failed = int(candidate["n_failed_mlps"])
         correctness = (n_mlps - n_failed) / n_mlps if n_mlps else 0.0
-        return {
-            "reward": float(reward),
-            "msg": (
+        promotion_passed = bool(
+            test_gate["passed"]
+            and (
+                holdout_gate["passed"]
+                if holdout_gate["enabled"]
+                else True
+            )
+        )
+        details = {
+            "whestbench": {
+                "schema_version": cls.SCHEMA_VERSION,
+                "suite_role": "test",
+                "suite": {
+                    "dataset": config.dataset,
+                    "revision": config.revision,
+                    "split": config.split,
+                    "n_mlps": n_mlps,
+                    "mlp_offset": config.mlp_offset,
+                },
+                "score_key": "adjusted_final_layer_score",
+                "score_direction": "minimize",
+                "adjusted_final_layer_score": score,
+                "baseline_adjusted_final_layer_score": baseline_score,
+                "test_gate": test_gate,
+                "holdout_gate": holdout_gate,
+                "promotion_passed": promotion_passed,
+            }
+        }
+        return cls(
+            reward=float(reward),
+            msg=(
                 f"adjusted_final_layer_score={score:.8g}; "
                 f"final_layer_mse={candidate['final_layer_mse']:.8g}; "
                 f"baseline_adjusted_score={baseline_score:.8g}; "
-                f"failed_mlps={n_failed}/{n_mlps}"
+                f"failed_mlps={n_failed}/{n_mlps}; "
+                f"test_gate_passed={test_gate['passed']}; "
+                f"holdout_evaluated={holdout_gate['evaluated']}; "
+                f"holdout_gate_passed={holdout_gate['passed']}; "
+                f"promotion_passed={promotion_passed}"
             ),
-            "correctness": float(correctness),
-            "raw_score": score,
-            "result_construction": _per_mlp_summary(candidate),
-            "stdout": _format_report(candidate),
-            "metrics": {
+            correctness=float(correctness),
+            raw_score=score,
+            result_construction=per_mlp,
+            stdout=_format_report(candidate),
+            threshold_passed=promotion_passed,
+            metrics={
                 "whestbench/adjusted_final_layer_score": score,
                 "whestbench/final_layer_mse": float(candidate["final_layer_mse"]),
                 "whestbench/all_layers_mse": float(candidate["all_layers_mse"]),
@@ -436,22 +648,176 @@ class WhestBenchRewardEvaluator(BaseRewardEvaluator):
                 ),
                 "whestbench/n_failed_mlps": n_failed,
                 "whestbench/n_mlps": n_mlps,
-                "whestbench/flop_budget": self.config.flop_budget,
-                "whestbench/lambda_flops_per_second": self.config.lambda_flops_per_second,
+                "whestbench/flop_budget": config.flop_budget,
+                "whestbench/lambda_flops_per_second": config.lambda_flops_per_second,
+                "whestbench/test_gate_passed": bool(test_gate["passed"]),
+                "whestbench/holdout_evaluated": bool(holdout_gate["evaluated"]),
+                "whestbench/holdout_gate_passed": holdout_gate["passed"],
+                "whestbench/promotion_passed": promotion_passed,
             },
-        }
+            details=details,
+        )
+
+    @classmethod
+    def infrastructure_failure(cls, msg: str) -> "WhestBenchRewardResult":
+        return cls(
+            reward=0.0,
+            msg=msg,
+            correctness=0.0,
+            raw_score=float("inf"),
+            result_construction=[],
+            stdout="",
+            metrics={},
+            details={
+                "whestbench": {
+                    "schema_version": cls.SCHEMA_VERSION,
+                    "suite_role": "test",
+                    "status": "infrastructure_failure",
+                    "promotion_passed": False,
+                }
+            },
+            threshold_passed=False,
+        )
+
+
+class WhestBenchRewardEvaluator(BaseRewardEvaluator):
+    def __init__(self, *args, **kwargs):
+        del args
+        self.problem_type = kwargs.pop("problem_type", "arc_whestbench_2026")
+        provided_suite_config = kwargs.pop("suite_config", None)
+        self.config = provided_suite_config or _suite_from_env()
+        self.gate_config = kwargs.pop("gate_config", None) or _gate_config_from_env()
+        self.gate_config.validate()
+        provided_holdout_config = kwargs.pop("holdout_config", None)
+        self.holdout_config = (
+            provided_holdout_config
+            if provided_suite_config is not None
+            else (
+                provided_holdout_config
+                or _holdout_suite_from_env(self.config)
+            )
+        )
+        _validate_disjoint_suites(self.config, self.holdout_config)
+
+        provided_contest_data = kwargs.pop("contest_data", None)
+        self._has_provided_contest_data = provided_contest_data is not None
+        self.contest_data = provided_contest_data or _load_contest_data(self.config)
+        provided_holdout_data = kwargs.pop("holdout_contest_data", None)
+        self._has_provided_holdout_data = provided_holdout_data is not None
+        self.holdout_contest_data = provided_holdout_data
+
+        self.baseline = kwargs.pop("baseline_report", None)
+        if self.baseline is None:
+            if provided_contest_data is None:
+                self.baseline = _official_baseline_report(self.config)
+            else:
+                self.baseline = _score_code(
+                    INITIAL_ESTIMATOR_CODE, self.contest_data, self.config
+                )
 
     @staticmethod
-    def _infrastructure_failure(msg: str) -> dict[str, Any]:
-        return {
-            "reward": 0.0,
-            "msg": msg,
-            "correctness": 0.0,
-            "raw_score": float("inf"),
-            "result_construction": [],
-            "stdout": "",
-            "metrics": {},
-        }
+    def _incumbent_code(state: State | None) -> str:
+        code = _extract_python_code(getattr(state, "code", "") or "")
+        return code if code.strip() else INITIAL_ESTIMATOR_CODE
+
+    def _score_test(self, code: str) -> dict[str, Any]:
+        if self._has_provided_contest_data:
+            return _score_code(code, self.contest_data, self.config)
+        return _score_code_for_config(code, self.config)
+
+    def _score_holdout(self, code: str) -> dict[str, Any]:
+        if self.holdout_config is None:
+            raise RuntimeError("WhestBench holdout suite is not configured")
+        if self._has_provided_holdout_data:
+            assert self.holdout_contest_data is not None
+            return _score_code(code, self.holdout_contest_data, self.holdout_config)
+        return _score_code_for_config(code, self.holdout_config)
+
+    def _test_incumbent_rows(
+        self,
+        state: State | None,
+        candidate_rows: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        construction = getattr(state, "construction", None)
+        if isinstance(construction, list) and construction:
+            try:
+                _gate_decision(
+                    candidate_rows,
+                    construction,
+                    threshold=self.gate_config.test_threshold,
+                )
+                return construction
+            except (KeyError, TypeError, ValueError):
+                pass
+        incumbent = self._score_test(self._incumbent_code(state))
+        return _per_mlp_summary(incumbent)
+
+    def get_reward(self, code: str, state: State) -> dict[str, Any]:
+        candidate_code = _extract_python_code(code)
+        if not candidate_code.strip():
+            return WhestBenchRewardResult.infrastructure_failure("Empty candidate.")
+
+        try:
+            candidate = self._score_test(candidate_code)
+            candidate_rows = _per_mlp_summary(candidate)
+            incumbent_rows = self._test_incumbent_rows(state, candidate_rows)
+            test_gate = _gate_decision(
+                candidate_rows,
+                incumbent_rows,
+                threshold=self.gate_config.test_threshold,
+            )
+            test_failures = int(candidate["n_failed_mlps"])
+            if test_failures:
+                test_gate["passed"] = False
+                test_gate["failure_reason"] = "candidate_failed_mlps"
+                test_gate["n_failed_mlps"] = test_failures
+
+            holdout_gate: dict[str, Any] = {
+                "enabled": self.holdout_config is not None,
+                "evaluated": False,
+                "passed": None,
+            }
+            if self.holdout_config is not None:
+                holdout_gate["threshold"] = self.gate_config.holdout_threshold
+                if not test_gate["passed"]:
+                    holdout_gate["passed"] = False
+                    holdout_gate["skip_reason"] = "test_gate_failed"
+                else:
+                    holdout_candidate = self._score_holdout(candidate_code)
+                    holdout_incumbent = self._score_holdout(
+                        self._incumbent_code(state)
+                    )
+                    private_decision = _gate_decision(
+                        _per_mlp_summary(holdout_candidate),
+                        _per_mlp_summary(holdout_incumbent),
+                        threshold=self.gate_config.holdout_threshold,
+                    )
+                    holdout_failures = int(holdout_candidate["n_failed_mlps"])
+                    private_passed = bool(
+                        private_decision["passed"] and not holdout_failures
+                    )
+                    holdout_gate.update(
+                        {
+                            "evaluated": True,
+                            "passed": private_passed,
+                            "n_mlps": private_decision["n_mlps"],
+                        }
+                    )
+                    if holdout_failures:
+                        holdout_gate["failure_reason"] = "candidate_failed_mlps"
+                        holdout_gate["n_failed_mlps"] = holdout_failures
+        except Exception as exc:
+            return WhestBenchRewardResult.infrastructure_failure(
+                f"Official evaluator failed: {exc}"
+            )
+
+        return WhestBenchRewardResult.from_report(
+            candidate=candidate,
+            baseline=self.baseline,
+            config=self.config,
+            test_gate=test_gate,
+            holdout_gate=holdout_gate,
+        )
 
 
 class WhestBenchEnv(Environment):
@@ -479,6 +845,7 @@ class WhestBenchEnv(Environment):
                     "revision": config.revision,
                     "split": config.split,
                     "n_mlps": spec.n_mlps,
+                    "mlp_offset": config.mlp_offset,
                     "width": spec.width,
                     "depth": spec.depth,
                     "flop_budget": spec.flop_budget,
@@ -498,6 +865,17 @@ class WhestBenchEnv(Environment):
 
     def is_maximize(self) -> bool:
         return False
+
+    def _create_next_state(
+        self,
+        step_idx: int,
+        parsed_code: str,
+        outs,
+    ) -> State | None:
+        whestbench = (outs.details or {}).get("whestbench", {})
+        if not bool(whestbench.get("promotion_passed", False)):
+            return None
+        return super()._create_next_state(step_idx, parsed_code, outs)
 
     def _should_keep_code_separators(self) -> bool:
         return False
@@ -582,6 +960,12 @@ Leave the best plain Python implementation in:
                 host=host,
                 port=port,
                 timeout_s=max(1.0, float(eval_timeout)),
+                state=(
+                    self.state.to_dict()
+                    if hasattr(self.state, "to_dict")
+                    else None
+                ),
+                print_details=True,
             ),
             encoding="utf-8",
         )
@@ -604,6 +988,9 @@ Do not edit `eval_client.py`. Only `submission.py` is a candidate artifact. It
 must be plain Python source defining the official `Estimator(BaseEstimator)`
 class, without Markdown fences. Lower `raw_score` is better; `reward` is the
 official baseline score divided by the candidate score.
+The evaluator prints a `details` JSON object after each valid run. A candidate
+must pass the test gate before the hidden holdout is evaluated, and only
+`promotion_passed=true` is eligible to replace the incumbent.
 Do not inspect evaluation datasets, caches, reports, or target values; derive
 the estimator only from the supplied task description and blackbox scores.
 

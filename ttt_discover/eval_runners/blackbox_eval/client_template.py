@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
+from typing import Any
 
 
 def build_eval_client_source(
@@ -14,6 +16,8 @@ def build_eval_client_source(
     submission_path: str = "submission.py",
     timeout_s: float = 3600.0,
     max_submission_bytes: int = 8 * 1024 * 1024,
+    state: dict[str, Any] | None = None,
+    print_details: bool = False,
 ) -> str:
     """Return a self-contained eval_client.py source string.
 
@@ -23,6 +27,7 @@ def build_eval_client_source(
 
     if socket_path is None and port is None:
         raise ValueError("Either socket_path or port must be provided")
+    state_json = json.dumps(state, ensure_ascii=False, separators=(",", ":"))
 
     return f'''#!/usr/bin/env python3
 from __future__ import annotations
@@ -42,6 +47,8 @@ PORT = {port!r}
 SUBMISSION_PATH = {submission_path!r}
 TIMEOUT_S = {float(timeout_s)!r}
 MAX_SUBMISSION_BYTES = {int(max_submission_bytes)!r}
+STATE = json.loads({state_json!r})
+PRINT_DETAILS = {bool(print_details)!r}
 
 
 def _read_submission(path: str) -> str:
@@ -92,6 +99,8 @@ def main() -> int:
         "problem_type": PROBLEM_TYPE,
         "submission": _read_submission(submission_file),
     }}
+    if STATE is not None:
+        request["state"] = STATE
     data = json.dumps(request, ensure_ascii=False, separators=(",", ":")).encode() + b"\\n"
     with _connect() as sock:
         sock.sendall(data)
@@ -109,6 +118,16 @@ def main() -> int:
             print(f"raw_score {{response['raw_score']}}")
         if response.get("reward") is not None:
             print(f"reward {{response['reward']}}")
+        if PRINT_DETAILS and response.get("details"):
+            print(
+                "details "
+                + json.dumps(
+                    response["details"],
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+            )
         return 0
 
     stage = response.get("stage") or "eval"

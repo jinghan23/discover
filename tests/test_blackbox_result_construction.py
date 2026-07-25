@@ -10,6 +10,7 @@ from ttt_discover.eval_runners.blackbox_eval.server import (
     BlackboxVerifier,
     VerifierConfig,
 )
+from ttt_discover.tasks.base import VerifyResult
 
 
 class _ResponseSocket:
@@ -32,6 +33,19 @@ class _ResponseSocket:
         return response
 
 
+def test_verify_result_preserves_task_details() -> None:
+    result = VerifyResult.from_reward_dict(
+        {
+            "reward": 2.0,
+            "raw_score": 0.5,
+            "correctness": 1.0,
+            "details": {"task": {"suite": "search"}},
+        }
+    )
+
+    assert result.details == {"task": {"suite": "search"}}
+
+
 def test_blackbox_verifier_returns_result_construction(tmp_path: Path) -> None:
     class Evaluator:
         def __init__(self, **kwargs):
@@ -44,6 +58,7 @@ def test_blackbox_verifier_returns_result_construction(tmp_path: Path) -> None:
                 "raw_score": 0.5,
                 "correctness": 1.0,
                 "result_construction": [0.4, 0.6],
+                "details": {"task": {"suite": "search"}},
             }
 
     verifier = BlackboxVerifier(
@@ -61,6 +76,7 @@ def test_blackbox_verifier_returns_result_construction(tmp_path: Path) -> None:
     response = verifier.evaluate({"submission": "candidate"})
 
     assert response["result_construction"] == [0.4, 0.6]
+    assert response["details"] == {"task": {"suite": "search"}}
 
 
 def test_blackbox_runner_preserves_result_construction() -> None:
@@ -73,6 +89,7 @@ def test_blackbox_runner_preserves_result_construction() -> None:
             "raw_score": 0.5,
             "correctness": 1.0,
             "result_construction": [0.4, 0.6],
+            "details": {"task": {"suite": "search"}},
         }
     )
     runner = BlackboxRunner(socket_path="/tmp/not-used.sock")
@@ -85,5 +102,6 @@ def test_blackbox_runner_preserves_result_construction() -> None:
     result = runner.evaluate(env, "candidate")
 
     assert result.result_construction == [0.4, 0.6]
+    assert result.details == {"task": {"suite": "search"}}
     request = json.loads(socket.sent.decode("utf-8"))
     assert request["state"]["construction"] == [0.5, 0.5]

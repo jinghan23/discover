@@ -14,7 +14,9 @@ AIcrowd 提交记录。**从本页开始阅读，不要直接从散落的 JSON �
 4. 看某种方法的算法与复现结论：
    [`docs/PUBLIC_METHODS.md`](docs/PUBLIC_METHODS.md) 和
    [`public_reproductions/`](public_reproductions/README.md)。
-5. 看旧的实验过程、上传命令和历史叙述：
+5. 看本地 MLP 生成协议、深层方差与排名稳定性审计：
+   [`analysis/README.md`](analysis/README.md)。
+6. 看旧的实验过程、上传命令和历史叙述：
    [`docs/SUBMISSION_HISTORY.md`](docs/SUBMISSION_HISTORY.md)。它是历史档案，
    不是当前分数来源。
 
@@ -28,6 +30,7 @@ AIcrowd 提交记录。**从本页开始阅读，不要直接从散落的 JSON �
 | `public_reproductions/` | 公开方法的独立实现与评测报告 | 可复现参考 |
 | `discovered/` | TTT-Discover / AutoEvolve 发现的 estimator 与报告 | 实验记录 |
 | `leaderboard/` | 某一日期的公开榜快照 | 历史快照，不是实时榜单 |
+| `analysis/` | MLP 参数、深层方差和方法排名稳定性审计 | 可复现实验结论 |
 | `docs/` | 协议词汇、公开方法说明和历史记录 | 人工维护的说明 |
 
 ## Raw run workspace policy

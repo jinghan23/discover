@@ -28,9 +28,16 @@ defaults are:
 - Residual penalty: `100_000_000_000` FLOPs/second
 - Runner: official subprocess runner
 
-The checked-in discovery YAML evaluates all 100 MLPs. Set `WHEST_N_MLPS=10`
-explicitly for cheaper search iterations, then return to 100 for comparable
-final measurements.
+The checked-in discovery YAML uses two disjoint gates over the 100 MLPs:
+
+- test gate: rows `[0, 50)`;
+- holdout gate: rows `[50, 100)`, evaluated only after the test gate passes.
+
+Both gates require the candidate to improve over the incumbent by more than
+`1e-7` by default. Configure the suite sizes and thresholds with
+`WHEST_TEST_N_MLPS`, `WHEST_HOLDOUT_N_MLPS`,
+`WHEST_TEST_ACCEPTANCE_THRESHOLD`, and
+`WHEST_HOLDOUT_ACCEPTANCE_THRESHOLD`.
 
 Failures follow the official semantics: invalid output, exceptions, or compute
 exhaustion replace that MLP's prediction with zeros and force the score
@@ -55,8 +62,7 @@ python repro/run_from_yaml.py \
   --run aicrowd_whestbench
 ```
 
-The first run downloads and caches the pinned `mini` split (about 850 MB).
-Override `WHEST_N_MLPS` for a cheaper or broader scoring run. Set
+The first run downloads and caches the pinned `mini` split (about 850 MB). Set
 `WHEST_DATASET` to a local official dataset directory for fully offline
 evaluation. `WHEST_DATASET_STREAMING=1` is available for constrained
 environments, but materialized evaluation is the official starter-kit default.
@@ -70,8 +76,8 @@ TTT-Discover uses the in-process evaluator adapter. Neither path requires CUDA.
 RUN_WHEST_SMOKE=1 \
   bash repro/aicrowd_whestbench/run_official_mini.sh all
 
-# Search on all 100 mini MLPs.
-WHEST_SEARCH_N_MLPS=100 \
+# Use a 50-MLP test gate followed by a disjoint 50-MLP holdout gate.
+WHEST_SEARCH_N_MLPS=50 WHEST_HOLDOUT_N_MLPS=50 \
   bash repro/aicrowd_whestbench/run_official_mini.sh all
 ```
 
