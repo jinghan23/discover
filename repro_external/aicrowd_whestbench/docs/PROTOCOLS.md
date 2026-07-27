@@ -62,3 +62,60 @@ C/B 简单相乘来精确复原。
 4. hosted public-50 是最终公开依据，但它与本地集合不同；漂移不自动表示 evaluator
    有错误。
 5. “best official” 若没有特别说明，只指本地 registry 已登记的提交，不指全榜第一。
+
+## 三 sampling-seed 评测协议
+
+新的 stochastic sampling 候选不能再凭单次 local full-100 结果直接提交。使用固定的
+100 个 MLP 和 ground truth，只平移 estimator 自己的 RNG stream，默认 offsets 为
+`0`、`1000003`、`2000003`；German current 使用相同 offsets 作逐 seed、逐 MLP
+配对基线。
+
+`evaluate_public_reproduction.py` 是三 seed 门禁客户端。它通过已经运行的 blackbox
+server 分别评测候选和 German current 的三个 offset，共六次 official suite 调用；
+随后执行逐 seed/逐 MLP 配对、20,000 次 MLP-cluster bootstrap 和提交门禁。它不在
+客户端加载数据，也不启动 evaluator。server 需要使用普通的
+`WhestBenchRewardEvaluator` 并允许 request state（`--allow-request-state`）：
+
+```bash
+TTT_BLACKBOX_EVAL_SOCKET=/tmp/ttt_blackbox_eval_whestbench.sock \
+  .venv/bin/python repro/aicrowd_whestbench/evaluate_public_reproduction.py \
+  repro_external/aicrowd_whestbench/submissions/candidates/CANDIDATE.py \
+  repro_external/aicrowd_whestbench/submissions/seed_sweeps/METHOD_three_seed_gate.json
+```
+
+默认 baseline 是
+`public_reproductions/german_alfaro_current_41493b1.py`，可用 `--baseline` 显式覆盖。
+
+blackbox 协议只传 submission 源码和 request state，**不能携带附属文件**。因此权重放在
+单独文件里的提交（learned residual 需要同目录的 `learned_residual_weights.npz`）走不了
+这条路，必须用 `evaluate_full100_direct.py`：它在进程内直接调官方 scorer，用可重复的
+`--asset` 把附属文件拷到 `estimator.py` 旁边。learned residual 训练途中的 full-100
+监控用的就是它。该脚本是单次打分，不做三 seed 门禁；正式提交前的验收仍以上面的
+三 seed 协议为准。
+
+若共享宿主在连续 suite 切换时出现全套 `flops_used=0` 的 worker
+`SETUP_TIMEOUT`，未预声明恢复策略的该整轮作废，不能把失败行用于方法比较，也不能
+事后只挑成功 seed 拼接晋级。允许用
+`--interleave-baseline --inter-run-cooldown-s 15 --max-infra-retries 2
+--infra-retry-cooldown-s 30` 预声明恢复策略并重新执行完整六套门禁：六个 nominal
+请求前对候选和 baseline 对称等待，顺序为 `C0,B0,C1,B1,C2,B2`。这只调节 client
+侧 subprocess teardown/startup 节奏；server 的 official setup timeout、数据、预算
+和计分必须保持不变，报告也会记录请求顺序和 cooldown。
+
+基础设施 retry 只在一个 suite 的 100/100 行都是 `SETUP_TIMEOUT`、`flops_used=0`、
+`effective_compute=0` 且没有任何 exhaustion flag 时触发；candidate 与 baseline 使用
+完全相同的最多两次 retry。客户端采用第一个非基础设施失败的 attempt，不按分数
+择优，并在 JSON 中保存所有 attempt 的 source hash、failure summary 和是否进入聚合。
+partial setup failure、预测/预算/时间失败或任何非零计算都不得 retry；retry 用尽时
+整轮仍不通过。
+
+只有同时满足以下条件才可打包并测试 hosted public-50：
+
+1. 三次 local full-100 都是 0 failures；
+2. 三个 sampling seed 的 suite adjusted score 都低于配对 German current；
+3. 三 seed 平均 adjusted score 低于 German current；
+4. 先在每个 MLP 内平均三 seed 配对差，再按 MLP 做 20,000 次 bootstrap，其 95%
+   percentile CI 上界仍小于 0。
+
+seed sweep 报告保存在 `submissions/seed_sweeps/`。未通过门禁的方案保留为本地负
+结果，不生成官方提交。

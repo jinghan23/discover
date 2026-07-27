@@ -29,6 +29,7 @@ Environment overrides:
   RUN_WHEST_ABMCTS_CODEX_MODEL=...             Default gpt-5.6-sol
   RUN_WHEST_ABMCTS_REASONING_EFFORT=...         Default xhigh, including smoke runs
   RUN_WHEST_ABMCTS_CLI_TIMEOUT=...              Per-action timeout in seconds (default 600)
+  TTT_BLACKBOX_EVAL_SOCKET=...                  Existing blackbox server for promotion evals
   PYTHON=...                                   Default .venv/bin/python
   HF_HOME=...                                  Default /tmp/hf-whest-cache
 EOF

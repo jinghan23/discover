@@ -7,16 +7,20 @@ AIcrowd 提交记录。**从本页开始阅读，不要直接从散落的 JSON �
 
 1. 看最新提交结果：[`SUBMISSION_TRACKER.md`](SUBMISSION_TRACKER.md)。这是由本地
    registry 和 AIcrowd API 生成的唯一权威提交表。
-2. 看 starter baseline、Monte Carlo 变体、矩传播变体及其 full-100 结果：
+2. 看当前保留的好且多样化方法组合：
+   [`docs/CURRENT_METHODS.md`](docs/CURRENT_METHODS.md)。
+3. 看 starter baseline、Monte Carlo 变体、矩传播变体及其 full-100 结果：
    [`baselines/README.md`](baselines/README.md)。
-3. 看 `first-10`、`full-100`、`public-50` 和各分数字段的含义：
+4. 看 `first-10`、`full-100`、`public-50` 和各分数字段的含义：
    [`docs/PROTOCOLS.md`](docs/PROTOCOLS.md)。
-4. 看某种方法的算法与复现结论：
+5. 看某种方法的算法与复现结论：
    [`docs/PUBLIC_METHODS.md`](docs/PUBLIC_METHODS.md) 和
    [`public_reproductions/`](public_reproductions/README.md)。
-5. 看本地 MLP 生成协议、深层方差与排名稳定性审计：
+6. 看本地 MLP 生成协议、深层方差与排名稳定性审计：
    [`analysis/README.md`](analysis/README.md)。
-6. 看旧的实验过程、上传命令和历史叙述：
+7. 看 sampling 方法的统一视角、文献地图与下一步实验路线：
+   [`docs/SAMPLING_SURVEY.md`](docs/SAMPLING_SURVEY.md)。
+8. 看旧的实验过程、上传命令和历史叙述：
    [`docs/SUBMISSION_HISTORY.md`](docs/SUBMISSION_HISTORY.md)。它是历史档案，
    不是当前分数来源。
 

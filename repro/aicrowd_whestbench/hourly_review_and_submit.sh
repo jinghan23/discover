@@ -12,6 +12,7 @@ STATE_ROOT="${WHEST_REVIEW_STATE_ROOT:-$RUN_ROOT/hourly_submission_review}"
 LEDGER="$STATE_ROOT/REVIEW_LOG.md"
 MONITOR_LOG="$STATE_ROOT/monitor.log"
 DEPS_PATH="${WHEST_DEPS_PATH:-/tmp/whest-official-deps}"
+BLACKBOX_SOCKET="${TTT_BLACKBOX_EVAL_SOCKET:-/tmp/ttt_blackbox_eval_whestbench.sock}"
 
 mkdir -p "$STATE_ROOT"
 touch "$LEDGER" "$MONITOR_LOG"
@@ -123,7 +124,7 @@ initial estimator 位于：
 5. full-100 串行执行且 BLAS/OMP 线程数固定为 1，避免影响正在运行的搜索。使用官方
    Phase 1 mini full-100、subprocess runner：
 
-   `PYTHONPATH=__DEPS_PATH__:__REPO_ROOT__ HF_HOME=/tmp/hf-whest-cache OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 NUMEXPR_NUM_THREADS=1 python __REPO_ROOT__/repro/aicrowd_whestbench/evaluate_public_reproduction.py <estimator.py> <unique-full100-report.json> --n-mlps 100`
+   `PYTHONPATH=__DEPS_PATH__:__REPO_ROOT__ TTT_BLACKBOX_EVAL_SOCKET=__BLACKBOX_SOCKET__ python __REPO_ROOT__/repro/aicrowd_whestbench/evaluate_public_reproduction.py <estimator.py> <unique-full100-report.json> --n-mlps 100`
 
 6. full-100 必须 0 failure、每个 MLP 不超预算且结果可复现，才能考虑官方提交。综合判断：
    - 分数是否相对可比基线有足够大的真实改进；
@@ -182,6 +183,7 @@ PROMPT
     prompt="${prompt//__REPO_ROOT__/$REPO_ROOT}"
     prompt="${prompt//__RUN_ROOT__/$RUN_ROOT}"
     prompt="${prompt//__DEPS_PATH__/$DEPS_PATH}"
+    prompt="${prompt//__BLACKBOX_SOCKET__/$BLACKBOX_SOCKET}"
     printf '%s\n' "$prompt"
 }
 

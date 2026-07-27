@@ -640,7 +640,7 @@ def _launch_full100_monitor(
     log_path = step_dir / "evaluator.log"
     command = [
         sys.executable,
-        str(repo_root / "repro/aicrowd_whestbench/evaluate_public_reproduction.py"),
+        str(repo_root / "repro/aicrowd_whestbench/evaluate_full100_direct.py"),
         str(
             repo_root
             / "repro_external/aicrowd_whestbench/learned_residual/submission/estimator.py"

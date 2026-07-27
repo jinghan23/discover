@@ -62,6 +62,7 @@ _DEFAULT_LAMBDA_FLOPS_PER_SECOND = 1e11
 _DEFAULT_ACCEPTANCE_THRESHOLD = 1e-7
 _TARGET_ADJUSTED_SCORE = 1e-7
 _INITIAL_ESTIMATOR_PATH_ENV = "WHEST_INITIAL_ESTIMATOR_PATH"
+_ESTIMATOR_SEED_OFFSET_METADATA_KEY = "whestbench_estimator_seed_offset"
 
 
 @dataclass(frozen=True)
@@ -147,6 +148,45 @@ def _extract_python_code(text: str) -> str:
     if matches:
         return matches[-1].group(1).strip() + "\n"
     return (text or "").strip() + "\n"
+
+
+def _offset_estimator_rng_seeds(source: str, offset: int) -> tuple[str, int]:
+    """Shift estimator-owned RNG streams while keeping MLPs and targets fixed."""
+    if offset == 0:
+        return source, 0
+
+    pattern = re.compile(
+        r"fnp\.random\.default_rng\(\s*mlp\.seed"
+        r"(?P<constant>\s*\+\s*\d+)?\s*\)"
+    )
+
+    def replace_seed(match: re.Match[str]) -> str:
+        constant = match.group("constant") or ""
+        return f"fnp.random.default_rng(mlp.seed{constant} + {offset})"
+
+    return pattern.subn(replace_seed, source)
+
+
+def _estimator_seed_offset_from_state(state: State | None, default: int) -> int:
+    metadata = getattr(state, "metadata", None)
+    if not isinstance(metadata, dict):
+        return default
+    value = metadata.get(_ESTIMATOR_SEED_OFFSET_METADATA_KEY, default)
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"{_ESTIMATOR_SEED_OFFSET_METADATA_KEY} must be an integer"
+        ) from exc
+
+
+def _seed_offset_config(
+    config: OfficialSuiteConfig,
+    seed_offset: int,
+) -> OfficialSuiteConfig:
+    if not seed_offset:
+        return config
+    return replace(config, seed=config.seed + seed_offset)
 
 
 def _optional_float_env(name: str, default: float | None) -> float | None:
@@ -578,6 +618,8 @@ class WhestBenchRewardResult(dict[str, Any]):
         config: OfficialSuiteConfig,
         test_gate: dict[str, Any],
         holdout_gate: dict[str, Any],
+        seed_offset: int = 0,
+        seed_replacement_count: int = 0,
     ) -> "WhestBenchRewardResult":
         score = float(candidate["adjusted_final_layer_score"])
         baseline_score = float(baseline["adjusted_final_layer_score"])
@@ -586,6 +628,11 @@ class WhestBenchRewardResult(dict[str, Any]):
         n_mlps = len(per_mlp)
         n_failed = int(candidate["n_failed_mlps"])
         correctness = (n_mlps - n_failed) / n_mlps if n_mlps else 0.0
+        for row in per_mlp:
+            row["estimator_seed_offset"] = seed_offset
+            row["estimator_seed_replacement_count"] = seed_replacement_count
+            row["flop_budget"] = config.flop_budget
+            row["lambda_flops_per_second"] = config.lambda_flops_per_second
         promotion_passed = bool(
             test_gate["passed"]
             and (
@@ -620,6 +667,7 @@ class WhestBenchRewardResult(dict[str, Any]):
                 f"adjusted_final_layer_score={score:.8g}; "
                 f"final_layer_mse={candidate['final_layer_mse']:.8g}; "
                 f"baseline_adjusted_score={baseline_score:.8g}; "
+                f"estimator_seed_offset={seed_offset}; "
                 f"failed_mlps={n_failed}/{n_mlps}; "
                 f"test_gate_passed={test_gate['passed']}; "
                 f"holdout_evaluated={holdout_gate['evaluated']}; "
@@ -650,6 +698,8 @@ class WhestBenchRewardResult(dict[str, Any]):
                 "whestbench/n_mlps": n_mlps,
                 "whestbench/flop_budget": config.flop_budget,
                 "whestbench/lambda_flops_per_second": config.lambda_flops_per_second,
+                "whestbench/estimator_seed_offset": seed_offset,
+                "whestbench/estimator_seed_replacement_count": seed_replacement_count,
                 "whestbench/test_gate_passed": bool(test_gate["passed"]),
                 "whestbench/holdout_evaluated": bool(holdout_gate["evaluated"]),
                 "whestbench/holdout_gate_passed": holdout_gate["passed"],
@@ -720,23 +770,27 @@ class WhestBenchRewardEvaluator(BaseRewardEvaluator):
         code = _extract_python_code(getattr(state, "code", "") or "")
         return code if code.strip() else INITIAL_ESTIMATOR_CODE
 
-    def _score_test(self, code: str) -> dict[str, Any]:
+    def _score_test(self, code: str, *, seed_offset: int = 0) -> dict[str, Any]:
+        config = _seed_offset_config(self.config, seed_offset)
         if self._has_provided_contest_data:
-            return _score_code(code, self.contest_data, self.config)
-        return _score_code_for_config(code, self.config)
+            return _score_code(code, self.contest_data, config)
+        return _score_code(code, _load_contest_data(self.config), config)
 
-    def _score_holdout(self, code: str) -> dict[str, Any]:
+    def _score_holdout(self, code: str, *, seed_offset: int = 0) -> dict[str, Any]:
         if self.holdout_config is None:
             raise RuntimeError("WhestBench holdout suite is not configured")
+        config = _seed_offset_config(self.holdout_config, seed_offset)
         if self._has_provided_holdout_data:
             assert self.holdout_contest_data is not None
-            return _score_code(code, self.holdout_contest_data, self.holdout_config)
-        return _score_code_for_config(code, self.holdout_config)
+            return _score_code(code, self.holdout_contest_data, config)
+        return _score_code(code, _load_contest_data(self.holdout_config), config)
 
     def _test_incumbent_rows(
         self,
         state: State | None,
         candidate_rows: list[dict[str, Any]],
+        *,
+        seed_offset: int = 0,
     ) -> list[dict[str, Any]]:
         construction = getattr(state, "construction", None)
         if isinstance(construction, list) and construction:
@@ -749,7 +803,11 @@ class WhestBenchRewardEvaluator(BaseRewardEvaluator):
                 return construction
             except (KeyError, TypeError, ValueError):
                 pass
-        incumbent = self._score_test(self._incumbent_code(state))
+        incumbent_code, _ = _offset_estimator_rng_seeds(
+            self._incumbent_code(state),
+            seed_offset,
+        )
+        incumbent = self._score_test(incumbent_code, seed_offset=seed_offset)
         return _per_mlp_summary(incumbent)
 
     def get_reward(self, code: str, state: State) -> dict[str, Any]:
@@ -758,9 +816,18 @@ class WhestBenchRewardEvaluator(BaseRewardEvaluator):
             return WhestBenchRewardResult.infrastructure_failure("Empty candidate.")
 
         try:
-            candidate = self._score_test(candidate_code)
+            seed_offset = _estimator_seed_offset_from_state(state, 0)
+            candidate_code, seed_replacement_count = _offset_estimator_rng_seeds(
+                candidate_code,
+                seed_offset,
+            )
+            candidate = self._score_test(candidate_code, seed_offset=seed_offset)
             candidate_rows = _per_mlp_summary(candidate)
-            incumbent_rows = self._test_incumbent_rows(state, candidate_rows)
+            incumbent_rows = self._test_incumbent_rows(
+                state,
+                candidate_rows,
+                seed_offset=seed_offset,
+            )
             test_gate = _gate_decision(
                 candidate_rows,
                 incumbent_rows,
@@ -783,9 +850,17 @@ class WhestBenchRewardEvaluator(BaseRewardEvaluator):
                     holdout_gate["passed"] = False
                     holdout_gate["skip_reason"] = "test_gate_failed"
                 else:
-                    holdout_candidate = self._score_holdout(candidate_code)
+                    holdout_incumbent_code, _ = _offset_estimator_rng_seeds(
+                        self._incumbent_code(state),
+                        seed_offset,
+                    )
+                    holdout_candidate = self._score_holdout(
+                        candidate_code,
+                        seed_offset=seed_offset,
+                    )
                     holdout_incumbent = self._score_holdout(
-                        self._incumbent_code(state)
+                        holdout_incumbent_code,
+                        seed_offset=seed_offset,
                     )
                     private_decision = _gate_decision(
                         _per_mlp_summary(holdout_candidate),
@@ -817,6 +892,8 @@ class WhestBenchRewardEvaluator(BaseRewardEvaluator):
             config=self.config,
             test_gate=test_gate,
             holdout_gate=holdout_gate,
+            seed_offset=seed_offset,
+            seed_replacement_count=seed_replacement_count,
         )
 
 
