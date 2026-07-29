@@ -36,23 +36,34 @@ Official scoring:
   budget exhaustion use an all-zero prediction and multiplier 1.0 for that MLP.
 - All-layer MSE is diagnostic only.
 
-Do not use plain NumPy or uninstrumented numerical libraries to evade FLOP
-accounting. Residual Python or uninstrumented work is charged at the official
-lambda rate and can exhaust the combined budget.
+Official public leaderboard top 20 (snapshot retrieved 2026-07-29):
+- Adjusted Score and Final Layer MSE are both lower-is-better. They can differ
+  because Adjusted Score includes the official compute multiplier.
+- Source:
+  https://www.aicrowd.com/challenges/arc-white-box-estimation-challenge-2026/leaderboards
 
-Fairness and data isolation:
-- Derive predictions only from the `mlp` weights and allowed setup context.
-- Do not inspect, search for, or read evaluation datasets, Hugging Face caches,
-  saved evaluation reports, target moments, or ground-truth files.
-- Do not hardcode values tied to public mini MLPs. Such candidates are invalid
-  even if they receive a low local score.
-
-Algorithm directions worth exploring:
-- Mean and diagonal-variance propagation through ReLU moments.
-- Full, structured, or low-rank covariance propagation.
-- Hybrid analytic propagation with compute-budgeted Monte Carlo probes.
-- Layer-wise corrections for correlation error in deep networks.
-- Allocating FLOPs to layers where final-layer MSE is most sensitive.
+| Rank | Participant | Adjusted Score | Final Layer MSE | Entries |
+| ---: | :--- | ---: | ---: | ---: |
+| 1 | joe_wanza | 0.0000000123 | 0.0000000824 | 594 |
+| 2 | dpskv5 | 0.0000000227 | 0.0000000288 | 56 |
+| 3 | abhinav_gorrepati | 0.0000000230 | 0.0000002104 | 107 |
+| 4 | fklassen | 0.0000000345 | 0.0000001620 | 143 |
+| 5 | mliston | 0.0000000463 | 0.0000001680 | 370 |
+| 6 | huang_chung_yi | 0.0000000536 | 0.0000000817 | 135 |
+| 7 | adrianleb | 0.0000000559 | 0.0000002592 | 21 |
+| 8 | ai_innovation | 0.0000000918 | 0.0000001972 | 448 |
+| 9 | jtel | 0.0000000938 | 0.0000002039 | 195 |
+| 10 | SKIBIDI_TOILET | 0.0000000976 | 0.0000002089 | 246 |
+| 11 | Puffi | 0.0000001062 | 0.0000001994 | 118 |
+| 12 | neuron | 0.0000001143 | 0.0000002126 | 568 |
+| 13 | kaileh57 | 0.0000001159 | 0.0000002089 | 293 |
+| 14 | jamespayor | 0.0000001193 | 0.0000001724 | 119 |
+| 15 | sweaty_dog | 0.0000001212 | 0.0000001455 | 95 |
+| 16 | ednacob | 0.0000001234 | 0.0000002361 | 37 |
+| 17 | yanggan_gu | 0.0000001274 | 0.0000002422 | 29 |
+| 18 | andrew_epstein | 0.0000001288 | 0.0000002381 | 37 |
+| 19 | andrei_bulzan | 0.0000001315 | 0.0000002090 | 133 |
+| 20 | williawa | 0.0000001437 | 0.0000007644 | 171 |
 """
 
 
